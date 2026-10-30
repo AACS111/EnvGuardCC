@@ -45,6 +45,7 @@
     "test:traffic": "node --test scripts/check-traffic-layer.mjs",
     "test:protection": "node --test scripts/check-protection-session.mjs scripts/check-protection-controls.cjs scripts/check-protection-reconnect.mjs",
     "desktop:package": "node scripts/package-desktop.mjs",
+    "desktop:installer": "node scripts/package-desktop.mjs && node scripts/build-installer.mjs",
     "license:generator": "node tools/license-generator/server.mjs --open",
     "license:package": "node tools/license-generator/package.mjs",
     "test:license": "node --test tools/license-generator/check-license.mjs"

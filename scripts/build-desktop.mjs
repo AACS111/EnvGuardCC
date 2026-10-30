@@ -36,6 +36,7 @@ if (!stage.startsWith(path.join(root, 'node_modules') + path.sep)) throw new Err
 await rm(stage, { recursive: true, force: true });
 await mkdir(stage, { recursive: true });
 await cp(exportRoot, path.join(stage, 'out'), { recursive: true });
+await cp(path.join(root, 'LICENSE'), path.join(stage, 'LICENSE'));
 for (const dir of [ 'scripts', 'desktop', 'src/detection', 'src/i18n', 'src/regions']) await cp(path.join(root, dir), path.join(stage, dir), { recursive: true });
 await mkdir(path.join(stage, 'node_modules'), { recursive: true });
 if (process.platform !== 'win32' || process.arch !== 'x64') throw new Error('Windows x64 打包需使用 Windows x64 Node。');
