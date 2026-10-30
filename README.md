@@ -4,6 +4,14 @@ Claude 运行环境检测与保护工作台，支持浏览器与客户端环境�
 
 [English](README.en.md) · [GitHub](https://github.com/AACS111/EnvGuardCC) · [问题反馈](https://github.com/AACS111/EnvGuardCC/issues)
 
+## 下载
+
+- [Windows x64 安装包（.exe）](https://github.com/AACS111/EnvGuardCC/releases/download/v0.1.0/EnvGuardCC-Setup-0.1.0.exe)
+- [Windows x64 便携包（.zip）](https://github.com/AACS111/EnvGuardCC/releases/download/v0.1.0/EnvGuardCC-Windows-x64.zip)
+- [SHA-256 校验值](https://github.com/AACS111/EnvGuardCC/releases/download/v0.1.0/SHA256SUMS.txt) · [全部版本](https://github.com/AACS111/EnvGuardCC/releases)
+
+安装包下载后直接运行；便携包请完整解压后运行 EnvGuardCC.exe，保留同目录运行文件。均已包含运行环境，无需另行安装 Node.js。安装包尚未进行代码签名。
+
 ## 界面预览
 
 ### 概览
@@ -62,7 +70,7 @@ pnpm test:desktop
 pnpm test:shutdown
 pnpm test:protection
 pnpm build
-pnpm desktop:package
+pnpm desktop:installer
 ```
 
 桌面发布包名为 `EnvGuardCC-Windows-x64.zip`，具体目录见打包命令输出。

@@ -4,6 +4,14 @@ A Claude runtime environment inspection and protection workspace with browser an
 
 [中文](README.md) · [GitHub](https://github.com/AACS111/EnvGuardCC) · [Issues](https://github.com/AACS111/EnvGuardCC/issues)
 
+## Download
+
+- [Windows x64 installer (.exe)](https://github.com/AACS111/EnvGuardCC/releases/download/v0.1.0/EnvGuardCC-Setup-0.1.0.exe)
+- [Windows x64 portable package (.zip)](https://github.com/AACS111/EnvGuardCC/releases/download/v0.1.0/EnvGuardCC-Windows-x64.zip)
+- [SHA-256 checksums](https://github.com/AACS111/EnvGuardCC/releases/download/v0.1.0/SHA256SUMS.txt) · [All releases](https://github.com/AACS111/EnvGuardCC/releases)
+
+Run the installer directly, or extract the entire portable package and launch EnvGuardCC.exe with its accompanying files. Both packages include the runtime; Node.js is not required. The installer is not code-signed.
+
 ## Screenshots
 
 The screenshots below show the current Chinese desktop interface.
@@ -64,7 +72,7 @@ pnpm test:desktop
 pnpm test:shutdown
 pnpm test:protection
 pnpm build
-pnpm desktop:package
+pnpm desktop:installer
 ```
 
 The Windows release archive is named `EnvGuardCC-Windows-x64.zip`. The packaging command prints its output location.
