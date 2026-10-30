@@ -1,0 +1,12 @@
+# EnvGuardCC 的 pnpm 工作区配置，用于声明当前仓库包与允许构建的原生依赖。
+packages:
+  - .
+
+allowBuilds:
+  classic-level: set this to true or false
+  sharp: set this to true or false
+
+onlyBuiltDependencies:
+  - classic-level
+  - sharp
+  - unrs-resolver

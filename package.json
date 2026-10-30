@@ -1,0 +1,69 @@
+{
+  "name": "envguardcc",
+  "productName": "EnvGuardCC",
+  "version": "0.1.0",
+  "description": "Claude environment checker and account-risk analysis tool.",
+  "license": "MIT",
+  "homepage": "https://github.com/AACS111/EnvGuardCC",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/AACS111/EnvGuardCC.git"
+  },
+  "bugs": {
+    "url": "https://github.com/AACS111/EnvGuardCC/issues"
+  },
+  "keywords": [
+    "claude",
+    "anthropic",
+    "environment-checker",
+    "risk-analysis",
+    "nextjs"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "node scripts/dev.mjs",
+    "dev:electron": "node scripts/dev-electron.mjs",
+    "repair:helper": "node scripts/local-repair.mjs",
+    "gateway": "node scripts/claude-gateway.mjs",
+    "test:dev": "node --test scripts/check-dev.mjs",
+    "test:repair": "node scripts/check-repair-scoring.cjs",
+    "test:environment": "node --test --test-timeout=35000 scripts/check-environment-runtime.mjs",
+    "test:desktop": "node --test scripts/check-desktop-launcher.mjs",
+    "test:shutdown": "node --test scripts/check-shutdown-restore.mjs",
+    "test:gateway": "node --test scripts/check-gateway.mjs scripts/check-gateway-model.cjs scripts/check-gateway-simulation.mjs scripts/check-simulation-runner.mjs scripts/check-gateway-proxy.mjs",
+    "test:simulation": "node --test scripts/check-gateway-simulation.mjs",
+    "build": "next build",
+    "start": "next start",
+    "lint": "eslint",
+    "traffic:prepare": "node scripts/traffic-config.mjs prepare",
+    "traffic:apply": "node scripts/traffic-config.mjs apply",
+    "traffic:restore": "node scripts/traffic-config.mjs restore",
+    "traffic:status": "node scripts/traffic-config.mjs status",
+    "traffic:serve": "node scripts/traffic-layer.mjs",
+    "test:traffic": "node --test scripts/check-traffic-layer.mjs",
+    "test:protection": "node --test scripts/check-protection-session.mjs scripts/check-protection-controls.cjs scripts/check-protection-reconnect.mjs",
+    "desktop:package": "node scripts/package-desktop.mjs",
+    "license:generator": "node tools/license-generator/server.mjs --open",
+    "license:package": "node tools/license-generator/package.mjs",
+    "test:license": "node --test tools/license-generator/check-license.mjs"
+  },
+  "dependencies": {
+    "classic-level": "3.0.0",
+    "next": "16.2.10",
+    "react": "19.2.4",
+    "react-dom": "19.2.4"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4",
+    "@types/node": "^20",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "eslint": "^9",
+    "eslint-config-next": "16.2.10",
+    "js-yaml": "4.3.0",
+    "tailwindcss": "^4",
+    "typescript": "^5"
+  }
+}

@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="issuer-token" content="__ISSUER_TOKEN__">
+  <title>EnvGuardCC 授权码生成器</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <main>
+    <header>
+      <p class="eyebrow">EnvGuardCC · 离线签发</p>
+      <h1>授权码生成器</h1>
+      <p class="description">绑定指定 Claude 桌面账号，生成后须在一小时内激活。无需登录本工具。</p>
+    </header>
+    <form id="issue-form" aria-describedby="form-error">
+      <div class="field">
+        <label for="account">Claude 桌面账号 UUID</label>
+        <input id="account" name="account" type="text" autocomplete="off" spellcheck="false" maxlength="36" required pattern="[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}" aria-describedby="account-help">
+        <p id="account-help" class="description">填写真实账号的 UUID，不能使用邮箱、组织 ID 或设备 ID。生成器不会读取 Claude 登录凭证。</p>
+      </div>
+      <div class="field">
+        <label for="days">激活后可用天数</label>
+        <input id="days" name="days" type="number" min="1" max="3650" step="1" value="30" required aria-describedby="days-help">
+        <p id="days-help" class="description">从首次成功激活开始计时；一小时激活窗口与使用期限分别计算。</p>
+      </div>
+      <p id="form-error" class="error" role="alert" hidden></p>
+      <button id="issue" type="submit" disabled>正在连接生成器…</button>
+    </form>
+    <section id="result" aria-labelledby="result-title" hidden>
+      <h2 id="result-title">授权码已生成</h2>
+      <dl>
+        <div><dt>绑定账号</dt><dd id="result-account"></dd></div>
+        <div><dt>签发时间</dt><dd id="issued-at"></dd></div>
+        <div><dt>激活截止</dt><dd id="activate-before"></dd></div>
+        <div><dt>激活后可用</dt><dd id="usage"></dd></div>
+      </dl>
+      <label for="license">授权码</label>
+      <textarea id="license" readonly rows="6" spellcheck="false" aria-describedby="copy-help"></textarea>
+      <p id="copy-help" class="description">将完整授权码交给对应账号的用户；已签发内容不能直接修改。</p>
+      <div class="actions"><button id="copy" class="secondary" type="button">复制授权码</button><button id="download" class="secondary" type="button">保存授权文件</button></div>
+      <p id="copy-status" role="status" aria-live="polite"></p>
+    </section>
+    <footer>
+      <h2>验签公钥</h2>
+      <p class="description">集成到主应用时使用此公钥。签发私钥保留在本机，不随授权码或公钥导出。</p>
+      <p class="fingerprint" id="fingerprint">正在读取公钥指纹…</p>
+      <button id="public-key" class="secondary" type="button" disabled>导出验签公钥</button>
+      <p class="description">当前工具只负责签发，不验证 UUID 的所有权，也不代表主应用已完成账号绑定。</p>
+    </footer>
+  </main>
+</body>
+</html>

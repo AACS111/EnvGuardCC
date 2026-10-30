@@ -1,0 +1,15 @@
+export const simulationCases = [
+  { id: "passthrough", label: "无配置时原样转发", signals: ["language", "locale"] },
+  { id: "preview", label: "配置预览不算验证", signals: ["language", "languageVariant", "locale"] },
+  { id: "headers", label: "目标语言与区域改写", signals: ["language", "languageVariant", "locale", "requestHeaders"] },
+  { id: "stream", label: "SSE流式响应与正文透传", signals: ["claudeTrigger", "claudeLatency", "requestHeaders"] },
+  { id: "field", label: "未改写字段不冒用结果", signals: ["locale"] },
+  { id: "auth", label: "401鉴权错误保留", signals: ["claudeTrigger", "apiReachability"] },
+  { id: "rate", label: "429限流错误保留", signals: ["claudeTrigger", "apiReachability"] },
+  { id: "target", label: "切换目标使旧记录失效", signals: ["language", "languageVariant", "locale", "requestHeaders"] },
+  { id: "disabled", label: "关闭后恢复原始声明", signals: ["language", "locale"] },
+  { id: "disconnect", label: "连接中断与502处理", signals: ["claudeTrigger", "claudeReachability"] },
+  { id: "contract", label: "消息协议与错误载荷", signals: ["requestHeaders"] },
+  { id: "retry", label: "限流后的客户端重试", signals: ["claudeTrigger", "apiReachability"] },
+  { id: "cancel", label: "客户端取消请求", signals: ["claudeTrigger"] },
+];
