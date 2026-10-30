@@ -67,7 +67,7 @@ const packager = packagerModule.default ?? packagerModule.packager;
 process.env.electron_config_cache ||= path.join(toolsDir, 'electron-cache');
 require('electron');
 const version = JSON.parse(await readFile(path.join(toolsDir, 'node_modules/electron/package.json'), 'utf8')).version;
-const { downloadArtifact } = require('@electron/get');
+const { downloadArtifact } = createRequire(require.resolve('electron/package.json'))('@electron/get');
 const zip = await downloadArtifact({ version, platform: 'win32', arch: 'x64', artifactName: 'electron', cacheRoot: path.join(root, 'node_modules', '.checkcc-electron-cache'), checksums: JSON.parse(await readFile(path.join(toolsDir, 'node_modules/electron/checksums.json'), 'utf8')) });
 const artifacts = await packager({ dir: stage, out: output, name: 'EnvGuardCC', executableName: 'EnvGuardCC', icon: path.join(root, 'desktop', 'envguardcc.ico'), platform: 'win32', arch: 'x64', electronVersion: version, electronZipDir: path.dirname(zip), overwrite: true, asar: false, prune: false, appVersion: manifest.version, win32metadata: { CompanyName: 'EnvGuardCC', FileDescription: 'EnvGuardCC 环境检测与模拟保护', ProductName: 'EnvGuardCC' } });
 // Replace the release ZIP only after compression has completed successfully.
