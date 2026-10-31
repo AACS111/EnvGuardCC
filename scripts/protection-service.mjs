@@ -27,12 +27,14 @@ export function targetFromExit(exit) {
   return { ip: geo.ip, countryCode: geo.countryCode, countryName: FALLBACK_COUNTRY_NAMES[geo.countryCode] ?? geo.countryCode, city: geo.city, timezone, windowsTimezone: WINDOWS_ZONES[timezone] ?? null, language, locale: language };
 }
 
-export function createProtectionService({ stateDir, runtime, browserCloak, currentZone, setZone, canTest, gatewayRequest = gateway }) {
+export function createProtectionService({ stateDir, runtime, browserCloak, currentZone, setZone, restoreTimezone, canTest, gatewayRequest = gateway }) {
   const profileFile = path.join(stateDir, 'region-profile.json');
   const timezoneBackup = path.join(stateDir, 'timezone-backup.json');
   const policyFile = path.join(stateDir, 'environment-policy.json');
   const gateway = gatewayRequest;
-  return new ProtectionSession({
+  let browserIssues = [];
+  const browserErrors = report => [...report.results.filter(result => result.state !== "verified").map(result => result.detail), ...(report.requestProbe?.state !== "verified" ? [report.requestProbe?.detail || "浏览器实际请求尚未验证。"] : [])];
+  const session = new ProtectionSession({
     stateDir, canTest,
     detect: async () => targetFromExit((await collectNetworkDiagnostics(new URL(process.env.CHECKCC_UPSTREAM || 'https://api.anthropic.com'), { signalId: 'country' })).exit),
     snapshot: async () => {
@@ -47,10 +49,10 @@ export function createProtectionService({ stateDir, runtime, browserCloak, curre
         if (!target.windowsTimezone) issues.push('当前地区暂无系统时区映射，需手动处理。');
         else try { if (await currentZone() !== target.windowsTimezone) await setZone(target.windowsTimezone); }
         catch (error) { issues.push('系统时区适配失败：' + error.message); }
-      } else issues.push('本机系统时区自动适配仅支持 Windows。');
+      } // macOS system timezone is changed only by the explicit timezone operation.
       const report = await browserCloak.sync(origin, { launch: false, force: true });
-      for (const result of report.results) if (result.state !== 'verified') issues.push(result.detail);
-      if (report.requestProbe?.state !== 'verified') issues.push(report.requestProbe?.detail ?? '浏览器实际请求尚未验证。');
+      browserIssues = browserErrors(report);
+      issues.push(...browserIssues);
       return issues;
     },
     restore: async (baseline, origin, { shutdown = false } = {}) => {
@@ -73,6 +75,7 @@ export function createProtectionService({ stateDir, runtime, browserCloak, curre
       });
       await attempt('浏览器配置文件恢复', () => saveFile(policyFile, Object.hasOwn(baseline, 'policyFile') ? baseline.policyFile : JSON.stringify(baseline.policy)));
       await attempt('系统时区恢复', async () => {
+        if (restoreTimezone) { await restoreTimezone(); return; }
         if (baseline.timezone && await currentZone() !== baseline.timezone) await setZone(baseline.timezone);
         await saveFile(timezoneBackup, baseline.timezoneBackup);
       });
@@ -93,4 +96,10 @@ export function createProtectionService({ stateDir, runtime, browserCloak, curre
       return job;
     },
   });
+  session.refreshBrowser = report => {
+    const remaining = session.report().issues.filter(issue => !browserIssues.includes(issue));
+    browserIssues = browserErrors(report);
+    session.updateIssues([...remaining, ...browserIssues]);
+  };
+  return session;
 }

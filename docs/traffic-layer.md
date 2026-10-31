@@ -26,7 +26,7 @@ HTTP 代理不承载 UDP：原本走海外代理策略的 UDP 会不可用，QUI
 
 示例地址是文档保留地址，请替换为实际目标。IP 规则是目标 IP，不能改变代理出口公网 IP。精确匹配 IP 的域名访问需要 FlClash 获得真实目标 IP；fake-IP 模式下优先添加域名规则，不额外强迫本地解析目标域名。127.0.0.0/8 和 ::1 保留直连以避免代理循环。
 
-修改后运行 pnpm traffic:prepare，再 pnpm traffic:apply，然后在 FlClash 重新应用当前配置。apply 前必须有已验证的拦截入口；pnpm traffic:serve 可独立启动。开发启动器会启动或复用已应用的拦截入口。Windows 应用时同时添加当前用户隐藏自启动入口，避免重启后本机代理缺席。
+修改后运行 pnpm traffic:prepare，再 pnpm traffic:apply，然后在 FlClash 重新应用并启动当前配置。apply 前必须有已验证的拦截入口；pnpm traffic:serve 可独立启动。开发启动器会启动或复用已应用的拦截入口。Windows 应用时同时添加当前用户隐藏自启动入口，避免重启后本机代理缺席。
 
 pnpm traffic:status 查看保存状态；这不等于内核已重载。运行时统计需以经过认证的 /__checkcc/traffic/status 为准，不记录目标 URL、账号、正文或代理密码。
 

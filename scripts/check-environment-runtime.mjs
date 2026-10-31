@@ -309,3 +309,35 @@ test("跨域 iframe 刷新与关闭后仍能恢复原始接口，重复恢复幂
     await rm(directory, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
   }
 });
+
+test('代理地址改变后重建受控进程，实际请求使用新代理且保留接口策略', { timeout: 20000 }, async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), 'checkcc-network-change-'));
+  const names = ['CHECKCC_STATE_DIR', 'CHECKCC_PROXY', 'HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy', 'ALL_PROXY', 'all_proxy'];
+  const previous = Object.fromEntries(names.map(name => [name, process.env[name]]));
+  for (const name of names) delete process.env[name];
+  process.env.CHECKCC_STATE_DIR = directory;
+  const requests = [[], []];
+  const servers = requests.map((seen, index) => http.createServer((request, response) => { seen.push(request.url); response.end(`<title>proxy-${index}</title>`); }));
+  for (const server of servers) await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  const settings = index => writeFile(path.join(directory, 'proxy-settings.json'), JSON.stringify({ mode: 'manual', address: `http://127.0.0.1:${servers[index].address().port}` }));
+  const runtime = new EnvironmentRuntime({ stateDir: directory, headless: true });
+  try {
+    await settings(0);
+    await runtime.apply({ languages: ['en-US'], locale: 'en-US' }, `http://127.0.0.1:${servers[0].address().port}`, ['web']);
+    const firstPid = runtime.clients.get('web').child.pid;
+    await settings(1);
+    await runtime.apply({ languages: ['en-US'], locale: 'en-US' }, `http://127.0.0.1:${servers[1].address().port}`, ['web']);
+    const instance = runtime.clients.get('web');
+    assert.notEqual(instance.child.pid, firstPid);
+    const [session] = instance.sessions.keys();
+    const navigation = await instance.client.send('Page.navigate', { url: 'http://checkcc-network-change.invalid/' }, session);
+    assert.equal(navigation.errorText, undefined);
+    assert.ok(requests[1].includes('http://checkcc-network-change.invalid/'));
+    assert.deepEqual(runtime.policy.languages, ['en-US']);
+  } finally {
+    await runtime.close();
+    for (const server of servers) { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); }
+    for (const name of names) { if (previous[name] === undefined) delete process.env[name]; else process.env[name] = previous[name]; }
+    await rm(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  }
+});

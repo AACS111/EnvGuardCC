@@ -1,4 +1,4 @@
-export const HELPER_PROTOCOL = 6;
+export const HELPER_PROTOCOL = 7;
 
 export function assertCurrentHelper(session) {
   if (!/^[a-f0-9]{64}$/.test(session?.token ?? '')) throw new Error('本机助手返回了无效会话。');

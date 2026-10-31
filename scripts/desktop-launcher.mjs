@@ -1,4 +1,5 @@
-import { spawn } from 'node:child_process';
+import { spawn, execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { mkdir, access } from 'node:fs/promises';
 import path from 'node:path';
 import { findDesktop } from './environment-runtime.mjs';
@@ -6,10 +7,13 @@ import { selectedProxy } from './gateway-proxy.mjs';
 import { createDesktopGateway } from './desktop-gateway.mjs';
 import { stopManagedProcess } from './managed-process.mjs';
 import { DesktopLocale, desktopLocale } from './desktop-locale.mjs';
+import { applicationResources } from './application-paths.mjs';
 
 export class DesktopLauncher {
-  constructor({ stateDir, findExecutable = findDesktop, startProcess = spawn, resolveProxy = selectedProxy } = {}) {
+  constructor({ stateDir, findExecutable = findDesktop, startProcess = spawn, resolveProxy = selectedProxy, platform = process.platform, openApplication = promisify(execFile) } = {}) {
     this.stateDir = stateDir;
+    this.platform = platform;
+    this.openApplication = openApplication;
     this.findExecutable = findExecutable;
     this.startProcess = startProcess;
     this.resolveProxy = resolveProxy;
@@ -18,7 +22,7 @@ export class DesktopLauncher {
     this.localeProfile = new DesktopLocale(stateDir);
   }
   snapshot() {
-    return { version: 1, state: this.state, pid: this.child?.pid ?? null, startedAt: this.startedAt ?? null, error: this.error, locale: this.localeProfile.locale ?? null, gateway: this.relay ? { url: this.gatewayUrl, ...this.relay.snapshot() } : null };
+    return { version: 1, mode: this.platform === 'darwin' ? 'standard' : 'managed', detail: this.platform === 'darwin' ? '普通打开请求不代表独立资料、网关转发或接口保护已验证。' : null, state: this.state, pid: this.child?.pid ?? null, startedAt: this.startedAt ?? null, error: this.error, locale: this.localeProfile.locale ?? null, gateway: this.relay ? { url: this.gatewayUrl, ...this.relay.snapshot() } : null };
   }
   launch(target = {}) {
     if (this.closed) return Promise.reject(new Error('应用正在退出，请重新打开 EnvGuardCC。'));
@@ -32,11 +36,18 @@ export class DesktopLauncher {
     let relay;
     try {
       const executable = await this.findExecutable();
+      if (this.platform === 'darwin') {
+        const resources = applicationResources(executable);
+        if (path.basename(resources) !== 'Resources') throw new Error('普通打开需要有效的 macOS Claude 应用包。');
+        await this.openApplication('/usr/bin/open', ['-a', path.dirname(path.dirname(resources))], { timeout: 10000 });
+        this.state = 'opened'; this.startedAt = new Date().toISOString();
+        return this.snapshot();
+      }
       const profile = path.join(this.stateDir, 'managed-claude-desktop');
       await mkdir(profile, { recursive: true });
       if (target.locale || target.language) {
         const locale = desktopLocale(target.locale || target.language);
-        try { await access(path.join(path.dirname(executable), 'resources', `${locale}.json`)); }
+        try { await access(path.join(applicationResources(executable), `${locale}.json`)); }
         catch { throw new Error(`当前 Claude 版本未提供 ${locale} 界面语言。`); }
         await this.localeProfile.apply(locale);
       }

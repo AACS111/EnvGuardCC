@@ -38,7 +38,7 @@ export function RepairDialog({ signal, browser, claude, signals, locale, loading
   const [failed, setFailed] = useState(false);
   const [execution, setExecution] = useState<EnvironmentExecution | null>(null);
   const savedTarget = useRepairTarget(signal.id);
-  const choices = useMemo(() => repairChoices(signal, target), [signal, target]);
+  const choices = useMemo(() => repairChoices(signal, target, session?.platform), [signal, target, session?.platform]);
   const savedChoice = choices.find((choice) => choice.id === savedTarget?.id && choice.value === savedTarget.value);
   const observationOnly = choices.every((choice) => choice.action === "information" && !choiceRuntimePolicy(signal.id, choice));
   const selected = observationOnly ? choices.find((choice) => choice.current) : choices.find((choice) => choice.id === selectedId) ?? savedChoice ?? choices.find((choice) => choice.match === "target") ?? choices.find((choice) => choice.current);
@@ -65,7 +65,7 @@ export function RepairDialog({ signal, browser, claude, signals, locale, loading
     if (!isTimezone) return;
     let cancelled = false;
     helperRequest("/session").then((result: Session) => {
-      if (!cancelled) { setSession(result); setConnection(result.platform === "win32" ? "ready" : "unsupported"); }
+      if (!cancelled) { setSession(result); setConnection(result.capabilities?.timezoneWrite ? "ready" : "unsupported"); }
     }).catch(() => { if (!cancelled) setConnection("offline"); });
     return () => { cancelled = true; };
   }, [isTimezone]);
@@ -90,11 +90,11 @@ export function RepairDialog({ signal, browser, claude, signals, locale, loading
 
   const report = (text: string, error = false) => { setMessage(text); setFailed(error); };
   const applyTimezone = async (restore = false) => {
-    if (!session || (!restore && selected?.action !== "timezone")) return;
+    if (!session?.capabilities?.timezoneWrite || (!restore && selected?.action !== "timezone")) return;
     setBusy(true);
     report(zh ? "正在修改系统时区…" : "Updating system timezone…");
     try {
-      const result = await helperRequest(restore ? "/timezone/restore" : "/timezone", session.token, restore ? {} : { timezone: selected?.windowsTimezone });
+      const result = await helperRequest(restore ? "/timezone/restore" : "/timezone", session.token, restore ? {} : { timezone: session.capabilities?.timezoneFormat === "iana" ? selected?.value : selected?.windowsTimezone });
       setSession({ ...session, timezone: result.timezone, canRestore: result.canRestore });
       if (!restore && selected) { saveRepairTarget(window.localStorage, signal.id, selected); notifyRepairTargetChange(); }
       report(zh ? `系统时区已设为 ${result.timezone}，正在复检…` : `System timezone set to ${result.timezone}. Rechecking…`);
@@ -194,13 +194,15 @@ export function RepairDialog({ signal, browser, claude, signals, locale, loading
         {message && <p className={`repair-feedback${failed ? " repair-feedback--error" : ""}`} role={failed ? "alert" : "status"}>{message}</p>}
       </div>
       <footer className="repair-dialog__footer">
-        <button type="button" className="repair-button repair-button--primary" disabled={locked || (protectionEnabled && isTimezone && connection !== "ready")} onClick={() => {
-          if (observationOnly || !protectionEnabled || !selected) { setBusy(true); report(""); void onRecheck().then(() => report(zh ? "已完成当前环境重测。" : "Environment retested.")).catch((error) => report(String(error), true)).finally(() => setBusy(false)); }
+        {isTimezone && session?.canRestore && <button type="button" className="repair-button" disabled={locked || connection !== "ready"} onClick={() => void applyTimezone(true)}>{zh ? "恢复原始系统时区" : "Restore original system timezone"}</button>}
+        <button type="button" className="repair-button repair-button--primary" disabled={locked || (isTimezone && connection !== "ready")} onClick={() => {
+          if (isTimezone && selected?.action === "timezone" && connection === "ready") void applyTimezone();
+          else if (observationOnly || !protectionEnabled || !selected) { setBusy(true); report(""); void onRecheck().then(() => report(zh ? "已完成当前环境重测。" : "Environment retested.")).catch((error) => report(String(error), true)).finally(() => setBusy(false)); }
           else if (isTimezone && selected.action === "timezone") void applyTimezone();
           else if (runtimeChoice) void applyScripts();
           else if (policy.treatment === "gateway" && selected.action !== "information") void applyGateway();
           else void confirmTarget();
-        }}>{locked ? (zh ? "执行中…" : "Working…") : observationOnly ? (zh ? "重新检测" : "Retest") : (zh ? "确认并重测" : "Confirm & retest")}</button>
+        }}>{locked ? (zh ? "执行中…" : "Working…") : isTimezone ? (zh ? "设置系统时区并复检" : "Set system timezone & recheck") : observationOnly ? (zh ? "重新检测" : "Retest") : (zh ? "确认并重测" : "Confirm & retest")}</button>
       </footer>
     </dialog>
   );

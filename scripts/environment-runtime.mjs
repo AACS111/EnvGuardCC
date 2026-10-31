@@ -1,13 +1,13 @@
-import { spawn, execFile } from "node:child_process";
-import { promisify } from "node:util";
-import { access, mkdir, readFile, writeFile, rename } from "node:fs/promises";
+import { spawn } from "node:child_process";
+import { mkdir, readFile, writeFile, rename } from "node:fs/promises";
 import path from "node:path";
 import net from "node:net";
 import { selectedProxy } from "./gateway-proxy.mjs";
 import { stopManagedProcess } from "./managed-process.mjs";
 import { runtimePolicyScript, verifyRuntimePolicy, migrateRuntimePolicy } from "../src/detection/runtime-policy.mjs";
+import { findBrowser, findDesktop } from "./application-paths.mjs";
 
-const exec = promisify(execFile);
+export { findBrowser, findDesktop };
 export function validatePolicy(delta) {
   if (!delta || typeof delta !== "object" || Array.isArray(delta)) throw new Error("无效环境配置。");
   const result = {};
@@ -51,24 +51,6 @@ class DebugConnection {
   disconnect() { for (const task of this.pending.values()) { clearTimeout(task.timer); task.reject(new Error("环境连接已关闭")); } this.pending.clear(); this.closeTransport(); }
 }
 
-async function findBrowser() {
-  const candidates = [process.env.CHECKCC_BROWSER_PATH, path.join(process.env.ProgramFiles ?? "C:/Program Files", "Google/Chrome/Application/chrome.exe"), path.join(process.env["ProgramFiles(x86)"] ?? "C:/Program Files (x86)", "Microsoft/Edge/Application/msedge.exe")].filter(Boolean);
-  for (const candidate of candidates) { try { await access(candidate); return candidate; } catch { /* Try next installed browser. */ } }
-  throw new Error("未找到 Chrome/Edge，无法启动隔离浏览器。");
-}
-
-export async function findDesktop() {
-  if (process.platform !== "win32") throw new Error("桌面客户端自动接入目前仅支持 Windows。");
-  if (process.env.CHECKCC_DESKTOP_PATH) {
-    await access(process.env.CHECKCC_DESKTOP_PATH);
-    return process.env.CHECKCC_DESKTOP_PATH;
-  }
-  const result = await exec("pwsh.exe", ["-NoProfile", "-NonInteractive", "-Command", "$p = Get-AppxPackage -Name Claude | Select-Object -First 1; if ($p) { Join-Path $p.InstallLocation 'app/Claude.exe' }"], { windowsHide: true, timeout: 5000, maxBuffer: 4096 });
-  const candidate = result.stdout.trim();
-  if (!candidate) throw new Error("未找到 Claude 桌面应用包。");
-  await access(candidate); return candidate;
-}
-
 async function unusedPort() {
   const server = net.createServer();
   await new Promise((resolve, reject) => { server.once("error", reject); server.listen(0, "127.0.0.1", resolve); });
@@ -88,7 +70,7 @@ export function browserNetworkArgs(proxy = selectedProxy()) {
 
 export class EnvironmentRuntime {
   clients = new Map(); policy = {}; loaded = false; enabled = true;
-  constructor({ stateDir, browserPath, headless = false, networkProxy = selectedProxy() }) { this.stateDir = stateDir; this.browserPath = browserPath; this.headless = headless; this.networkProxy = networkProxy; }
+  constructor({ stateDir, browserPath, headless = false, networkProxy }) { this.stateDir = stateDir; this.browserPath = browserPath; this.headless = headless; this.networkProxy = networkProxy; }
   async load() {
     if (this.loaded) return;
     try { this.policy = validatePolicy(migrateRuntimePolicy(JSON.parse(await readFile(path.join(this.stateDir, "environment-policy.json"), "utf8")))); } catch { this.policy = {}; }
@@ -105,7 +87,8 @@ export class EnvironmentRuntime {
     const profile = path.join(this.stateDir, `protected-${kind}`);
     await mkdir(profile, { recursive: true });
     // Use the same real upstream as the gateway, without sending proxy credentials to argv.
-    const networkArgs = browserNetworkArgs(this.networkProxy);
+    const networkProxy = this.networkProxy === undefined ? selectedProxy() : this.networkProxy;
+    const networkArgs = browserNetworkArgs(networkProxy);
     let client, child, spawnError;
     if (kind === "web") {
       child = spawn(this.browserPath ?? await findBrowser(), [`--user-data-dir=${profile}`, "--remote-debugging-pipe", "--no-first-run", "--no-default-browser-check", ...networkArgs, ...(this.headless ? ["--headless=new", "--disable-gpu"] : []), "about:blank"], { windowsHide: this.headless, stdio: ["ignore", "ignore", "ignore", "pipe", "pipe"] });
@@ -115,6 +98,7 @@ export class EnvironmentRuntime {
       child.stdio[3].on("error", () => client.disconnect());
       child.stdio[4].on("data", (chunk) => { buffer += chunk; let end; while ((end = buffer.indexOf("\0")) >= 0) { const raw = buffer.slice(0, end); buffer = buffer.slice(end + 1); if (raw) client.receive(raw); } });
     } else {
+      if (process.platform === "darwin") throw new Error("当前 macOS Claude 未提供可验证的独立调试接入，请使用受控浏览器；未修改个人客户端资料。");
       const port = await unusedPort();
       child = spawn(await findDesktop(), [`--user-data-dir=${profile}`, `--remote-debugging-port=${port}`, "--remote-debugging-address=127.0.0.1", ...networkArgs], { windowsHide: false, stdio: "ignore" });
       child.on("error", (error) => { spawnError = error; });
@@ -133,7 +117,7 @@ export class EnvironmentRuntime {
       socket.addEventListener("close", () => { if (this.clients.get(kind)?.client === client) this.clients.delete(kind); });
     }
     child.on("error", () => { client?.disconnect(); });
-    const instance = { kind, child, client, origin, sessions: new Map(), tasks: new Set(), errors: [] };
+    const instance = { kind, child, client, origin, networkKey: networkProxy?.url.href || null, sessions: new Map(), tasks: new Set(), errors: [] };
     child.once("exit", () => { if (this.clients.get(kind) === instance) this.clients.delete(kind); client.disconnect(); });
     client.listeners.add((event) => {
       if (event.method === "Target.detachedFromTarget") instance.sessions.delete(event.params.sessionId);
@@ -206,7 +190,14 @@ export class EnvironmentRuntime {
     const results = await Promise.all(kinds.map(async (kind) => {
       try {
         if (!["web", "desktop"].includes(kind)) throw new Error("不支持的执行环境");
-        const existing = this.clients.get(kind);
+        let existing = this.clients.get(kind);
+        const proxy = this.networkProxy === undefined ? selectedProxy() : this.networkProxy;
+        if (existing && existing.networkKey !== (proxy?.url.href || null)) {
+          await stopManagedProcess(existing.child);
+          existing.client.disconnect();
+          this.clients.delete(kind);
+          existing = undefined;
+        }
         const instance = existing ?? await this.launch(kind, origin);
         const observations = [];
         await Promise.all([...instance.tasks]);
