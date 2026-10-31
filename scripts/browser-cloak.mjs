@@ -8,7 +8,7 @@ export class BrowserCloakController {
     if (!response.ok || value.version !== 1 || typeof value.cloak?.enabled !== "boolean") throw new Error("无法读取网关模拟保护状态。");
     return value;
   }
-  key(state) { return JSON.stringify([state.cloak.enabled, state.cloak.updatedAt, state.profile?.updatedAt, state.profile?.language, state.profile?.locale]); }
+  key(state) { return JSON.stringify([state.cloak.enabled, state.cloak.updatedAt, state.profile?.updatedAt, state.profile?.language, state.profile?.locale, state.proxy?.mode, state.proxy?.source, state.proxy?.address]); }
   invalidate() { this.fingerprint = null; this.report = null; }
   detach() { clearInterval(this.timer); this.timer = null; this.origin = null; this.fingerprint = null; this.report = null; }
   async sync(origin, { launch = false, force = false } = {}) {

@@ -1,5 +1,7 @@
 "use client";
 import Image from 'next/image';
+import type { BrowserCloakExecution } from '@/detection/environment-runtime';
+import { ConnectionSettings } from './ConnectionSettings';
 import { measurementStatus, measurementPoints } from '@/detection/measurement-status';
 import { signalPolicy } from '@/detection/signal-policy';
 import { verificationScores, verificationItem, verificationSampleStatus, environmentRiskEstimates } from '@/detection/verification-score';
@@ -15,6 +17,7 @@ import type { CSSProperties, ReactNode } from 'react';
 
 export type Baseline = { at: string; browser: SignalView[]; claude: SignalView[]; score: number | null; policy: Record<string, unknown>; storage: Record<string, string | null> };
 type Props = {
+  browserReport?: BrowserCloakExecution | null; onBrowserReport?: (report: BrowserCloakExecution) => void;
   locale: LocaleCode; report: ProtectionReport | null; connected: boolean; busy: boolean; checking?: boolean; powerAction?: "start" | "stop" | null; error?: string;
   scores: ReturnType<typeof verificationScores>;
   geo: ExitGeo | null; target: ExitTarget | null; baseline: Baseline | null;
@@ -105,6 +108,7 @@ export function ProtectionWorkspace(props: Props) {
       <div className="workspace-content">
         {notices.length > 0 && <div className="workspace-notices" role="alert">{notices.map((message) => <p key={message} className="workspace-alert">{message}</p>)}</div>}
         <div id="panel-basic" role="tabpanel" aria-labelledby="tab-basic" tabIndex={0} hidden={tab !== 'basic'}>
+          <ConnectionSettings browserReport={connected && protectionEnabled ? props.browserReport ?? null : null} onBrowserReport={props.onBrowserReport} onRefresh={props.onRefresh} locale={locale} connected={connected} disabled={busy} protectionEnabled={protectionEnabled} />
           <section className="workspace-score" aria-label={text('环境验证得分', 'Environment verification scores')}>
             <div className="workspace-score-total"><span>{text('环境风险估计', 'Estimated environment risk')}</span><div className="workspace-risk-rings">{(['browser', 'claude'] as const).map(side => {
               const estimate = risks[side];

@@ -10,7 +10,7 @@ import { RepairDialog } from "./RepairDialog";
 import { currentSimulation, simulationSignals, nativeClientSignals } from "@/detection/simulation-evidence";
 import { mergePointSignals, mergePointCheckSignals, requestSignalSimulation } from "@/detection/single-signal";
 import { signalPolicy, signalTestKind } from "@/detection/signal-policy";
-import { activeRuntimePolicy, synchronizeBrowserCloak, watchBrowserCloak } from "@/detection/environment-runtime";
+import { activeRuntimePolicy, synchronizeBrowserCloak, watchBrowserCloak, type BrowserCloakExecution } from "@/detection/environment-runtime";
 import { installRuntimePolicy, restoreRuntimePolicy } from "@/detection/runtime-policy.mjs";
 import { protectionRequest } from "@/detection/protection";
 import { buildGatewayCheck } from "@/detection/gateway-check";
@@ -45,6 +45,7 @@ export function Detector({ locale = "zh" }: { locale?: LocaleCode }) {
   const [exitLoading, setExitLoading] = useState(false);
   const [checkError, setCheckError] = useState("");
   const [detailSignalId, setDetailSignalId] = useState<string | null>(null);
+  const [browserReport, setBrowserReport] = useState<BrowserCloakExecution | null>(null);
   const [baseline, setBaseline] = useState<Baseline | null>(null);
   const [filter, setFilter] = useState("all");
   const [search, setSearch] = useState("");
@@ -107,7 +108,7 @@ export function Detector({ locale = "zh" }: { locale?: LocaleCode }) {
   useEffect(() => {
     if (transitioning || protection.busy || protection.report?.phase === "starting" || protection.report?.phase === "stopping") return;
     if (protection.report?.phase === "restart_required") return;
-    return watchBrowserCloak(() => {});
+    return watchBrowserCloak(setBrowserReport);
   }, [transitioning, protection.busy, protection.report?.phase]);
   useEffect(() => {
     if (!baseline || protection.report?.phase !== "idle" || !protection.connected || transitioning || protection.busy) return;
@@ -300,7 +301,7 @@ export function Detector({ locale = "zh" }: { locale?: LocaleCode }) {
     finally { setTransitioning(false); }
   };
   return <>
-    <ProtectionWorkspace error={checkError || protection.error} locale={locale} report={protection.report} connected={protection.connected} powerAction={powerAction} checking={!powerAction && (exitLoading || loading || protection.report?.testing === true)} busy={cloakBusy || transitioning || exitLoading || loading || protection.report?.testing === true} scores={scores} geo={exitGeo} target={target} baseline={baseline} browser={browserSignals} claude={claudeSignals} signals={allSignals} filter={filter} search={search} onFilter={setFilter} onSearch={setSearch} onToggle={() => void toggleProtection()} onStop={() => void toggleProtection(true)} onMonitor={(enabled, intervalMs) => { void protection.act("monitor", { enabled, intervalMs }).catch(() => {}); }} onRefresh={() => void recheck()} onSelect={setDetailSignalId}
+    <ProtectionWorkspace browserReport={browserReport} onBrowserReport={setBrowserReport} error={checkError || protection.error} locale={locale} report={protection.report} connected={protection.connected} powerAction={powerAction} checking={!powerAction && (exitLoading || loading || protection.report?.testing === true)} busy={cloakBusy || transitioning || exitLoading || loading || protection.report?.testing === true} scores={scores} geo={exitGeo} target={target} baseline={baseline} browser={browserSignals} claude={claudeSignals} signals={allSignals} filter={filter} search={search} onFilter={setFilter} onSearch={setSearch} onToggle={() => void toggleProtection()} onStop={() => void toggleProtection(true)} onMonitor={(enabled, intervalMs) => { void protection.act("monitor", { enabled, intervalMs }).catch(() => {}); }} onRefresh={() => void recheck()} onSelect={setDetailSignalId}
       cards={visibleSignals.length ? <div className="signal-card-grid">{visibleSignals.map((signal) => <SignalCard key={signal.id} signal={signal} browser={browserSignals.find((item) => item.id === signal.id)} claude={claudeSignals.find((item) => item.id === signal.id)} locale={locale} target={target} job={simulationJob} simulationBusy={selfTest.busy} checking={loading} testing={pointBusy === signal.id} detailLabel={zh ? "配置与详情" : "Configuration & details"} onSelect={setDetailSignalId} />)}</div> : <p className="workspace-empty">{zh ? "没有匹配的检测项目。" : "No matching test items."}</p>} />
     {detailSignal && <RepairDialog key={detailSignal.id} signal={detailSignal} browser={browserSignals.find((item) => item.id === detailSignal.id)} claude={claudeSignals.find((item) => item.id === detailSignal.id)} signals={allSignals} locale={locale} target={target} protectionEnabled={protection.report?.enabled} loading={loading || transitioning || cloakBusy || protection.report?.testing === true || protection.report?.phase === "restart_required"} onClose={() => setDetailSignalId(null)} onRecheck={() => runSignal(detailSignal.id)} onRuntimeRecheck={runAll} onApplyGateway={(choice) => runSignal(detailSignal.id, choice)} />}
   </>;

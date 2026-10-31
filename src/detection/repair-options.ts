@@ -80,7 +80,7 @@ export function repairValueMatches(id: string, left: string, right: string) {
   return comparable(expected) === comparable(right);
 }
 
-export function repairChoices(signal: Pick<SignalResult, "id" | "value" | "contribution" | "assessment"> & Partial<Pick<SignalResult, "score" | "settingValue">>, target?: ExitTarget | null): RepairChoice[] {
+export function repairChoices(signal: Pick<SignalResult, "id" | "value" | "contribution" | "assessment"> & Partial<Pick<SignalResult, "score" | "settingValue">>, target?: ExitTarget | null, platform = "win32"): RepairChoice[] {
   const { id } = signal;
   const choices: RepairChoice[] = [];
   const add = (value: string, label: string, score: number, action: RepairAction = "information", extra: Partial<RepairChoice> = {}) => {
@@ -93,7 +93,7 @@ export function repairChoices(signal: Pick<SignalResult, "id" | "value" | "contr
       (zone) => zone,
     );
     for (const zone of zones) {
-      const effective = effectiveZone(zone);
+      const effective = platform === "win32" ? effectiveZone(zone) : zone;
       const impacts = { timezone: points("timezone", rules.timezoneScore(effective)), timezoneOffset: points("timezoneOffset", rules.offsetScore(rules.timezoneOffset(zone))) };
       add(zone, zoneLabel(zone), 0, "timezone", {
         contribution: impacts[id],
@@ -197,8 +197,8 @@ export function repairChoices(signal: Pick<SignalResult, "id" | "value" | "contr
 }
 
 // 一键优化使用的推荐项：优先出口目标，但目标项加分更高时仍取最低分项。
-export function recommendedChoice(signal: Pick<SignalResult, "id" | "value" | "contribution">, target?: ExitTarget | null): RepairChoice | null {
-  const choices = repairChoices(signal, target);
+export function recommendedChoice(signal: Pick<SignalResult, "id" | "value" | "contribution">, target?: ExitTarget | null, platform = "win32"): RepairChoice | null {
+  const choices = repairChoices(signal, target, platform);
   if (!choices.length) return null;
   const targetChoice = choices.find((choice) => choice.match === "target" && choice.id !== "current");
   if (targetChoice && targetChoice.contribution <= choices[0].contribution) return targetChoice;
