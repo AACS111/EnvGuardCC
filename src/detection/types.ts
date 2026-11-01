@@ -1,4 +1,5 @@
 // EnvGuardCC 的检测数据类型定义，用于描述地区、产品访问状态、信号结果和地区画像结构。
+import type { EmojiRenderingEvidence } from './emoji-rendering';
 export type RegionCode = "auto" | "cn" | "ru" | "ir";
 export type AccessStatus = "supported" | "possibly_supported" | "restricted" | "unsupported" | "unknown";
 export type SignalSource = "browser" | "server" | "combined" | "gateway";
@@ -24,9 +25,11 @@ export type SignalResult = {
   originalValue?: string;
   assessment?: "ok" | "warning" | "unknown" | "error" | "not_applicable";
   observation?: "review" | "unavailable" | "inconclusive";
+  unscored?: boolean;
   testedAt?: string;
   settingValue?: string;
   detail?: string;
+  emojiRendering?: EmojiRenderingEvidence;
   // 该结果来自哪一侧实测；用于对比浏览器环境与 Claude 环境是否被拦截迷惑层改写。
   environment?: SignalEnvironment;
   // 该项是否由拦截迷惑层改写（仅 Claude 侧可能出现）。

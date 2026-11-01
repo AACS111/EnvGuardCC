@@ -1,19 +1,15 @@
 // Diagnostic probes share the gateway's native HTTP transport. No API credentials or request bodies are sampled.
 import { proxyRequest, proxyInfo } from "./gateway-proxy.mjs";
 import dns from "node:dns";
-import { isIP } from "node:net";
+import { isPublicIp } from "../src/detection/ip-address.cjs";
+import { httpReachability, networkFailure } from "./claude-reachability.mjs";
 
 export function transportRequest(url, options, onResponse) {
   return proxyRequest(url, options, onResponse);
 }
 
 export function publicIp(value) {
-  if (typeof value !== "string" || !isIP(value)) return null;
-  if (isIP(value) === 4) {
-    const [a, b] = value.split(".").map(Number);
-    if (a === 0 || a === 10 || a === 127 || a >= 224 || (a === 100 && b >= 64 && b <= 127) || (a === 169 && b === 254) || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168)) return null;
-  } else if (/^(::|::1|::ffff:|f[cd]|fe[89ab]|ff)/i.test(value)) return null;
-  return value;
+  return typeof value === "string" && isPublicIp(value) ? value : null;
 }
 
 export function probe(rawUrl, { method = "HEAD", family, json = false, text = false, timeout = 4500, headers = {} } = {}) {
@@ -24,7 +20,7 @@ export function probe(rawUrl, { method = "HEAD", family, json = false, text = fa
     const finish = (result) => {
       if (settled) return;
       settled = true;
-      resolve({ url: url.origin + url.pathname, elapsedMs: Date.now() - start, ...result });
+      resolve({ url: url.origin + url.pathname, elapsedMs: Date.now() - start, outcome: httpReachability(result.status, result.challenge), ...(!result.status ? { failureKind: networkFailure(result.error) } : {}), ...result });
     };
     const request = transportRequest(url, {
       method, family, signal: AbortSignal.timeout(timeout),
@@ -33,6 +29,7 @@ export function probe(rawUrl, { method = "HEAD", family, json = false, text = fa
       const socket = response.socket;
       const result = {
         status: response.statusCode,
+        challenge: String(response.headers["cf-mitigated"]).toLowerCase() === "challenge",
         remoteAddress: socket.remoteAddress ?? null,
         tls: url.protocol === "https:" ? { authorized: socket.authorized === true, protocol: socket.getProtocol?.() ?? null } : null,
       };

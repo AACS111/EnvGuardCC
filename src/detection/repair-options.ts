@@ -82,6 +82,7 @@ export function repairValueMatches(id: string, left: string, right: string) {
 
 export function repairChoices(signal: Pick<SignalResult, "id" | "value" | "contribution" | "assessment"> & Partial<Pick<SignalResult, "score" | "settingValue">>, target?: ExitTarget | null, platform = "win32"): RepairChoice[] {
   const { id } = signal;
+  if (id === 'emojiStyle') return [];
   const choices: RepairChoice[] = [];
   const add = (value: string, label: string, score: number, action: RepairAction = "information", extra: Partial<RepairChoice> = {}) => {
     choices.push({ id: value, value, label, contribution: points(id, score), impacts: { [id]: points(id, score) }, action, match: "other", ...extra });
@@ -126,9 +127,6 @@ export function repairChoices(signal: Pick<SignalResult, "id" | "value" | "contr
     for (const [label, sc, tc] of [["No listed fonts / 无名单内字体", 0, 0], ["Traditional only / 仅繁体名单字体", 0, 1], ["1 simplified font / 1 种简体名单字体", 1, 0], ["2 simplified fonts / 2 种简体名单字体", 2, 0], ["3+ simplified fonts / 3 种以上简体名单字体", 3, 0]] as const) add(label, label, rules.fontScore(sc, tc));
   } else if (id === "vendorFonts") {
     for (const count of [0, 1, 2]) add(String(count), `${count === 2 ? "2+" : count} vendor fonts / 厂商名单字体`, rules.vendorFontScore(count));
-  } else if (id === "emojiStyle") {
-    // Unknown UA is not a real setting and is deliberately excluded as a zero-point "fix".
-    for (const value of ["macOS / iOS", "Windows", "Android"]) add(value, value, rules.emojiScore(value === "macOS / iOS" ? "Mac OS" : value));
   } else if (id === "domesticBrowser") {
     add("Chrome / Edge / Firefox / Safari", "Chrome / Edge / Firefox / Safari", 0);
     add("Matched browser brand / 命中品牌名单", "Matched browser brand / 命中品牌名单", 1);
@@ -163,7 +161,6 @@ export function repairChoices(signal: Pick<SignalResult, "id" | "value" | "contr
     if (id === "exitType") choice.current = /数据中心|Datacenter/i.test(choice.value) ? /机房|数据中心|云厂商|Datacenter|cloud/i.test(actual) : /住宅|家庭|其它网络|Residential|other network/i.test(actual);
     if (id === "domesticBrowser") choice.current = /Matched browser/.test(choice.value) ? signal.score! > 0 : signal.score === 0;
     if (id === "domesticDevice") choice.current = /Other/.test(choice.value) ? signal.score === 0 : actual.toLowerCase().includes(choice.value.toLowerCase());
-    if (id === "emojiStyle") choice.current = /Windows/.test(choice.value) ? /Windows/i.test(actual) : /Android/.test(choice.value) ? /Android/i.test(actual) : /Apple|苹果|macOS|iOS/i.test(actual);
     if (id === "dnsMode" || id === "dnsReview") choice.current = /Proxy resolution/.test(choice.value) ? /代理解析|Proxy resolution/.test(actual) : /系统 DNS|系统解析|System DNS|System lookup/.test(actual);
     if (id === "dnsConsistency") choice.current = signal.assessment === "ok" && /交叉核对通过|answer sets overlap/.test(actual);
     if (id === "multiSourceConsistency" || id === "proxyCountry") choice.current = /consistent sources/.test(choice.value) ? signal.assessment === "ok" : signal.assessment === "warning" || signal.assessment === "error";

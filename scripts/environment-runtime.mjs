@@ -6,6 +6,7 @@ import { selectedProxy } from "./gateway-proxy.mjs";
 import { stopManagedProcess } from "./managed-process.mjs";
 import { runtimePolicyScript, verifyRuntimePolicy, migrateRuntimePolicy } from "../src/detection/runtime-policy.mjs";
 import { findBrowser, findDesktop } from "./application-paths.mjs";
+import { recordNavigation, inspectClaudePage, browserPageState } from "./claude-reachability.mjs";
 
 export { findBrowser, findDesktop };
 export function validatePolicy(delta) {
@@ -120,6 +121,7 @@ export class EnvironmentRuntime {
     const instance = { kind, child, client, origin, networkKey: networkProxy?.url.href || null, sessions: new Map(), tasks: new Set(), errors: [] };
     child.once("exit", () => { if (this.clients.get(kind) === instance) this.clients.delete(kind); client.disconnect(); });
     client.listeners.add((event) => {
+      recordNavigation(instance, event);
       if (event.method === "Target.detachedFromTarget") instance.sessions.delete(event.params.sessionId);
       if (event.method !== "Target.attachedToTarget") return;
       const { sessionId, targetInfo } = event.params;
@@ -129,6 +131,11 @@ export class EnvironmentRuntime {
             await client.send("Page.enable", {}, sessionId);
             const registration = await client.send("Page.addScriptToEvaluateOnNewDocument", { source: this.source(origin) }, sessionId);
             instance.sessions.set(sessionId, { script: registration.identifier, type: targetInfo.type, targetId: targetInfo.targetId });
+            if (targetInfo.type === "page") {
+              const { frameTree } = await client.send("Page.getFrameTree", {}, sessionId);
+              instance.sessions.get(sessionId).frameId = frameTree.frame.id;
+              await client.send("Network.enable", {}, sessionId);
+            }
             await this.configure(instance, sessionId);
             // Recursively catch cross-origin renderer frames before their scripts run.
             await client.send("Target.setAutoAttach", { autoAttach: true, waitForDebuggerOnStart: true, flatten: true }, sessionId).catch(() => {});
@@ -177,6 +184,45 @@ export class EnvironmentRuntime {
     }
     if (this.enabled && this.policy.locale) await client.send("Emulation.setLocaleOverride", { locale: this.policy.locale }, sessionId);
     return client.send("Runtime.evaluate", { expression: this.source(instance.origin), returnByValue: true }, sessionId);
+  }
+  async claudeBrowser(origin, { open = false } = {}) {
+    if (!/^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)) throw new Error("仅支持本机检测页面。");
+    await this.load();
+    let instance = this.clients.get("web");
+    if (!instance && open) instance = await this.launch("web", origin);
+    const checkedAt = new Date().toISOString();
+    if (!instance) return { state: "unavailable", checkedAt };
+    const proxy = this.networkProxy === undefined ? selectedProxy() : this.networkProxy;
+    if (instance.networkKey !== (proxy?.url.href || null)) return { state: "route_changed", checkedAt };
+    await Promise.all([...instance.tasks]);
+    const { targetInfos } = await instance.client.send("Target.getTargets");
+    let target = targetInfos.find(item => item.targetId === instance.claudeVerificationTarget);
+    target ??= targetInfos.find(item => item.type === "page" && /^https:\/\/claude\.ai(?:\/|$)/.test(item.url));
+    if (!target && !open) return { state: "unavailable", checkedAt };
+    if (!target) {
+      const { targetId } = await instance.client.send("Target.createTarget", { url: "about:blank" });
+      target = { targetId };
+      for (let attempt = 0; attempt < 20; attempt++) {
+        await Promise.all([...instance.tasks]);
+        const entry = [...instance.sessions].find(([, item]) => item.targetId === targetId);
+        if (entry) { await instance.client.send("Page.navigate", { url: "https://claude.ai/" }, entry[0]); break; }
+        await new Promise(resolve => setTimeout(resolve, 50));
+      }
+    }
+    instance.claudeVerificationTarget = target.targetId;
+    if (open) await instance.client.send("Target.activateTarget", { targetId: target.targetId });
+    const entry = [...instance.sessions].find(([, item]) => item.targetId === target.targetId);
+    if (!entry) return { state: "unavailable", checkedAt };
+    const [sessionId, registration] = entry;
+    if (open && target.url && !/^https:\/\/claude\.ai(?:\/|$)/.test(target.url)) {
+      await instance.client.send("Page.navigate", { url: "https://claude.ai/" }, sessionId);
+      return { state: "loading", checkedAt };
+    }
+    if (registration.navigation && !registration.navigation.forClaude) return { state: "unavailable", checkedAt };
+    if (registration.navigation?.error) return { state: "network_error", status: null, failureKind: registration.navigation.error, checkedAt };
+    const result = await instance.client.send("Runtime.evaluate", { expression: `(${inspectClaudePage.toString()})()`, returnByValue: true }, sessionId);
+    if (result.exceptionDetails) return { state: "unavailable", checkedAt };
+    return { state: browserPageState(result.result?.value, registration.navigation), status: registration.navigation?.status ?? null, failureKind: registration.navigation?.error, checkedAt };
   }
   async apply(delta, origin, kinds = ["web", "desktop"]) {
     if (!/^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)) throw new Error("仅支持本机检测页面。");

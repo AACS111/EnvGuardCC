@@ -17,5 +17,5 @@ export async function shutdownHelper(url, origin, session, stopServer = false) {
   assertCurrentHelper(session);
   const response = await fetch(url + '/shutdown', { method: 'POST', headers: { ...headers, 'Content-Type': 'application/json', 'X-CheckCC-Token': session.token }, body: JSON.stringify({ stopServer }), signal: AbortSignal.timeout(120000) });
   const result = await response.json();
-  if (!response.ok || result.restored !== true) throw new Error(result.error ?? '本机配置恢复未完成。');
+  if (!response.ok || result.restored !== true) throw Object.assign(new Error(result.error ?? '本机配置恢复未完成。'), { code: result.code });
 }

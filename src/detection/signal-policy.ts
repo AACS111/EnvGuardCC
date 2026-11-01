@@ -12,7 +12,7 @@ export function signalTestKind(id: string) { return simulationSignalIds.includes
 export function signalPolicy(id: string) {
   const scope = detectionConfig.signals[id]?.environment ?? "claude";
   const treatment = scope === "browser" ? "browser" : gatewayFields.has(id) ? "gateway" : networkFields.has(id) ? "network" : "observe";
-  return { scope, treatment } as const;
+  return { scope, treatment, informational: detectionConfig.signals[id]?.informational === true } as const;
 }
 
 export function signalPolicyCopy(id: string, locale: LocaleCode) {

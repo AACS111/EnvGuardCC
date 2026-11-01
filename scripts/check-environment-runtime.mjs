@@ -225,6 +225,10 @@ test("本机助手自动启动后，执行请求需要本机来源、会话令�
     assert.equal(session.browserCloak, 1);
     const unauthorized = await fetch(`${helper.url}/environment`, { method: "POST", headers, body: JSON.stringify({ policy: { fontMode: "none" } }) });
     assert.equal(unauthorized.status, 403);
+    const unopened = await fetch(`${helper.url}/claude-browser`, { headers });
+    assert.equal((await unopened.json()).state, "unavailable");
+    assert.equal((await fetch(`${helper.url}/claude-browser`, { method: "POST", headers, body: JSON.stringify({action:"open"}) })).status, 403);
+    assert.equal((await fetch(`${helper.url}/claude-browser`, { method: "POST", headers: {...headers,"X-CheckCC-Token":session.token}, body: JSON.stringify({action:"navigate",url:"https://evil.example"}) })).status, 400);
     const invalid = await fetch(`${helper.url}/environment`, { method: "POST", headers: { ...headers, "X-CheckCC-Token": session.token }, body: JSON.stringify({ policy: { country: "KR" } }) });
     assert.equal(invalid.status, 400);
   } finally { await helper.closeRuntime(); helper.server.closeAllConnections(); await new Promise((resolve) => helper.server.close(resolve)); await rm(helperState, { recursive: true, force: true }); }

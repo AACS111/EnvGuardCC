@@ -15,6 +15,9 @@ import { targetOutcome, targetOutcomeLabel } from "@/detection/target-outcome";
 import { choiceRuntimePolicy } from "@/detection/environment-actions";
 import { applyEnvironment, type EnvironmentExecution } from "@/detection/environment-runtime";
 import type { LocaleCode } from "@/i18n/messages";
+import { EmojiRenderingDetails } from './EmojiRenderingDetails';
+import type { SignalResult } from "@/detection/types";
+import { ClaudeBrowserVerification } from "./ClaudeBrowserVerification";
 
 type Session = HelperSession;
 
@@ -24,14 +27,16 @@ export function isDialogBackdropEvent(event: Pick<MouseEvent<HTMLDialogElement>,
   return event.clientX < bounds.left || event.clientX > bounds.right || event.clientY < bounds.top || event.clientY > bounds.bottom;
 }
 
-export function RepairDialog({ signal, browser, claude, signals, locale, loading, target, protectionEnabled, onClose, onRecheck, onRuntimeRecheck, onApplyGateway }: {
+export function RepairDialog({ signal, browser, claude, signals, locale, loading, target, protectionEnabled, onClose, onRecheck, onRuntimeRecheck, onApplyGateway, onBrowserSample }: {
   signal: SignalView; browser?: SignalView; claude?: SignalView; onApplyGateway: (choice: RepairChoice) => Promise<void>; signals: SignalView[]; locale: LocaleCode; loading: boolean; target?: ExitTarget | null; protectionEnabled?: boolean;
   onClose: () => void; onRecheck: () => Promise<void>; onRuntimeRecheck?: () => Promise<void>;
+  onBrowserSample: (sample: SignalResult) => void;
 }) {
   const zh = locale.startsWith("zh");
   const scoreText = (sample?: SignalView) => {
     if (!sample) return "";
     const verification = signalScoreLabel(sample, zh);
+    if (signalPolicy(sample.id).informational) return verification;
     return signalResultStatus(sample) === "measured" ? `${zh ? "风险 +" : "risk +"}${sample.contribution} · ${verification}` : verification;
   };
   const dialog = useRef<HTMLDialogElement>(null);
@@ -76,8 +81,10 @@ export function RepairDialog({ signal, browser, claude, signals, locale, loading
     return () => { cancelled = true; };
   }, [isTimezone]);
 
-  const explain = navigationUrl
-    ? zh ? "此项分别显示浏览器跨站脚本探测和网关出口探测。浏览器探测受 CORS/CORP 或网络限制时不计分，以客户端网关的 HTTP 响应为准；可先打开网站人工核对。实际出口国家风险仍单独计分。" : "Browser and gateway probes are shown separately. When the browser probe is restricted by CORS/CORP or the network, it is not scored; use the gateway HTTP response. Open the site to check manually. Exit-country risk is scored separately."
+  const explain = signal.id === "claudeReachability"
+    ? zh ? "网关后台探测与受控浏览器访问分别验证。Cloudflare 验证、身份验证或限流不会直接判成网络不通，也不计验证分；打开受控浏览器完成验证后，页面状态会更新到浏览器侧卡片。出口国家风险仍单独计分。" : "Gateway probes and managed-browser navigation are verified separately. Challenges, authentication and rate limits are unscored and do not imply a broken network. Open the managed browser and complete verification to update the browser card. Exit-country risk is scored separately."
+    : navigationUrl
+    ? zh ? "此项分别显示浏览器跨站脚本探测和网关出口探测。浏览器探测受 CORS/CORP 或网络限制时无法判定且不计分；网关 HTTP 响应只代表网关路径。可打开网站人工核对。实际出口国家风险仍单独计分。" : "Browser and gateway probes are shown separately. A browser probe restricted by CORS/CORP or the network is inconclusive and not scored; the gateway HTTP response covers only the gateway path. Open the site to check manually. Exit-country risk is scored separately."
     : runtimeSignal
     ? zh ? "可执行选项会调用本机脚本：在当前检测页面以及启动器接入的独立浏览器、Claude 桌面渲染页面屏蔽指定接口，再读取采样结果。桌面端不支持脚本接入或尚未打开目标页面时，会单独显示未验证或失败。不会卸载系统字体，也不保证覆盖所有指纹检测方式。" : "Executable options apply renderer-interface protection to this page and managed browser/desktop pages, then verify observations. Unsupported desktop access or missing target pages are reported separately. System fonts are not removed; not all fingerprint methods are covered."
     : policy.treatment === "network"
@@ -91,7 +98,7 @@ export function RepairDialog({ signal, browser, claude, signals, locale, loading
       : isLocale
         ? zh ? "读取 Intl 默认区域设置。网页不能直接改写浏览器配置；请在语言设置中应用实际需要的区域，重启浏览器后复检。" : "This reads the default Intl locale. Apply the intended region in browser/system language settings, restart the browser, then recheck."
         : signal.id === "emojiStyle"
-          ? zh ? "此项根据 User-Agent 推断操作系统，没有检测 Emoji 渲染。Windows / Android 计 2 分，Apple 计 1 分；没有可用于一键修复的 0 分系统选项。" : "This infers the OS from User-Agent, without measuring emoji rendering. Windows / Android add 2 points and Apple adds 1. There is no genuine zero-point OS option here."
+          ? zh ? "实际绘制 Emoji 并读取像素，再与成功加载的本机 Emoji 字体比较。系统声明只用于核对常见默认字体，不代替渲染检测；无法访问或无法唯一匹配时保留无法判定。此项仅供参考，不计入风险分或验证得分。" : "Draws emoji and reads pixels, then compares successfully loaded local emoji fonts. The declared system only provides context; it never replaces rendering measurements. Inaccessible or ambiguous references remain inconclusive. This informational item affects neither risk nor verification scores."
           : zh ? "这是字体、浏览器或设备特征，下面列出不同真实环境的规则分数用于比较。网页不能替换设备或卸载字体，不会通过修改检测结果将其标为正常。" : "These are real font, browser or device characteristics. Options compare rule scores for different environments; a website cannot replace a device or remove system fonts.";
 
   const report = (text: string, error = false) => { setMessage(text); setFailed(error); };
@@ -169,23 +176,25 @@ export function RepairDialog({ signal, browser, claude, signals, locale, loading
         <button type="button" className="repair-button repair-button--quiet" onClick={onClose} disabled={locked} aria-label={zh ? "关闭配置" : "Close configuration"}>{"×"}</button>
       </header>
       <div className="repair-dialog__body">
-        <div className="repair-measured"><div><span>{zh ? "当前实测值" : "Measured value"}</span><strong>{loading ? zh ? "复检中…" : "Rechecking…" : signal.value}</strong></div><strong className="repair-points" data-score-state={verificationSampleStatus(signal) === "passed" ? "pass" : verificationSampleStatus(signal) === "failed" ? "flagged" : "pending"}>{loading ? "…" : scoreText(signal)}</strong></div>
+        <div className="repair-measured"><div><span>{signal.id === "claudeReachability" && signal.source === "gateway" ? (zh ? "网关出口实测值" : "Gateway egress measurement") : (zh ? "当前实测值" : "Measured value")}</span><strong>{loading ? zh ? "复检中…" : "Rechecking…" : signal.value}</strong></div><strong className="repair-points" data-score-state={policy.informational ? "pending" : verificationSampleStatus(signal) === "passed" ? "pass" : verificationSampleStatus(signal) === "failed" ? "flagged" : "pending"}>{loading ? "…" : scoreText(signal)}</strong></div>
         {browser && policy.scope !== "claude" && <p className="repair-description"><strong>{zh ? "浏览器当前配置：" : "Current browser: "}</strong>{browser.value} · {scoreText(browser)}</p>}
         {claude && policy.scope !== "browser" && <p className="repair-description"><strong>{zh ? "客户端当前配置：" : "Current client: "}</strong>{claude.value} · {scoreText(claude)}</p>}
         {claude?.cloaked && claude.originalValue && <p className="repair-description"><strong>{zh ? "原始请求 / 网关配置：" : "Original request / gateway: "}</strong>{claude.originalValue} / {claude.value}</p>}
         {signal.detail && <p className="repair-description">{signal.detail}</p>}
-        {!protectionEnabled && <p className="repair-notice">{zh ? "模拟保护未启动，本次仅重测当前环境。启动模拟保护后可应用配置。" : "Protection is off; this action only retests. Start protection to apply changes."}</p>}
+        {signal.emojiRendering && <EmojiRenderingDetails evidence={signal.emojiRendering} zh={zh} />}
+        {signal.id === "claudeReachability" && <ClaudeBrowserVerification locale={locale} disabled={locked} onSample={onBrowserSample} />}
+        {!protectionEnabled && !navigationUrl && !policy.informational && <p className="repair-notice">{zh ? "模拟保护未启动，本次仅重测当前环境。启动模拟保护后可应用配置。" : "Protection is off; this action only retests. Start protection to apply changes."}</p>}
         <p id="repair-description" className="repair-description">{explain}</p>
-        {navigationUrl && <p className="repair-notice">{zh ? "浏览器跨站脚本探测与正常打开网站是两种访问方式。网站能打开但脚本请求被 CORS/CORP 或网络限制时，浏览器侧显示探测受限且不计分，以客户端网关的 HTTP 响应为准。" : "Cross-site script probes and normal site navigation differ. If navigation works but the script is restricted by CORS/CORP or the network, the browser side shows a restricted, unscored probe and the gateway HTTP response is authoritative."}</p>}
-        <p className="repair-notice">{zh ? "风险分按本项目权重，验证分按原站对应权重：通过得满分，未测试或证据不足暂计半分，未达标或检测失败计0分；不适用项不计分。选择目标不改变实测状态，复检后更新得分。" : "Risk points use this project's weights; verification points use the reference weights: full credit for passed items, provisional half for untested or unresolved items, and zero for not-met or failed items. Inapplicable items earn no credit. Choosing a target does not change observations; recheck to update the score."}</p>
-        {choices.length > 0 ? <fieldset className="repair-options" disabled={locked || observationOnly}>
+        {navigationUrl && signal.id !== "claudeReachability" && <p className="repair-notice">{zh ? "浏览器跨站脚本探测与正常打开网站是两种访问方式。脚本请求受 CORS/CORP 或网络限制时，浏览器侧无法判定且不计分；网关响应不能证明浏览器路径可用。" : "Cross-site script probes and normal site navigation differ. When CORS/CORP or the network restricts the script, the browser result is inconclusive and not scored; a gateway response cannot verify the browser path."}</p>}
+        {!policy.informational && <p className="repair-notice">{zh ? "风险分按本项目权重，验证分按原站对应权重：通过得满分，未测试或一般证据不足暂计半分，未达标或检测失败计0分；标记不计分及不适用的结果不纳入得分。选择目标不改变实测状态，复检后更新得分。" : "Risk points use this project's weights; verification points use the reference weights: full credit for passed items, provisional half for untested or generally unresolved items, and zero for not-met or failed items. Results marked unscored or inapplicable are excluded. Choosing a target does not change observations; recheck to update the score."}</p>}
+        {choices.length > 0 && signal.id !== "claudeReachability" ? <fieldset className="repair-options" disabled={locked || observationOnly}>
           <legend>{observationOnly ? (zh ? "当前实测配置 · 此项无法在页面修改" : "Observed configuration · cannot be changed here") : target ? (zh ? `选择目标设置 · 优先与出口地区（${target.city ?? target.countryName}）一致的选项` : `Choose a target · exit-consistent options (${target.city ?? target.countryName}) first`) : zh ? "选择目标设置 · 符合条件的选项优先" : "Choose a target · matching options first"}</legend>
           {choices.map((choice) => <label key={choice.id} className={`repair-option${selected?.id === choice.id ? " repair-option--selected" : ""}`}>
             <input type="radio" name="repair-choice" value={choice.id} checked={selected?.id === choice.id} onChange={() => { setSelectedId(choice.id); report(""); }} />
             <span className="repair-option__value">{choice.label}{choice.match === "target" && <span className="repair-option__target">{zh ? "与出口一致" : "Matches exit"}</span>}{policy.scope !== "claude" && targetOutcome(browser ?? (signal.environment === "browser" ? signal : undefined), choice) === "matched" && <small className="repair-option__current">{zh ? "当前浏览器配置" : "Current browser"}</small>}{policy.scope !== "browser" && targetOutcome(claude ?? (signal.environment === "claude" ? signal : undefined), choice) === "matched" && <small className="repair-option__current">{zh ? "当前客户端配置" : "Current client"}</small>}{choice.action === "information" && !choice.current && <span className="repair-option__target">{choiceRuntimePolicy(signal.id, choice) ? (zh ? "可执行·接口屏蔽" : "Executable · interface protection") : (zh ? "仅比较" : "Compare only")}</span>}</span>
             <span className="repair-option__score">{choice.contribution === 0 ? (zh ? "符合条件 · 待实测" : "Matches · unverified") : (zh ? "不符合条件" : "Does not match")}</span>
           </label>)}
-        </fieldset> : <p className="repair-notice">{zh ? "此项暂无可执行的设置选项。" : "No executable settings are available for this signal."}</p>}
+        </fieldset> : signal.id === "claudeReachability" ? null : <p className="repair-notice">{zh ? "此项暂无可执行的设置选项。" : "No executable settings are available for this signal."}</p>}
         {!observationOnly && savedTarget && <div className="repair-notice" role="status"><strong>{zh ? "处理目标：" : "Treatment target: "}</strong>{savedTarget.label}
           {policy.scope !== "claude" && <p>{zh ? "浏览器：" : "Browser: "}{targetOutcomeLabel(browser ?? (signal.environment === "browser" ? signal : undefined), savedTarget, zh)}</p>}
           {policy.scope !== "browser" && <p>{zh ? "客户端：" : "Client: "}{targetOutcomeLabel(claude ?? (signal.environment === "claude" ? signal : undefined), savedTarget, zh)}</p>}
@@ -195,7 +204,7 @@ export function RepairDialog({ signal, browser, claude, signals, locale, loading
           <p>{zh ? "该风险预估越低越好，仅供选项比较，不计入验证得分。未测试暂计半分，执行并复检后更新实际得分。" : "Lower estimated risk is better. This estimate is for comparison and earns no verification credit. Apply and recheck to earn passing points."}</p>
         </div>}
         {isTimezone && <p className="repair-description" role="status">{connection === "checking" ? zh ? "正在连接本机助手…" : "Connecting to local helper…" : connection === "ready" ? `${zh ? "本机助手已连接，系统时区：" : "Local helper connected. System timezone: "}${session?.timezone}` : zh ? "本机助手未连接或当前系统不支持自动修改。请检查连接后重试，或在系统的日期与时间设置中调整。" : "Local helper unavailable or automatic changes unsupported. Check the connection and retry, or use system Date & Time settings."}</p>}
-        {readOnly && !runtimeSignal && <p className="repair-description">{zh ? (policy.treatment === "network" ? "请在 FlClash 中实际调整节点或规则后测试；页面选项为只读。" : "此项为实际设备特征或观测数据，没有可可靠自动执行的修改脚本。") : "This observation has no reliable automatic change script. Apply actual network or device changes before retesting."}</p>}
+        {readOnly && !runtimeSignal && !policy.informational && !navigationUrl && <p className="repair-description">{zh ? (policy.treatment === "network" ? "请在 FlClash 中实际调整节点或规则后测试；页面选项为只读。" : "此项为实际设备特征或观测数据，没有可可靠自动执行的修改脚本。") : "This observation has no reliable automatic change script. Apply actual network or device changes before retesting."}</p>}
         {execution && <div className="repair-notice" aria-live="polite"><strong>{zh ? "各端脚本执行报告" : "Execution by environment"}</strong>{execution.results.map((item) => <p key={item.target}><strong>{({ local: zh ? "当前检测浏览器" : "Current browser", web: zh ? "独立 Claude 网页窗口" : "Managed Claude browser", desktop: zh ? "Claude 桌面端" : "Claude desktop", remote: zh ? "外部环境" : "External environments", gateway: zh ? "Claude 网关" : "Claude gateway" } as Record<string, string>)[item.target] ?? item.target}：{item.state === "verified" ? zh ? "指定接口已验证" : "Interfaces verified" : item.state === "restored" ? zh ? "已恢复" : "Restored" : item.state === "failed" ? zh ? "执行失败" : "Failed" : zh ? "待验证" : "Unverified"}</strong> · {item.detail}</p>)}</div>}
         {message && <p className={`repair-feedback${failed ? " repair-feedback--error" : ""}`} role={failed ? "alert" : "status"}>{message}</p>}
       </div>
