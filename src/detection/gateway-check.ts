@@ -216,7 +216,7 @@ export function buildGatewayCheck(report: GatewayReport | null, locale: LocaleCo
   if (edge) {
     const ok = edge.http === 200 && edge.colo;
     put("edgeCountry", edge.loc ? countryDisplayName(edge.loc, locale) : missing, edge.loc ? "ok" : ok ? "unknown" : "error", ok ? tr(`边缘 trace 返回 ${edge.loc}（仅供参考，不代表 Claude 处理节点）。`, `Edge trace returned ${edge.loc} (reference only, not the Claude processing node).`) : (edge.error ?? missing));
-    put("edgeCity", edge.city ?? tr("响应未提供城市字段", "Response has no city field"), edge.city ? "ok" : ok ? "unknown" : "error", ok ? tr("trace 自报城市；Cloudflare 不一定返回城市字段。", "City reported by trace; Cloudflare does not always include it.") : (edge.error ?? missing), 0, false, ok && !edge.city ? "unavailable" : undefined);
+    put("edgeCity", edge.city ?? tr("Cloudflare trace 不提供城市字段", "Cloudflare trace does not provide a city"), edge.city ? "ok" : ok ? "not_applicable" : "error", ok ? tr("trace 自报城市；Cloudflare 的 trace 响应不提供城市字段，本项不适用。", "City reported by trace; the Cloudflare trace response does not provide a city field, so this item is not applicable.") : (edge.error ?? missing), 0, false, undefined);
     put("edgeColo", edge.colo ?? missing, ok ? "ok" : "error", ok ? tr(`Cloudflare 边缘机房 ${edge.colo}（cdn-cgi/trace 实测）。`, `Cloudflare edge colo ${edge.colo} (measured via cdn-cgi/trace).`) : (edge.error ?? missing));
   } else {
     for (const id of ["edgeCountry", "edgeCity", "edgeColo"]) put(id, missing, "unknown", offline);
@@ -266,6 +266,13 @@ export function buildGatewayCheck(report: GatewayReport | null, locale: LocaleCo
       signal.testedAt = report.checkedAt ?? new Date().toISOString();
       if (signal.assessment === "unknown" && !signal.observation) signal.observation = signal.value === missing ? "unavailable" : "inconclusive";
     }
+  }
+  // Values derived from the current report are measurements too: gateway profile,
+  // observed headers and client clues otherwise stay "untested" forever.
+  for (const signal of observations.values()) {
+    if (signal.environment === "browser" || signal.testedAt) continue;
+    if (!signal.value || signal.value === missing || signal.assessment === "unknown" || signal.assessment === "not_applicable") continue;
+    signal.testedAt = report.checkedAt ?? new Date().toISOString();
   }
   return { signals: sortSignals(observations), geo, report, error: null, verifiedRequest: successful && !report.lastFailure, cloak };
 }

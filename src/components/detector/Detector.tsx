@@ -225,7 +225,7 @@ export function Detector({ locale = "zh" }: { locale?: LocaleCode }) {
         if (!existing) map.set(signal.id, { ...signal, value: zh ? "请先检测浏览器环境" : "Run browser checks first", assessment: "unknown", source: "browser", state: "pending" });
         continue;
       }
-      map.set(signal.id, { ...signal, contribution: Math.max(existing?.contribution ?? 0, signal.contribution), label: detectorText.signalLabels[signal.id] ?? signal.label, state: "done", ...(existing && existing.source === "browser" && !signal.cloaked ? { value: signal.value } : {}) });
+      map.set(signal.id, { ...signal, contribution: Math.max(existing?.contribution ?? 0, signal.contribution), label: detectionConfig.signals[signal.id]?.environment === "claude" ? signal.label : detectorText.signalLabels[signal.id] ?? signal.label, state: "done", ...(existing && existing.source === "browser" && !signal.cloaked ? { value: signal.value } : {}) });
     }
     return orderedIds().map((id) => map.get(id)).filter((signal): signal is SignalView => Boolean(signal));
   }, [browserSignals, claudeSignals, detectorText, zh]);

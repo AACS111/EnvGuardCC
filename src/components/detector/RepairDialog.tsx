@@ -7,6 +7,7 @@ import { helperRequest, type HelperSession } from "@/detection/local-helper";
 import { signalPolicy } from "@/detection/signal-policy";
 import type { RepairChoice } from "@/detection/repair-options";
 import { verificationLabel as signalScoreLabel, verificationSampleStatus } from "@/detection/verification-score";
+import { signalResultStatus } from "@/detection/card-evidence";
 import { saveRepairTarget } from "@/detection/repair-target";
 import { notifyRepairTargetChange, useRepairTarget } from "@/detection/use-repair-target";
 import { previewTotal, repairChoices } from "@/detection/repair-options";
@@ -28,6 +29,11 @@ export function RepairDialog({ signal, browser, claude, signals, locale, loading
   onClose: () => void; onRecheck: () => Promise<void>; onRuntimeRecheck?: () => Promise<void>;
 }) {
   const zh = locale.startsWith("zh");
+  const scoreText = (sample?: SignalView) => {
+    if (!sample) return "";
+    const verification = signalScoreLabel(sample, zh);
+    return signalResultStatus(sample) === "measured" ? `${zh ? "风险 +" : "risk +"}${sample.contribution} · ${verification}` : verification;
+  };
   const dialog = useRef<HTMLDialogElement>(null);
   const backdropPointerDown = useRef(false);
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -71,7 +77,7 @@ export function RepairDialog({ signal, browser, claude, signals, locale, loading
   }, [isTimezone]);
 
   const explain = navigationUrl
-    ? zh ? "此项分别显示浏览器跨站脚本探测和网关出口探测。可先打开网站人工核对，再按需要重新探测；脚本未完成时保留无法判定，实际出口国家风险仍单独计分。" : "Browser cross-site probing and gateway egress probing are shown separately. Open the site to check navigation, then retry if needed. Incomplete script probes remain inconclusive; actual exit-country risks are assessed separately."
+    ? zh ? "此项分别显示浏览器跨站脚本探测和网关出口探测。浏览器探测受 CORS/CORP 或网络限制时不计分，以客户端网关的 HTTP 响应为准；可先打开网站人工核对。实际出口国家风险仍单独计分。" : "Browser and gateway probes are shown separately. When the browser probe is restricted by CORS/CORP or the network, it is not scored; use the gateway HTTP response. Open the site to check manually. Exit-country risk is scored separately."
     : runtimeSignal
     ? zh ? "可执行选项会调用本机脚本：在当前检测页面以及启动器接入的独立浏览器、Claude 桌面渲染页面屏蔽指定接口，再读取采样结果。桌面端不支持脚本接入或尚未打开目标页面时，会单独显示未验证或失败。不会卸载系统字体，也不保证覆盖所有指纹检测方式。" : "Executable options apply renderer-interface protection to this page and managed browser/desktop pages, then verify observations. Unsupported desktop access or missing target pages are reported separately. System fonts are not removed; not all fingerprint methods are covered."
     : policy.treatment === "network"
@@ -163,15 +169,15 @@ export function RepairDialog({ signal, browser, claude, signals, locale, loading
         <button type="button" className="repair-button repair-button--quiet" onClick={onClose} disabled={locked} aria-label={zh ? "关闭配置" : "Close configuration"}>{"×"}</button>
       </header>
       <div className="repair-dialog__body">
-        <div className="repair-measured"><div><span>{zh ? "当前实测值" : "Measured value"}</span><strong>{loading ? zh ? "复检中…" : "Rechecking…" : signal.value}</strong></div><strong className="repair-points" data-score-state={verificationSampleStatus(signal) === "passed" ? "pass" : verificationSampleStatus(signal) === "failed" ? "flagged" : "pending"}>{loading ? "…" : signalScoreLabel(signal, zh)}</strong></div>
-        {browser && policy.scope !== "claude" && <p className="repair-description"><strong>{zh ? "浏览器当前配置：" : "Current browser: "}</strong>{browser.value} · {signalScoreLabel(browser, zh)}</p>}
-        {claude && policy.scope !== "browser" && <p className="repair-description"><strong>{zh ? "客户端当前配置：" : "Current client: "}</strong>{claude.value} · {signalScoreLabel(claude, zh)}</p>}
+        <div className="repair-measured"><div><span>{zh ? "当前实测值" : "Measured value"}</span><strong>{loading ? zh ? "复检中…" : "Rechecking…" : signal.value}</strong></div><strong className="repair-points" data-score-state={verificationSampleStatus(signal) === "passed" ? "pass" : verificationSampleStatus(signal) === "failed" ? "flagged" : "pending"}>{loading ? "…" : scoreText(signal)}</strong></div>
+        {browser && policy.scope !== "claude" && <p className="repair-description"><strong>{zh ? "浏览器当前配置：" : "Current browser: "}</strong>{browser.value} · {scoreText(browser)}</p>}
+        {claude && policy.scope !== "browser" && <p className="repair-description"><strong>{zh ? "客户端当前配置：" : "Current client: "}</strong>{claude.value} · {scoreText(claude)}</p>}
         {claude?.cloaked && claude.originalValue && <p className="repair-description"><strong>{zh ? "原始请求 / 网关配置：" : "Original request / gateway: "}</strong>{claude.originalValue} / {claude.value}</p>}
         {signal.detail && <p className="repair-description">{signal.detail}</p>}
         {!protectionEnabled && <p className="repair-notice">{zh ? "模拟保护未启动，本次仅重测当前环境。启动模拟保护后可应用配置。" : "Protection is off; this action only retests. Start protection to apply changes."}</p>}
         <p id="repair-description" className="repair-description">{explain}</p>
-        {navigationUrl && <p className="repair-notice">{zh ? "浏览器跨站脚本探测与正常打开网站是两种访问方式。网站能打开但脚本请求未完成时，浏览器侧显示无法判定，不因该失败加分；网关收到 HTTP 响应的结果独立保留。" : "Cross-site script probes and normal site navigation differ. If navigation works but the script cannot complete, browser reachability remains inconclusive without added risk points. Gateway HTTP-response evidence remains separate."}</p>}
-        <p className="repair-notice">{zh ? "按原站对应权重计分：通过得满分，未测试或证据不足暂计半分，未通过或检测失败计0分；不适用项不计分。选择目标不改变实测状态，复检后更新得分。" : "Reference weights: full credit for passed items, provisional half credit for untested or unresolved items, and zero for failures. Inapplicable items earn no credit. Choosing a target does not change observations; recheck to update the score."}</p>
+        {navigationUrl && <p className="repair-notice">{zh ? "浏览器跨站脚本探测与正常打开网站是两种访问方式。网站能打开但脚本请求被 CORS/CORP 或网络限制时，浏览器侧显示探测受限且不计分，以客户端网关的 HTTP 响应为准。" : "Cross-site script probes and normal site navigation differ. If navigation works but the script is restricted by CORS/CORP or the network, the browser side shows a restricted, unscored probe and the gateway HTTP response is authoritative."}</p>}
+        <p className="repair-notice">{zh ? "风险分按本项目权重，验证分按原站对应权重：通过得满分，未测试或证据不足暂计半分，未达标或检测失败计0分；不适用项不计分。选择目标不改变实测状态，复检后更新得分。" : "Risk points use this project's weights; verification points use the reference weights: full credit for passed items, provisional half for untested or unresolved items, and zero for not-met or failed items. Inapplicable items earn no credit. Choosing a target does not change observations; recheck to update the score."}</p>
         {choices.length > 0 ? <fieldset className="repair-options" disabled={locked || observationOnly}>
           <legend>{observationOnly ? (zh ? "当前实测配置 · 此项无法在页面修改" : "Observed configuration · cannot be changed here") : target ? (zh ? `选择目标设置 · 优先与出口地区（${target.city ?? target.countryName}）一致的选项` : `Choose a target · exit-consistent options (${target.city ?? target.countryName}) first`) : zh ? "选择目标设置 · 符合条件的选项优先" : "Choose a target · matching options first"}</legend>
           {choices.map((choice) => <label key={choice.id} className={`repair-option${selected?.id === choice.id ? " repair-option--selected" : ""}`}>
