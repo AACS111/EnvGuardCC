@@ -15,7 +15,7 @@ export async function requestSignalSimulation(id: string, related = false): Prom
 }
 
 export function mergePointSignals(previous: SignalResult[], sample: SignalResult, template: SignalResult[] = []) {
-  const base = previous.length ? previous : template.map((signal) => ({ ...signal, value: null, testedAt: undefined, settingValue: undefined, observation: undefined, score: 0, contribution: 0, assessment: "unknown" as const }));
+  const base = previous.length ? previous : template.map((signal) => ({ ...signal, value: null, testedAt: undefined, settingValue: undefined, observation: undefined, unscored: undefined, score: 0, contribution: 0, assessment: "unknown" as const }));
   return base.some((signal) => signal.id === sample.id) ? base.map((signal) => signal.id === sample.id ? sample : signal) : [...base, sample];
 }
 

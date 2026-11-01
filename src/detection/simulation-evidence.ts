@@ -7,7 +7,7 @@ import { signalTestKind } from "./signal-policy";
 
 export function nativeClientSignals(signals: SignalResult[], configurationMatches: boolean) {
   return signals.map((signal) => signal.sampleKind === "simulation" || !configurationMatches && signalTestKind(signal.id) === "simulation"
-    ? { ...signal, value: null, originalValue: undefined, testedAt: undefined, settingValue: undefined, observation: undefined, score: 0, contribution: 0, cloaked: false, sampleKind: undefined, assessment: "unknown" as const }
+    ? { ...signal, value: null, originalValue: undefined, testedAt: undefined, settingValue: undefined, observation: undefined, unscored: undefined, score: 0, contribution: 0, cloaked: false, sampleKind: undefined, assessment: "unknown" as const }
     : signal);
 }
 

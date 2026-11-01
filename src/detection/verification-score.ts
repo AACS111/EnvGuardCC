@@ -1,5 +1,6 @@
 import { detectionConfig } from './config';
 import { signalPolicy } from './signal-policy';
+import { measurementFailed } from './measurement-status';
 import type { SignalResult } from './types';
 
 // Reference: https://github.com/AACS111/EnvGuardCC/blob/main/src/detection/config/signals.ts
@@ -24,6 +25,7 @@ export function verificationSampleStatus(sample?: SignalResult & { state?: strin
 }
 export function verificationPassed(sample?: SignalResult) { return verificationSampleStatus(sample) === 'passed'; }
 export function verificationPoint(sample?: SignalResult, id = sample?.id): number | null {
+  if (sample?.unscored) return null;
   const status = verificationSampleStatus(sample);
   const weight = id ? verificationWeight(id) : 0;
   return status === 'passed' ? weight : status === 'failed' ? 0 : status === 'pending' && id ? weight / 2 : null;
@@ -34,8 +36,9 @@ export function verificationLabel(sample: (SignalResult & { state?: string }) | 
     const points = verificationWeight(sample!.id);
     return points > 0 ? (zh ? '通过 +' + points : 'Passed +' + points) : (zh ? '通过 · 不计分' : 'Passed · informational');
   }
-  if (status === 'failed') return sample?.assessment === 'error' ? (zh ? '检测失败 · 0分' : 'Failed · 0 pts') : (zh ? '未达标 · 0分' : 'Not met · 0 pts');
+  if (status === 'failed') return measurementFailed(sample) ? (zh ? '检测失败 · 0分' : 'Test failed · 0 pts') : (zh ? '未达标 · 0分' : 'Not met · 0 pts');
   if (status === 'not_applicable') return zh ? '不适用' : 'N/A';
+  if (sample?.unscored) return zh ? '无法判定 · 不计分' : 'Inconclusive · not scored';
   if (sample?.assessment === 'error') return zh ? '测试失败' : 'Failed';
   const provisional = id ? verificationWeight(id) / 2 : 0;
   const label = sample?.observation === 'unavailable' ? (zh ? '已测·无数据' : 'Tested · no data') : sample?.observation === 'inconclusive' || sample?.observation === 'review' ? (zh ? '无法判定' : 'Inconclusive') : (zh ? '未测试' : 'Untested');
@@ -69,8 +72,9 @@ export function verificationScores(browser: SignalResult[] | null, claude: Signa
       if (samples.every(sample => sample?.assessment === 'not_applicable')) continue;
       possible++;
       const weight = verificationWeight(id);
-      maximum += weight;
       const states = samples.filter(sample => sample?.assessment !== 'not_applicable').map(verificationSampleStatus);
+      if (samples.some(sample => sample?.unscored) && !states.some(status => status === 'failed')) { pending++; continue; }
+      maximum += weight;
       if (states.every(status => status === 'passed')) { passed++; earned += weight; }
       else if (states.some(status => status === 'failed')) failed++;
       else { pending++; provisional += weight / 2; }

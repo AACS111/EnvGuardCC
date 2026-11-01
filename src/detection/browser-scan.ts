@@ -109,14 +109,15 @@ export async function runBrowserScan(region: RegionCode, locale: LocaleCode, tex
       ["claudeReachability", reachability.claude],
       ["anthropicReachability", reachability.anthropic],
     ];
-    const restricted = locale.startsWith("zh") ? "浏览器跨站探测受限（CORS/网络），不计分；以客户端网关结果为准" : "Browser cross-site probe restricted (CORS/network); not scored; use the client gateway result";
+    const restricted = locale.startsWith("zh") ? "浏览器跨站探测未完成，无法判定；本侧不计分" : "Browser cross-site probe incomplete; inconclusive and not scored";
     for (const [id, probe] of probeMap) {
       put(id, {
         ...makeSignalScore(id, label[id], probe.ok ? `${probe.elapsedMs} ms` : restricted, id === "claudeReachability" ? 6 : 0, 0, text, detectionConfig),
-        assessment: probe.ok ? "ok" : "not_applicable",
+        assessment: probe.ok ? "ok" : "unknown",
+        ...(!probe.ok ? { observation: "inconclusive" as const, unscored: true } : {}),
         detail: probe.ok
           ? (locale.startsWith("zh") ? "这里从本地检测页发起不带登录凭证的 no-cors 请求；opaque 响应不提供状态码。网关探测结果独立显示。" : "A credential-free no-cors request from the local checker; an opaque response exposes no status. Gateway evidence is separate.")
-          : (locale.startsWith("zh") ? "本地检测页无法确认跨站可达性；TypeError 可能来自 CORP/COEP、扩展、重定向或网络，不能据此判定网站不可达。本项不计分，以客户端网关的 HTTP 响应为准。" : "The local page cannot confirm cross-site reachability. CORP/COEP, extensions, redirects or network errors can throw TypeError; this does not prove unreachability. The item is not scored; use the gateway HTTP response."),
+          : (locale.startsWith("zh") ? "本地检测页无法确认跨站可达性；TypeError 可能来自 CORP/COEP、扩展、重定向或网络，不能据此判定网站不可达。本侧不计分。网关结果独立显示，不能替代浏览器验证。" : "The local page cannot confirm cross-site reachability. CORP/COEP, extensions, redirects or network errors can throw TypeError; this does not prove unreachability. This side is not scored. Gateway evidence is separate and cannot verify the browser path."),
         environment: "browser",
       });
     }
