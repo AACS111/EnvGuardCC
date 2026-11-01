@@ -8,11 +8,10 @@ import { createProtectionService } from "./protection-service.mjs";
 import { EnvironmentRuntime } from "./environment-runtime.mjs";
 import { BrowserCloakController } from "./browser-cloak.mjs";
 import { readSystemTimezone, readAutomaticTimezone, setSystemTimezone, validIanaTimezone, sameTimezone, timezoneSupported } from "./system-timezone.mjs";
+import { resetTimezoneServiceAuthorization } from "./timezone-service.mjs";
 import { findBrowser, findDesktop } from "./application-paths.mjs";
-import { proxyStatus, proxySettingsFile, validateProxySettings } from "./gateway-proxy.mjs";
+import { proxyStatus } from "./gateway-proxy.mjs";
 import { DesktopLauncher } from "./desktop-launcher.mjs";
-import { prepareTrafficConfig, applyTrafficConfig, restoreTrafficConfig, trafficStatus, entryStatus } from "./traffic-config.mjs";
-import { startTrafficLayer } from "./traffic-layer.mjs";
 import { HELPER_PROTOCOL, assertCurrentHelper, shutdownHelper } from "./helper-connection.mjs";
 
 const port = 3001;
@@ -47,23 +46,6 @@ let protectionChanging = false;
 let closing = false;
 let closePending = null;
 let initializing = true;
-let trafficLayer = null;
-const trafficFile = path.join(stateDir, "traffic-layer.json");
-async function ensureTrafficLayer() {
-  if (trafficLayer) return;
-  try { trafficLayer = await startTrafficLayer(trafficFile); }
-  catch (error) {
-    if (error.code !== "EADDRINUSE") throw error;
-    await entryStatus(JSON.parse(await readFile(trafficFile, "utf8")));
-    trafficLayer = { close: async () => {} };
-  }
-}
-async function restoreTraffic() {
-  let config;
-  try { config = JSON.parse(await readFile(trafficFile, "utf8")); } catch (error) { if (error.code === "ENOENT") return; throw error; }
-  if (config.applied) await restoreTrafficConfig();
-  await trafficLayer?.close(); trafficLayer = null;
-}
 const environmentRuntime = new EnvironmentRuntime({ stateDir });
 const browserCloak = new BrowserCloakController(environmentRuntime, { gatewayUrl: process.env.CHECKCC_GATEWAY_URL || "http://127.0.0.1:3010", acquire: () => { if (changing || protectionChanging || closing) return false; changing = true; return true; }, release: () => { changing = false; } });
 
@@ -175,7 +157,6 @@ async function closeRuntime({ reusable = false } = {}) {
     while (changing || protectionChanging) await new Promise(resolve => setTimeout(resolve, 100));
     const issues = [];
     const attempt = async operation => { try { return await operation(); } catch (error) { issues.push(error.message); } };
-    await attempt(restoreTraffic);
     await attempt(() => browserCloak.close());
     await attempt(() => desktopLauncher.close());
     const protectionReport = await attempt(() => protection.stop({ shutdown: true }));
@@ -245,9 +226,11 @@ const server = http.createServer(async (req, res) => {
     try {
       const body = await parseBody(req);
       if (body.action === "observe") return send(200, protection.observe(body));
-      if (body.action === "monitor") return send(200, protection.monitor(body.enabled, body.intervalMs));
+      if (body.action === "monitor") return send(200, await protection.monitor(body.enabled, body.intervalMs));
+      if (body.action === 'startup') return send(200, await protection.startupPreference(body.enabled));
       if (!["start", "stop", "test", "resume"].includes(body.action)) return send(400, { error: "无效操作。" });
       if (protectionChanging) return send(409, { error: "配置正在执行，请稍后重试。" });
+      if (body.action === 'start' || body.action === 'stop') resetTimezoneServiceAuthorization();
       protectionChanging = true;
       try {
         // Reserve explicit protection actions so background sync cannot starve them.
@@ -265,44 +248,9 @@ const server = http.createServer(async (req, res) => {
       return send(500, { error: "本机助手初始化失败：" + error.message });
     }
   }
-  if (req.url === '/traffic') {
-    if (req.method === 'GET') { try { return send(200, await trafficStatus()); } catch (error) { return send(500, { error: error.message }); } }
-    if (req.method !== 'POST') return send(405, { error: '仅支持 GET/POST。' });
-    if (!authenticated(req.headers['x-checkcc-token'])) return send(403, { error: '会话已失效。' });
-    if (!req.headers['content-type']?.startsWith('application/json')) return send(415, { error: '必须使用 JSON。' });
-    if (changing || protectionChanging) return send(409, { error: '配置正在执行，请稍后重试。' });
-    changing = true;
-    try {
-      const body = await parseBody(req);
-      if (body.action === 'prepare') {
-        if ((await trafficStatus()).applied) throw new Error('请先恢复当前联动，再准备新的配置。');
-        await prepareTrafficConfig({ defaultPolicy: body.defaultPolicy });
-      } else if (body.action === 'apply') { await ensureTrafficLayer(); await applyTrafficConfig(); }
-      else if (body.action === 'restore') await restoreTraffic();
-      else return send(400, { error: '无效的 FlClash 操作。' });
-      return send(200, await trafficStatus());
-    } catch (error) {
-      if (error.code === 'FLCLASH_RELOAD_REQUIRED') return send(202, await trafficStatus());
-      return send(400, { error: error.message });
-    }
-    finally { changing = false; }
-  }
   if (req.url === '/proxy') {
-    if (req.method === 'GET') { try { return send(200, proxyStatus()); } catch (error) { return send(500, { error: error.message }); } }
-    if (req.method !== 'POST') return send(405, { error: '仅支持 GET/POST。' });
-    if (!authenticated(req.headers['x-checkcc-token'])) return send(403, { error: '会话已失效。' });
-    if (!req.headers['content-type']?.startsWith('application/json')) return send(415, { error: '必须使用 JSON。' });
-    if (changing || protectionChanging) return send(409, { error: '配置正在执行，请稍后重试。' });
-    changing = true;
-    try {
-      const settings = validateProxySettings(await parseBody(req));
-      await mkdir(stateDir, { recursive: true });
-      await writeFile(proxySettingsFile() + '.tmp', JSON.stringify(settings), { mode: 0o600 });
-      await rename(proxySettingsFile() + '.tmp', proxySettingsFile());
-      browserCloak.invalidate();
-      return send(200, proxyStatus());
-    } catch (error) { return send(400, { error: error.message }); }
-    finally { changing = false; }
+    if (req.method !== 'GET') return send(405, { error: '网络连接由系统自动管理。' });
+    try { return send(200, proxyStatus()); } catch (error) { return send(500, { error: error.message }); }
   }
   if (req.method === "POST" && ["/environment", "/environment/restore", "/browser-cloak"].includes(req.url)) {
     if (!authenticated(req.headers["x-checkcc-token"])) return send(403, { error: "会话已失效，请重新打开详情。" });
@@ -362,6 +310,7 @@ const server = http.createServer(async (req, res) => {
       if (!body || typeof body.timezone !== "string" || !(process.platform === "darwin" ? validIanaTimezone(body.timezone) : allowedZones.has(body.timezone))) return send(400, { error: "请选择列表中的有效时区。" });
       target = body.timezone;
     }
+    resetTimezoneServiceAuthorization();
     // Pass timezone as data, never interpolate a browser value into PowerShell code.
     const before = await currentZone();
     if (restoring && process.platform === "darwin") {
@@ -385,16 +334,14 @@ server.headersTimeout = 10000;
 server.on("error", (error) => { if (error.code !== "EADDRINUSE") console.error(`[repair] ${error.code}: ${error.message}`); });
 export async function startRepairHelper(listenPort = port) {
   try {
+    // Never silently abandon an active routing configuration from an older version.
+    try {
+      const legacy = JSON.parse(await readFile(path.join(stateDir, 'traffic-layer.json'), 'utf8'));
+      if (legacy.applied) throw new Error('旧版代理联动尚未恢复，请先使用旧版应用恢复原始代理配置，再启动当前版本。');
+    } catch (error) { if (error.code !== 'ENOENT') throw error; }
     await new Promise((resolve, reject) => { server.once("error", reject); server.listen(listenPort, "127.0.0.1", resolve); });
     await protection.recover();
     await desktopLauncher.localeProfile.restore();
-    try {
-      const saved = JSON.parse(await readFile(trafficFile, 'utf8'));
-      if (saved.applied) {
-        await ensureTrafficLayer();
-        try { await restoreTraffic(); } catch (error) { console.error('[repair] FlClash 恢复未完成：' + error.message); }
-      }
-    } catch (error) { if (error.code !== 'ENOENT') console.error('[repair] FlClash 状态检查失败：' + error.message); }
     initializing = false;
     return { server, url: `http://127.0.0.1:${server.address().port}`, closeRuntime };
   } catch (error) {

@@ -211,3 +211,23 @@ test('失效脚本注册不阻止撤销语言和接口覆盖，仍必须核对�
   nativeMatches = false;
   assert.equal((await runtime.restore()).results[0].state, 'unverified');
 });
+
+
+test('旧版路由联动未恢复时拒绝静默迁移，保留原备份', async t => {
+  const stateDir = await mkdtemp(path.join(tmpdir(), 'checkcc-legacy-routing-'));
+  t.after(() => rm(stateDir, { recursive: true, force: true }));
+  const file = path.join(stateDir, 'traffic-layer.json');
+  const raw = JSON.stringify({ applied: true, profile: 'user-owned-config', original: 'keep' });
+  await writeFile(file, raw);
+  const child = spawn(process.execPath, ['--input-type=module', '-e', `import { startRepairHelper } from ${JSON.stringify(new URL('./local-repair.mjs', import.meta.url).href)}; try { await startRepairHelper(0); process.exitCode = 0; } catch (error) { console.error(error.message); process.exitCode = 1; }`], {
+    env: { ...process.env, CHECKCC_STATE_DIR: stateDir }, stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  t.after(() => { if (child.exitCode === null) child.kill(); });
+  let output = '';
+  child.stdout.on('data', chunk => { output += chunk; });
+  child.stderr.on('data', chunk => { output += chunk; });
+  const [code] = await once(child, 'exit');
+  assert.equal(code, 1);
+  assert.match(output, /旧版代理联动尚未恢复/);
+  assert.equal(await readFile(file, 'utf8'), raw);
+});

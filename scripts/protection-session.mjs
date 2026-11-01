@@ -17,11 +17,13 @@ export class ProtectionSession {
     this.testing = false;
   }
   report() { return structuredClone({ ...this.state, desiredEnabled: this.desiredEnabled, intervalMs: this.intervalMs, testing: this.testing }); }
-  async savePreference(enabled) {
+  async savePreference(enabled, { monitoring = this.state.monitoring, intervalMs = this.intervalMs } = {}) {
     await mkdir(path.dirname(this.preferenceFile), { recursive: true });
-    await writeFile(this.preferenceFile + '.tmp', JSON.stringify({ enabled }), { mode: 0o600 });
+    await writeFile(this.preferenceFile + '.tmp', JSON.stringify({ enabled, monitoring, intervalMs }), { mode: 0o600 });
     await rename(this.preferenceFile + '.tmp', this.preferenceFile);
     this.desiredEnabled = enabled;
+    this.state.monitoring = monitoring;
+    this.intervalMs = intervalMs;
   }
   event(message) {
     this.state.history.unshift({ at: new Date().toISOString(), message });
@@ -43,12 +45,26 @@ export class ProtectionSession {
     return next;
   }
   async recover() {
-    try { this.desiredEnabled = JSON.parse(await readFile(this.preferenceFile, 'utf8')).enabled === true; }
+    try {
+      const saved = JSON.parse(await readFile(this.preferenceFile, 'utf8'));
+      this.desiredEnabled = saved.enabled === true;
+      if (typeof saved.monitoring === 'boolean') this.state.monitoring = saved.monitoring;
+      if (Number.isInteger(saved.intervalMs) && saved.intervalMs >= 30000 && saved.intervalMs <= 600000) this.intervalMs = saved.intervalMs;
+    }
     catch (error) { if (error.code !== 'ENOENT') throw error; }
     try { this.pending = JSON.parse(await readFile(this.file, 'utf8')); }
     catch (error) { if (error.code === 'ENOENT') return this.report(); throw error; }
     if (this.pending) { this.event('检测到未恢复的配置，正在自动恢复'); await this.stop({ shutdown: true }); }
     return this.report();
+  }
+  startupPreference(enabled) {
+    if (typeof enabled !== 'boolean') throw new Error('无效的启动保护设置。');
+    return this.serialize(async () => {
+      if (this.pending || this.state.enabled || this.state.phase !== 'idle') throw new Error('当前保护尚未恢复，不能覆盖启动意愿。');
+      this.intentVersion++;
+      await this.savePreference(enabled);
+      return this.report();
+    });
   }
   start(origin) {
     return this.serialize(() => this.activate(origin));
@@ -114,7 +130,7 @@ export class ProtectionSession {
     this.timer = setInterval(() => {
       if (!this.state.enabled || this.testing || !this.canTest()) return;
       void this.serialize(async () => {
-        if (this.state.enabled && this.canTest()) await this.performTest();
+        if (this.state.enabled && this.state.monitoring && this.canTest()) await this.performTest();
       });
     }, this.intervalMs);
     this.timer.unref?.();
@@ -165,11 +181,15 @@ export class ProtectionSession {
       return this.report();
     });
   }
-  monitor(enabled, intervalMs = this.intervalMs) {
+  monitor(enabled, intervalMs) {
     if (typeof enabled !== 'boolean') throw new Error('无效的监测开关。');
-    if (!Number.isInteger(intervalMs) || intervalMs < 30000 || intervalMs > 600000) throw new Error('检测间隔须为30秒至10分钟。');
-    this.intervalMs = intervalMs;
-    this.state.monitoring = enabled; this.schedule(); return this.report();
+    if (intervalMs !== undefined && (!Number.isInteger(intervalMs) || intervalMs < 30000 || intervalMs > 600000)) throw new Error('检测间隔须为30秒至10分钟。');
+    return this.serialize(async () => {
+      // Commit to disk before updating the live timer or returning success.
+      await this.savePreference(this.desiredEnabled, { monitoring: enabled, intervalMs: intervalMs ?? this.intervalMs });
+      this.schedule();
+      return this.report();
+    });
   }
   async restorePending(options = {}) {
     this.state.phase = 'stopping'; this.state.enabled = false; this.state.nextTestAt = null;

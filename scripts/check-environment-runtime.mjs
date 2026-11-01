@@ -319,7 +319,7 @@ test('代理地址改变后重建受控进程，实际请求使用新代理且�
   const requests = [[], []];
   const servers = requests.map((seen, index) => http.createServer((request, response) => { seen.push(request.url); response.end(`<title>proxy-${index}</title>`); }));
   for (const server of servers) await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
-  const settings = index => writeFile(path.join(directory, 'proxy-settings.json'), JSON.stringify({ mode: 'manual', address: `http://127.0.0.1:${servers[index].address().port}` }));
+  const settings = async index => { process.env.CHECKCC_PROXY = `http://127.0.0.1:${servers[index].address().port}`; };
   const runtime = new EnvironmentRuntime({ stateDir: directory, headless: true });
   try {
     await settings(0);

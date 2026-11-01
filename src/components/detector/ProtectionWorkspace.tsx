@@ -1,7 +1,6 @@
 "use client";
 import Image from 'next/image';
-import type { BrowserCloakExecution } from '@/detection/environment-runtime';
-import { ConnectionSettings } from './ConnectionSettings';
+import { DesktopSettingsFields } from './DesktopSettingsFields';
 import { measurementStatus, measurementPoints } from '@/detection/measurement-status';
 import { signalPolicy } from '@/detection/signal-policy';
 import { verificationScores, verificationItem, verificationSampleStatus, environmentRiskEstimates } from '@/detection/verification-score';
@@ -17,7 +16,6 @@ import type { CSSProperties, ReactNode } from 'react';
 
 export type Baseline = { at: string; browser: SignalView[]; claude: SignalView[]; score: number | null; policy: Record<string, unknown>; storage: Record<string, string | null> };
 type Props = {
-  browserReport?: BrowserCloakExecution | null; onBrowserReport?: (report: BrowserCloakExecution) => void;
   locale: LocaleCode; report: ProtectionReport | null; connected: boolean; busy: boolean; checking?: boolean; powerAction?: "start" | "stop" | null; error?: string;
   scores: ReturnType<typeof verificationScores>;
   geo: ExitGeo | null; target: ExitTarget | null; baseline: Baseline | null;
@@ -108,7 +106,6 @@ export function ProtectionWorkspace(props: Props) {
       <div className="workspace-content">
         {notices.length > 0 && <div className="workspace-notices" role="alert">{notices.map((message) => <p key={message} className="workspace-alert">{message}</p>)}</div>}
         <div id="panel-basic" role="tabpanel" aria-labelledby="tab-basic" tabIndex={0} hidden={tab !== 'basic'}>
-          <ConnectionSettings browserReport={connected && protectionEnabled ? props.browserReport ?? null : null} onBrowserReport={props.onBrowserReport} onRefresh={props.onRefresh} locale={locale} connected={connected} disabled={busy} protectionEnabled={protectionEnabled} />
           <section className="workspace-score" aria-label={text('环境验证得分', 'Environment verification scores')}>
             <div className="workspace-score-total"><span>{text('环境风险估计', 'Estimated environment risk')}</span><div className="workspace-risk-rings">{(['browser', 'claude'] as const).map(side => {
               const estimate = risks[side];
@@ -129,6 +126,7 @@ export function ProtectionWorkspace(props: Props) {
               <div><dt>{text('目标时区', 'Timezone')}</dt><dd>{report?.target?.timezone ?? target?.timezone ?? '—'}</dd></div>
               <div><dt>{text('语言 / 区域', 'Language / locale')}</dt><dd>{report?.target?.language ?? target?.language ?? '—'}</dd></div>
               <div><dt>{text('实时检测', 'Monitoring')}</dt><dd className="workspace-monitor-controls"><label className="workspace-monitor"><input type="checkbox" role="switch" aria-label={text('实时检测', 'Monitoring')} checked={connected && Boolean(report?.monitoring)} disabled={busy || !connected || !report} onChange={(event) => props.onMonitor(event.target.checked, intervalMs)} /><span className="sr-only">{text('实时检测', 'Monitoring')}</span></label><select className="workspace-interval" aria-label={text('自动检测间隔', 'Automatic test interval')} value={intervalMs} disabled={busy || !connected || !report} onChange={(event) => props.onMonitor(Boolean(report?.monitoring), Number(event.target.value))}>{[[30000, text('每30秒', 'Every 30 seconds')], [60000, text('每分钟', 'Every minute')], [300000, text('每5分钟', 'Every 5 minutes')], [600000, text('每10分钟', 'Every 10 minutes')]].map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></dd></div>
+              <DesktopSettingsFields locale={locale} protectionEnabled={protectionEnabled} />
             </dl></section>
           </div>
           <section className="workspace-panel"><div className="workspace-section-heading"><h2>{text('异常项目', 'Flagged items')}<span className="workspace-heading-count">{issues.length}</span></h2><button type="button" className="repair-button repair-button--quiet" onClick={() => { props.onFilter('issues'); props.onSearch(''); setTab('tests'); }}>{text('查看全部', 'View all')} →</button></div>{issues.length ? <div className="workspace-issue-list">{issues.slice(0, 6).map((signal) => <button type="button" key={signal.id} onClick={() => props.onSelect(signal.id)}><span className="workspace-issue-name">{signal.label}{issueSides(signal)}</span><span>{failed(signal) ? text("检测失败", "Failed") : text('未通过', 'Not passed')} →</span></button>)}</div> : <p>{measured ? text('已测项目暂无异常', 'No flagged measured items') : text('尚未检测，请启动保护或刷新环境。', 'Start protection or refresh to run tests.')}</p>}</section>

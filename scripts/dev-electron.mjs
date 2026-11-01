@@ -5,6 +5,7 @@ import net from "node:net";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
+import { buildTimezoneService } from "./build-timezone-service.mjs";
 import { startDev } from "./dev.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -65,6 +66,10 @@ async function electronExecutable() {
 }
 
 async function main() {
+  if (process.platform === 'darwin') {
+    try { await buildTimezoneService(); }
+    catch (error) { console.warn('[timezone-service] 编译未完成，将使用临时授权：' + error.message); }
+  }
   const executable = await electronExecutable();
   // Explicit port prevents Next from silently switching to another port.
   await new Promise((resolve, reject) => {

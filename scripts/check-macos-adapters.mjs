@@ -1,11 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
+import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { parseMacProxy, systemProxy, systemProxyStatus, validateProxySettings } from './gateway-proxy.mjs';
+import { parseMacProxy, systemProxy, systemProxyStatus } from './gateway-proxy.mjs';
 import { readSystemTimezone, readAutomaticTimezone, setSystemTimezone, validIanaTimezone } from './system-timezone.mjs';
-import { flclashDirectory, currentFlclashProfile, flclashController } from './flclash-runtime.mjs';
 import { DesktopLauncher } from './desktop-launcher.mjs';
 
 test('Mac 静态代理、系统路由、PAC、SOCKS 和读取失败不混为直连', () => {
@@ -19,8 +18,6 @@ test('Mac 静态代理、系统路由、PAC、SOCKS 和读取失败不混为直�
   }
   assert.equal(systemProxyStatus({ platform: 'darwin', run: () => { throw new Error('failed'); } }).state, 'failed');
   assert.throws(() => systemProxy({ platform: 'darwin', run: () => { throw new Error('failed'); } }));
-  assert.throws(() => validateProxySettings({ mode: 'manual', address: 'socks5://localhost:7890' }));
-  assert.throws(() => validateProxySettings({ mode: 'manual', address: 'http://private:credential@localhost:7890' }));
 });
 
 test('Mac 时区读取无提权，写入仅执行固定命令；取消和复核失败均报告失败', async () => {
@@ -33,24 +30,6 @@ test('Mac 时区读取无提权，写入仅执行固定命令；取消和复核�
   await assert.rejects(setSystemTimezone('Asia/Tokyo', { platform: 'darwin', checkZone: async () => {}, run: async () => { throw new Error('User canceled (-128)'); } }), /取消/);
   await assert.rejects(setSystemTimezone('../bad', { platform: 'darwin', run }), /无效/);
   assert.equal(calls, 2);
-});
-
-test('Mac FlClash 读取系统偏好的精确配置 ID，控制端口必须本机且带认证', async t => {
-  const dir = await mkdtemp(path.join(tmpdir(), 'guardcc-flclash-path-'));
-  t.after(() => rm(dir, { recursive: true, force: true }));
-  const id = '370409826729070592';
-  await mkdir(path.join(dir, 'profiles'));
-  await writeFile(path.join(dir, 'profiles', `${id}.yaml`), 'proxies: []');
-  const profile = await currentFlclashProfile({ directory: dir, platform: 'darwin', env: {}, run: async (file, args) => {
-    assert.equal(file, '/usr/bin/defaults'); assert.deepEqual(args, ['read', 'com.follow.clash', 'flutter.config']);
-    return { stdout: `{"currentProfileId":${id}}` };
-  } });
-  assert.equal(profile, path.join(dir, 'profiles', `${id}.yaml`));
-  assert.equal(flclashDirectory({ platform: 'darwin', env: {}, home: '/test-user' }), path.join('/test-user', 'Library', 'Application Support', 'com.follow.clash'));
-  await writeFile(path.join(dir, 'config.yaml'), 'external-controller: 0.0.0.0:9090\nsecret: local-test-only');
-  await assert.rejects(flclashController(dir), /本机/);
-  await writeFile(path.join(dir, 'config.yaml'), 'external-controller: 127.0.0.1:9090');
-  await assert.rejects(flclashController(dir), /认证/);
 });
 
 test('Mac 普通打开不修改用户资料或注入代理，也不声明托管成功', async t => {

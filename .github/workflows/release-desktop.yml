@@ -48,7 +48,7 @@ jobs:
         shell: bash
         run: |
           pnpm lint
-          node --test --test-timeout=60000 scripts/check-dev.mjs scripts/check-desktop-launcher.mjs scripts/check-shutdown-restore.mjs scripts/check-traffic-layer.mjs scripts/check-protection-session.mjs scripts/check-protection-controls.cjs scripts/check-protection-reconnect.mjs scripts/check-application-paths.mjs scripts/check-macos-adapters.mjs scripts/check-flclash-workflow.mjs scripts/check-windows-timezone.mjs
+          node --test --test-timeout=60000 scripts/check-dev.mjs scripts/check-desktop-launcher.mjs scripts/check-shutdown-restore.mjs scripts/check-protection-session.mjs scripts/check-protection-controls.cjs scripts/check-protection-reconnect.mjs scripts/check-application-paths.mjs scripts/check-macos-adapters.mjs scripts/check-windows-timezone.mjs scripts/check-timezone-service.mjs scripts/check-desktop-settings.mjs scripts/check-claude-reset.mjs
       - name: Build app and installer
         run: pnpm desktop:installer
       - uses: actions/upload-artifact@v4

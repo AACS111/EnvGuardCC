@@ -91,7 +91,7 @@ Open the local URL printed by the terminal. Desktop mode uses port 3030 for its 
 
 ## Supported scope
 
-macOS source support now includes system proxy reading and manual connection settings, managed browsers, explicit system-authorized timezone changes and restoration, and FlClash integration. The current Claude build is opened normally and is not reported as managed. FlClash changes require reapplying and starting the profile in FlClash, then runtime verification. See [stage 2/3 results](docs/MACOS-STAGE23-RESULTS.md).
+macOS automatically follows system HTTP/HTTPS proxy settings or system routing (including TUN), without manual in-app proxy configuration. The app does not read or rewrite third-party subscriptions, policy groups or routing configuration. Managed browsers and system-authorized timezone changes/restoration remain available; Claude desktop is opened normally.
 
 An Apple Silicon local trial package is available (`.app`, ZIP, DMG; ad-hoc signed) under `node_modules/.checkcc-dist`. `pnpm desktop:package` builds the `.app` and ZIP; `pnpm desktop:installer` also builds the DMG. Developer ID signing and notarization are not part of the current local-trial scope; first launch on another Mac needs approval in System Settings > Privacy & Security. It is installed locally in `/Applications`; other-machine validation remains pending. Actual Mac validation used Apple Silicon and macOS 27.0; older macOS and Intel support are not claimed. See [stage 4 results](docs/MACOS-STAGE4-RESULTS.md).
 
@@ -106,7 +106,7 @@ pnpm build
 pnpm desktop:installer
 ```
 
-`desktop:installer` only builds the Windows installer. The Windows release archive is named `EnvGuardCC-Windows-x64.zip`. The packaging command prints its output location.
+`desktop:installer` builds a Windows installer on Windows or a DMG on macOS arm64. The Mac DMG includes EnvGuardCC, an Applications shortcut and bilingual instructions. Drag the app into Applications, then launch it there. The packaging command prints its output location.
 
 ## Stack
 
@@ -115,3 +115,17 @@ Next.js 16, React 19, TypeScript, Tailwind CSS 4, and Electron.
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+### System timezone authorization
+
+On macOS 13+, the first protection activation requests system approval to bind its restricted timezone service. Subsequent changes and restoration reuse that service automatically. Source/ad-hoc builds are supported without end-user developer certificates. There is no connection or service-management panel. See [timezone service details](docs/timezone-service.md).
+
+### Desktop startup and background operation
+
+Installed Windows and macOS apps offer launch-at-login and automatic protection switches in Protection configuration. Development previews do not register login items. Closing the window keeps protection running in the background; quitting from the tray or app menu restores configuration before exiting.
+
+### Reset Claude Desktop
+
+The Protection configuration action resets supported local Claude Desktop data locations after protection is stopped and Claude and its background tasks are closed. Review the native confirmation first: sign-in state, caches, preferences, MCP configuration and local Cowork/Desktop session data are moved to the system Trash/Recycle Bin and remain recoverable until it is emptied. Unknown locations, redirected paths, locks and permission errors are reported instead of claiming a complete reset. The app, browser profiles, Claude Code, projects, cloud records and unrelated credential-manager entries are preserved. This does not change device identity or guarantee removal of server-side account associations. Check onboarding and sign-in after reopening Claude; use Claude’s built-in Reset Application Data for unsupported storage layouts.
+
+Monitoring and its interval are saved locally before a change is acknowledged and survive app restarts and protection stop/start cycles. Save failures are reported without changing the active settings. Launch-at-login and automatic protection preferences are also retained.

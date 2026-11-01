@@ -1,4 +1,4 @@
-import { access, mkdir, readFile, rm } from 'node:fs/promises';
+import { access, mkdir, readFile, rm, cp, mkdtemp, symlink, writeFile, rename } from 'node:fs/promises';
 import { spawn } from 'node:child_process';
 import { createRequire } from 'node:module';
 import path from 'node:path';
@@ -17,8 +17,31 @@ if (process.platform === 'darwin' && process.arch === 'arm64') {
   await access(path.join(app, 'Contents', 'Info.plist'));
   const version = JSON.parse(await readFile(path.join(root, 'package.json'), 'utf8')).version;
   const dmg = path.join(output, `EnvGuardCC-${version}-arm64.dmg`);
-  await rm(dmg, { force: true });
-  await run('hdiutil', ['create', '-volname', 'EnvGuardCC', '-srcfolder', app, '-ov', '-format', 'UDZO', dmg]);
+  const staging = await mkdtemp(path.join(output, '.mac-installer-'));
+  const pending = path.join(staging, 'EnvGuardCC.pending.dmg');
+  try {
+    const contents = path.join(staging, 'contents');
+    await mkdir(contents);
+    await cp(app, path.join(contents, 'EnvGuardCC.app'), { recursive: true, verbatimSymlinks: true });
+    await symlink('/Applications', path.join(contents, 'Applications'));
+    await writeFile(path.join(contents, '安装说明 - 拖入 Applications 安装.txt'), [
+      'EnvGuardCC 安装说明', '',
+      '1. 若旧版正在运行，请从托盘或应用菜单选择退出，等待配置恢复完成。',
+      '2. 将本窗口中的 EnvGuardCC 拖入旁边的 Applications（应用程序）文件夹。',
+      '3. 如提示替换旧版本，请选择替换。',
+      '4. 从“应用程序”打开 EnvGuardCC，然后推出此磁盘映像。', '',
+      '双击 DMG 只是打开磁盘映像；直接运行映像中的应用不会将其安装到应用程序。', '',
+      'Installation', '',
+      'Quit any running copy of EnvGuardCC and wait for configuration restoration.',
+      'Drag EnvGuardCC into the Applications folder beside it. Replace an older copy if prompted.',
+      'Launch EnvGuardCC from Applications, then eject this disk image.',
+      'Opening the DMG or running the app inside it does not install the app.', '',
+    ].join('\n'));
+    await run('hdiutil', ['create', '-volname', 'EnvGuardCC', '-srcfolder', contents, '-ov', '-format', 'UDZO', pending]);
+    await run('hdiutil', ['verify', pending]);
+    // Keep the previous installer intact until the replacement is verified.
+    await rename(pending, dmg);
+  } finally { await rm(staging, { recursive: true, force: true }); }
   console.log(`macOS disk image: ${dmg}`);
   process.exit(0);
 }
