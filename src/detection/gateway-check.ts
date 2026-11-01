@@ -12,7 +12,7 @@ import { RISK_COUNTRIES } from "./browser-probes";
 import { signalTestKind } from "./signal-policy";
 import { exitNetworkType } from "./network-type";
 
-type Probe = { status: number | null; error?: string; elapsedMs: number; tls?: { authorized: boolean; protocol: string | null } | null };
+type Probe = { status: number | null; error?: string; elapsedMs: number; challenge?: boolean; failureKind?: string; tls?: { authorized: boolean; protocol: string | null } | null };
 type GeoSource = { source: string; ip: string; countryCode: string; city: string | null; regionName: string | null; timezone: string | null; asn: string | null; org: string | null };
 
 export type CloakState = {
@@ -191,8 +191,16 @@ export function buildGatewayCheck(report: GatewayReport | null, locale: LocaleCo
   for (const [id, probe] of [["claudeReachability", report.probes?.claude], ["anthropicReachability", report.probes?.anthropic]] as const) {
     if (!probe) { put(id, missing, "unknown", offline); continue; }
     const status = probe.status;
-    const value = status ? `HTTP ${status} · ${probe.elapsedMs} ms${status >= 300 && status < 400 ? tr(" · 已收到响应，网络可达", " · response received, network reachable") : status === 401 ? tr(" · 未验证授权", " · authorization not verified") : ""}` : probe.error ?? missing;
-    put(id, value, !status ? "error" : status >= 400 ? "warning" : "ok", tr("网关直出探测，不携带 API Key、不创建消息、不验证账号或模型权限。收到 HTTP 响应表示网络已连通，3xx 按网络可达计分；401/403/429 不等于账号可用。重定向未跟随，未验证最终页面。", "Gateway egress probe without API keys or message creation. An HTTP response proves network reachability; 3xx counts as reachable. 401/403/429 do not verify account access. Redirects are not followed and the final page is not verified."), id === "claudeReachability" && !status ? 1 : 0);
+    const pending = probe.challenge || status === 401 || status === 403 || status === 429;
+    const reason = probe.challenge ? tr("网络已通，Cloudflare 要求浏览器验证", "Network connected; Cloudflare browser verification required")
+      : status === 403 ? tr("网络已通，网站拒绝访问，原因未确认", "Network connected; website denied access, reason unconfirmed")
+      : status === 401 ? tr("网络已通，网站要求身份验证", "Network connected; website authentication required")
+      : status === 429 ? tr("网络已通，网站限制请求频率", "Network connected; website rate limited the request")
+      : status && status < 400 ? tr("已收到响应，网络可达", "Response received, network reachable")
+      : status ? tr("网站返回错误响应", "Website returned an error response") : ({ certificate: tr("证书或 TLS 校验失败", "Certificate or TLS failure"), dns: tr("域名解析失败", "DNS resolution failed"), timeout: tr("连接超时", "Connection timed out"), proxy: tr("代理连接失败", "Proxy connection failed"), connection: tr("网络连接失败", "Network connection failed") }[probe.failureKind ?? "connection"] ?? probe.error ?? missing);
+    const value = `${reason} · ${status ? `HTTP ${status}` : probe.error ?? "NETWORK_ERROR"} · ${probe.elapsedMs} ms`;
+    put(id, value, pending ? "unknown" : !status ? "error" : status >= 400 ? "warning" : "ok", tr("网关后台请求不携带浏览器登录 Cookie 或 API Key，也不执行验证页脚本。收到 HTTP 响应说明此路径网络已通；验证、鉴权或限流响应不计分，请用受控浏览器继续验证。此项不证明账号或聊天可用。重定向未跟随，未验证最终页面。", "The gateway request carries no browser login cookies or API keys and does not execute challenge scripts. An HTTP response establishes network connectivity on this route. Challenges, authentication and rate limits are unscored; continue in the managed browser. Account and messaging access are unverified. Redirects are not followed and the final page is not verified."), id === "claudeReachability" && !status ? 1 : 0, false, pending ? "inconclusive" : undefined);
+    if (pending) observations.get(id)!.unscored = true;
   }
   put("claudeTrigger", report.lastFailure ? tr(`上游失败：${report.lastFailure.error}`, `Upstream failure: ${report.lastFailure.error}`) : current?.status ? `HTTP ${current.status} · ${current.startedAt}` : tr("等待真实 Claude 请求", "Awaiting a real Claude request"), report.lastFailure ? "error" : current?.status ? successful ? "ok" : "warning" : "unknown", `${tr("仅记录经此网关转发后收到的真实上游响应，自动诊断请求不计入。保存配置后需要再发起一次 Claude 请求。", "Only actual forwarded upstream responses count; diagnostic probes do not. Send a new Claude request after changing the profile.")} ${cloakNote}`);
   put("claudeLatency", current?.elapsedMs != null ? `${current.elapsedMs} ms` : missing, current?.elapsedMs != null ? "ok" : "unknown", tr("从收到真实请求至上游返回响应头的耗时，不是完整生成耗时或首 token 延迟。", "Time from actual inbound request to upstream response headers, not generation completion or first-token latency."));

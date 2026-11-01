@@ -258,6 +258,20 @@ const server = http.createServer(async (req, res) => {
     } catch (error) { return send(400, { error: error.message }); }
   }
   if (req.method === "GET" && req.url === "/session?tokenOnly=1") return send(200, { token: secret });
+  if (req.url === "/claude-browser") {
+    if (!["GET", "POST"].includes(req.method)) return send(405, { error: "仅支持 GET/POST。" });
+    if (changing || protectionChanging) return send(409, { error: "浏览器配置正在更新，请稍后复检。" });
+    if (req.method === "POST") {
+      if (!authenticated(req.headers["x-checkcc-token"])) return send(403, { error: "会话已失效，请重新连接本机服务。" });
+      if (!req.headers["content-type"]?.startsWith("application/json")) return send(415, { error: "必须使用 JSON。" });
+      const body = await parseBody(req).catch(() => null);
+      if (body?.action !== "open") return send(400, { error: "无效操作。" });
+    }
+    changing = true;
+    try { return send(200, await environmentRuntime.claudeBrowser(origin, { open: req.method === "POST" })); }
+    catch { return send(500, { error: "无法读取受控浏览器，请确认浏览器仍在运行后重试。" }); }
+    finally { changing = false; }
+  }
   if (req.method === "GET" && req.url === "/session") {
     try { return send(200, { token: secret, helperProtocol: HELPER_PROTOCOL, shutdown: 1, desktopLauncher: 1, environmentScripts: 1, browserCloak: 1, platform: process.platform, capabilities: await capabilities(), timezone: timezoneSupported(process.platform) ? await currentZone() : "", canRestore: Boolean(await readBackup()), profile: await readProfile() }); }
     catch (error) {

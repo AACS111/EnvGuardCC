@@ -37,6 +37,9 @@ export function Detector({ locale = "zh" }: { locale?: LocaleCode }) {
   const protection = useProtection();
   const selfTest = useSimulation();
   const [browserScan, setBrowserScan] = useState<BrowserScan | null>(null);
+  const updateBrowserSample = useCallback((sample: SignalResult) => {
+    setBrowserScan(previous => previous ? { ...previous, signals: mergePointSignals(previous.signals, sample) } : previous);
+  }, []);
   const [claudeCheck, setClaudeCheck] = useState<GatewayCheck | null>(null);
   const [optimization, setOptimization] = useState<CloakState | null>(null);
   const [pointBusy, setPointBusy] = useState<string | null>(null);
@@ -303,6 +306,6 @@ export function Detector({ locale = "zh" }: { locale?: LocaleCode }) {
   return <>
     <ProtectionWorkspace browserReport={browserReport} onBrowserReport={setBrowserReport} error={checkError || protection.error} locale={locale} report={protection.report} connected={protection.connected} powerAction={powerAction} checking={!powerAction && (exitLoading || loading || protection.report?.testing === true)} busy={cloakBusy || transitioning || exitLoading || loading || protection.report?.testing === true} scores={scores} geo={exitGeo} target={target} baseline={baseline} browser={browserSignals} claude={claudeSignals} signals={allSignals} filter={filter} search={search} onFilter={setFilter} onSearch={setSearch} onToggle={() => void toggleProtection()} onStop={() => void toggleProtection(true)} onMonitor={(enabled, intervalMs) => { void protection.act("monitor", { enabled, intervalMs }).catch(() => {}); }} onRefresh={() => void recheck()} onSelect={setDetailSignalId}
       cards={visibleSignals.length ? <div className="signal-card-grid">{visibleSignals.map((signal) => <SignalCard key={signal.id} signal={signal} browser={browserSignals.find((item) => item.id === signal.id)} claude={claudeSignals.find((item) => item.id === signal.id)} locale={locale} target={target} job={simulationJob} simulationBusy={selfTest.busy} checking={loading} testing={pointBusy === signal.id} detailLabel={zh ? "配置与详情" : "Configuration & details"} onSelect={setDetailSignalId} />)}</div> : <p className="workspace-empty">{zh ? "没有匹配的检测项目。" : "No matching test items."}</p>} />
-    {detailSignal && <RepairDialog key={detailSignal.id} signal={detailSignal} browser={browserSignals.find((item) => item.id === detailSignal.id)} claude={claudeSignals.find((item) => item.id === detailSignal.id)} signals={allSignals} locale={locale} target={target} protectionEnabled={protection.report?.enabled} loading={loading || transitioning || cloakBusy || protection.report?.testing === true || protection.report?.phase === "restart_required"} onClose={() => setDetailSignalId(null)} onRecheck={() => runSignal(detailSignal.id)} onRuntimeRecheck={runAll} onApplyGateway={(choice) => runSignal(detailSignal.id, choice)} />}
+    {detailSignal && <RepairDialog key={detailSignal.id} signal={detailSignal} browser={browserSignals.find((item) => item.id === detailSignal.id)} claude={claudeSignals.find((item) => item.id === detailSignal.id)} signals={allSignals} locale={locale} target={target} protectionEnabled={protection.report?.enabled} loading={loading || transitioning || cloakBusy || protection.report?.testing === true || protection.report?.phase === "restart_required"} onBrowserSample={updateBrowserSample} onClose={() => setDetailSignalId(null)} onRecheck={() => runSignal(detailSignal.id)} onRuntimeRecheck={runAll} onApplyGateway={(choice) => runSignal(detailSignal.id, choice)} />}
   </>;
 }

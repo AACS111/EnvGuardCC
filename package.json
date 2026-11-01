@@ -32,6 +32,7 @@
     "test:environment": "node --test --test-timeout=35000 scripts/check-environment-runtime.mjs",
     "test:desktop": "node --test scripts/check-desktop-launcher.mjs",
     "test:shutdown": "node --test scripts/check-shutdown-restore.mjs",
+    "test:reachability": "node --test scripts/check-claude-reachability.mjs scripts/check-claude-reachability-model.cjs",
     "test:gateway": "node --test scripts/check-gateway.mjs scripts/check-gateway-model.cjs scripts/check-gateway-simulation.mjs scripts/check-simulation-runner.mjs scripts/check-gateway-proxy.mjs",
     "test:simulation": "node --test scripts/check-gateway-simulation.mjs",
     "build": "next build",

@@ -28,7 +28,7 @@ export function SignalCard({ signal, browser, claude, locale, testing, detailLab
     if (status === "pending") return zh ? "未采样" : "Not sampled";
     if (status === "running") return zh ? "检测中…" : "Testing…";
     if (status === "unavailable") return zh ? "未返回数据" : "No data returned";
-    if (status === "inconclusive" || status === "review") return zh ? "无法判定" : "Inconclusive";
+    if (status === "inconclusive" || status === "review") return signal.id === "claudeReachability" && sample?.value ? sample.value : zh ? "无法判定" : "Inconclusive";
     if (status === "failed") return sample?.value || (zh ? "检测失败" : "Test failed");
     return sample?.value || (zh ? "未判定" : "Unresolved");
   };

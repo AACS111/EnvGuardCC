@@ -59,8 +59,10 @@ test('HTTP redirects finish reachability checks without claiming final-page or a
     const result=buildGatewayCheck(report,'zh');
     const rows=index(result);
     for (const id of ['claudeReachability','anthropicReachability']) {
-      assert.equal(rows[id].assessment,status>=400?'warning':'ok');
-      assert.equal(signalScoreLabel(rows[id],true),'0');
+      const unresolved=[401,403,429].includes(status);
+      assert.equal(rows[id].assessment,unresolved?'unknown':status>=400?'warning':'ok');
+      assert.equal(Boolean(rows[id].unscored),unresolved);
+      assert.equal(signalScoreLabel(rows[id],true),unresolved?'无法判定':'0');
       assert.match(rows[id].value,new RegExp(`HTTP ${status}`));
       assert.match(rows[id].detail,/未验证最终页面/);
       if (status>=300 && status<400) assert.match(rows[id].value,/网络可达/);
@@ -101,10 +103,11 @@ test('opaque browser reachability never invents an HTTP status and failures stay
     const {runBrowserScan}=require(path.join(root,'src/detection/browser-scan.ts'));
     const {detectorLocaleText}=require(path.join(root,'src/detection/locale.ts'));
     const scan=await runBrowserScan('auto','zh',detectorLocaleText.zh,'claudeReachability');
-    assert.equal(scan.signals[0].assessment,'not_applicable');
-    assert.equal(scan.signals[0].observation,undefined);
+    assert.equal(scan.signals[0].assessment,'unknown');
+    assert.equal(scan.signals[0].observation,'inconclusive');
+    assert.equal(scan.signals[0].unscored,true);
     assert.equal(scan.signals[0].contribution,0);
-    assert.match(scan.signals[0].value,/浏览器跨站探测受限/);
+    assert.match(scan.signals[0].value,/浏览器跨站探测未完成/);
     assert.match(scan.signals[0].detail,/CORP\/COEP/);
   } finally {global.fetch=originalFetch;}
 });
@@ -147,17 +150,19 @@ test('browser script failures do not become reachability or aggregate access-ris
       failure=error;
       const reach=(await runBrowserScan('auto','zh',detectorLocaleText.zh,'claudeReachability')).signals[0];
       const risk=(await runBrowserScan('auto','zh',detectorLocaleText.zh,'claudeAccessRisk')).signals[0];
-      assert.equal(reach.assessment,'not_applicable');
-      assert.equal(reach.observation,undefined);
+      assert.equal(reach.assessment,'unknown');
+      assert.equal(reach.observation,'inconclusive');
+      assert.equal(reach.unscored,true);
       assert.equal(reach.contribution,0);
-      assert.equal(signalScoreLabel(reach,true),'不适用');
+      assert.equal(signalScoreLabel(reach,true),'无法判定');
       assert.equal(risk.assessment,'ok');
       assert.equal(risk.contribution,0);
       assert.equal(signalScoreLabel(risk,true),'0');
       const html=renderCard(reach,null,{browser:reach,claude:gateway});
       assert.match(html,/HTTP 302/);
-      assert.match(html,/不适用/);
-      assert.doesNotMatch(html,/测试失败|无法判定/);
+      assert.match(html,/无法判定/);
+      assert.match(html,/data-signal-state="pending"/);
+      assert.doesNotMatch(html,/测试失败|不适用/);
     }
     country='CN';
     const actualRisk=(await runBrowserScan('auto','zh',detectorLocaleText.zh,'claudeAccessRisk')).signals[0];
@@ -168,7 +173,9 @@ test('browser script failures do not become reachability or aggregate access-ris
     const {RepairDialog}=require(path.join(root,'src/components/detector/RepairDialog.tsx'));
     const html=renderToStaticMarkup(React.createElement(RepairDialog,{signal:gateway,claude:gateway,signals:[gateway],locale:'zh',loading:false,onClose:()=>{},onRecheck:async()=>{},onApplyGateway:async()=>{}}));
     assert.match(html,/重新检测/);
-    assert.match(html,/打开网站人工核对/);
+    assert.match(html,/打开受控浏览器/);
+    assert.match(html,/网关后台探测与受控浏览器访问分别验证/);
+    assert.doesNotMatch(html,/以客户端网关的 HTTP 响应为准/);
   } finally {probes.collectBrowserIpIntel=originalIp;probes.collectBrowserReachability=originalReach;}
 });
 

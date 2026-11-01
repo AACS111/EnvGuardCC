@@ -2,6 +2,7 @@
 import { proxyRequest, proxyInfo } from "./gateway-proxy.mjs";
 import dns from "node:dns";
 import { isIP } from "node:net";
+import { httpReachability, networkFailure } from "./claude-reachability.mjs";
 
 export function transportRequest(url, options, onResponse) {
   return proxyRequest(url, options, onResponse);
@@ -24,7 +25,7 @@ export function probe(rawUrl, { method = "HEAD", family, json = false, text = fa
     const finish = (result) => {
       if (settled) return;
       settled = true;
-      resolve({ url: url.origin + url.pathname, elapsedMs: Date.now() - start, ...result });
+      resolve({ url: url.origin + url.pathname, elapsedMs: Date.now() - start, outcome: httpReachability(result.status, result.challenge), ...(!result.status ? { failureKind: networkFailure(result.error) } : {}), ...result });
     };
     const request = transportRequest(url, {
       method, family, signal: AbortSignal.timeout(timeout),
@@ -33,6 +34,7 @@ export function probe(rawUrl, { method = "HEAD", family, json = false, text = fa
       const socket = response.socket;
       const result = {
         status: response.statusCode,
+        challenge: String(response.headers["cf-mitigated"]).toLowerCase() === "challenge",
         remoteAddress: socket.remoteAddress ?? null,
         tls: url.protocol === "https:" ? { authorized: socket.authorized === true, protocol: socket.getProtocol?.() ?? null } : null,
       };

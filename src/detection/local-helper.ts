@@ -6,7 +6,7 @@ export type HelperCapabilities = { timezoneRead: boolean; timezoneWrite: boolean
 export type HelperSession = { capabilities?: HelperCapabilities; token: string; timezone: string; canRestore: boolean; platform: string; profile?: unknown };
 export const gatewayUrl = `http://127.0.0.1:${runtimePorts?.gateway ?? 3010}`;
 
-export async function helperRequest(path: string, token?: string, body?: object): Promise<HelperSession & { timezone: string; canRestore: boolean }> {
+export async function helperRequest<T = HelperSession & { timezone: string; canRestore: boolean }>(path: string, token?: string, body?: object): Promise<T> {
   const response = await fetch(`${helperUrl}${path}`, {
     method: body ? "POST" : "GET",
     headers: { "X-CheckCC-Client": "repair-ui", ...(body ? { "Content-Type": "application/json", "X-CheckCC-Token": token ?? "" } : {}) },

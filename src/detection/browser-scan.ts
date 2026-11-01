@@ -10,6 +10,7 @@ import * as rules from "./signal-rules";
 import { activeRuntimePolicy } from "./environment-runtime";
 import { policyAffectsSignal } from "./environment-actions";
 import { collectBrowserSignals } from "./client-engine";
+import { readClaudeBrowser, claudeBrowserSignal } from "./claude-browser";
 
 export type BrowserScan = {
   signals: SignalResult[];
@@ -24,10 +25,11 @@ const DATACENTER_PATTERN = /(cloud|amazon|aws|google|azure|digitalocean|ovh|hetz
 export async function runBrowserScan(region: RegionCode, locale: LocaleCode, text: DetectorLocaleText, signalId?: string): Promise<BrowserScan> {
   const snapshot = collectBrowserEnvironment(text);
   // 三项并行：WebRTC 候选、出口情报、可达性；任一失败都不阻塞其它信号。
-  const [webrtc, ipIntel, reachability] = await Promise.all([
+  const [webrtc, ipIntel, reachability, claudeBrowser] = await Promise.all([
     !signalId || signalId.startsWith("webrtc") ? probeWebrtc() : Promise.resolve({ supported: false, candidates: 0, publicIps: [], hostCount: 0, srflxCount: 0, mdnsCount: 0, error: null } as WebrtcProbe),
     !signalId || ["country", "ipv4", "browserIpLocation", "browserIpOrg", "claudeAccessRisk", "webrtcConsistency"].includes(signalId) || signalId.startsWith("webrtc") ? collectBrowserIpIntel(locale).catch(() => null) : Promise.resolve(null),
     !signalId || ["claudeReachability", "anthropicReachability", "claudeAccessRisk"].includes(signalId) ? collectBrowserReachability().catch(() => null) : Promise.resolve(null),
+    !signalId || signalId === "claudeReachability" ? readClaudeBrowser().catch(() => null) : Promise.resolve(null),
   ]);
 
   const base = collectBrowserSignals(region, text, detectionConfig, snapshot, { webrtc, signalId }).signals;
@@ -109,18 +111,20 @@ export async function runBrowserScan(region: RegionCode, locale: LocaleCode, tex
       ["claudeReachability", reachability.claude],
       ["anthropicReachability", reachability.anthropic],
     ];
-    const restricted = locale.startsWith("zh") ? "浏览器跨站探测受限（CORS/网络），不计分；以客户端网关结果为准" : "Browser cross-site probe restricted (CORS/network); not scored; use the client gateway result";
+    const restricted = locale.startsWith("zh") ? "浏览器跨站探测未完成，无法判定；本侧不计分" : "Browser cross-site probe incomplete; inconclusive and not scored";
     for (const [id, probe] of probeMap) {
       put(id, {
-        ...makeSignalScore(id, label[id], probe.ok ? `${probe.elapsedMs} ms` : restricted, id === "claudeReachability" ? 6 : 0, 0, text, detectionConfig),
-        assessment: probe.ok ? "ok" : "not_applicable",
+        ...makeSignalScore(id, label[id], probe.ok ? `${id === "claudeReachability" ? (locale.startsWith("zh") ? "跨站请求已返回，网页可用性待浏览器验证 · " : "Cross-site response received; browser verification needed · ") : ""}${probe.elapsedMs} ms` : restricted, id === "claudeReachability" ? 6 : 0, 0, text, detectionConfig),
+        assessment: probe.ok && id !== "claudeReachability" ? "ok" : "unknown",
+        ...(!probe.ok || id === "claudeReachability" ? { observation: "inconclusive" as const, unscored: true } : {}),
         detail: probe.ok
           ? (locale.startsWith("zh") ? "这里从本地检测页发起不带登录凭证的 no-cors 请求；opaque 响应不提供状态码。网关探测结果独立显示。" : "A credential-free no-cors request from the local checker; an opaque response exposes no status. Gateway evidence is separate.")
-          : (locale.startsWith("zh") ? "本地检测页无法确认跨站可达性；TypeError 可能来自 CORP/COEP、扩展、重定向或网络，不能据此判定网站不可达。本项不计分，以客户端网关的 HTTP 响应为准。" : "The local page cannot confirm cross-site reachability. CORP/COEP, extensions, redirects or network errors can throw TypeError; this does not prove unreachability. The item is not scored; use the gateway HTTP response."),
+          : (locale.startsWith("zh") ? "本地检测页无法确认跨站可达性；TypeError 可能来自 CORP/COEP、扩展、重定向或网络，不能据此判定网站不可达。本侧不计分。网关结果独立显示，不能替代浏览器验证。" : "The local page cannot confirm cross-site reachability. CORP/COEP, extensions, redirects or network errors can throw TypeError; this does not prove unreachability. This side is not scored. Gateway evidence is separate and cannot verify the browser path."),
         environment: "browser",
       });
     }
   }
+  if (claudeBrowser && claudeBrowser.state !== "unavailable") put("claudeReachability", { ...claudeBrowserSignal(claudeBrowser, locale), label: label.claudeReachability });
   const riskyExit = riskyCountries.length > 0;
   const accessRisk = riskyExit;
   const completeAccessEvidence = Boolean(primary?.countryCode);

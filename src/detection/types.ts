@@ -24,6 +24,7 @@ export type SignalResult = {
   originalValue?: string;
   assessment?: "ok" | "warning" | "unknown" | "error" | "not_applicable";
   observation?: "review" | "unavailable" | "inconclusive";
+  unscored?: boolean;
   testedAt?: string;
   settingValue?: string;
   detail?: string;
