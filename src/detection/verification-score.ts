@@ -34,7 +34,7 @@ export function verificationLabel(sample: (SignalResult & { state?: string }) | 
     const points = verificationWeight(sample!.id);
     return points > 0 ? (zh ? '通过 +' + points : 'Passed +' + points) : (zh ? '通过 · 不计分' : 'Passed · informational');
   }
-  if (status === 'failed') return sample?.assessment === 'error' ? (zh ? '检测失败 · 0分' : 'Failed · 0 pts') : (zh ? '未通过 · 0分' : 'Not passed · 0 pts');
+  if (status === 'failed') return sample?.assessment === 'error' ? (zh ? '检测失败 · 0分' : 'Failed · 0 pts') : (zh ? '未达标 · 0分' : 'Not met · 0 pts');
   if (status === 'not_applicable') return zh ? '不适用' : 'N/A';
   if (sample?.assessment === 'error') return zh ? '测试失败' : 'Failed';
   const provisional = id ? verificationWeight(id) / 2 : 0;

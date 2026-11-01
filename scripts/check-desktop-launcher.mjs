@@ -92,7 +92,7 @@ async function launcherFixture(t, spawnBehavior) {
   const child = new EventEmitter();
   child.stderr = new EventEmitter();
   Object.assign(child, { pid: 12345, exitCode: null, signalCode: null, unref() {}, kill() { this.signalCode = 'SIGTERM'; this.emit('exit', null, 'SIGTERM'); return true; } });
-  const launcher = new DesktopLauncher({ stateDir, findExecutable: async () => path.join(stateDir, 'Claude.exe'), resolveProxy: () => null, startProcess: (_exe, argv, config) => {
+  const launcher = new DesktopLauncher({ stateDir, platform: 'win32', findExecutable: async () => path.join(stateDir, 'Claude.exe'), resolveProxy: () => null, startProcess: (_exe, argv, config) => {
     starts++; options = config; args = argv;
     queueMicrotask(() => spawnBehavior ? spawnBehavior(child) : child.emit('spawn'));
     return child;
@@ -227,7 +227,7 @@ test('本机启动接口要求会话认证和已开启保护，保护关闭时�
   assert.equal(unauthorized.status, 403);
   const disabled = await fetch(`${helper.url}/claude-desktop`, { method: 'POST', headers: { ...headers, 'Content-Type': 'application/json', 'X-CheckCC-Token': session.token }, body: JSON.stringify({ action: 'launch' }) });
   assert.equal(disabled.status, 409);
-  assert.match((await disabled.json()).error, /请先开启保护/);
+  assert.match((await disabled.json()).error, process.platform === 'darwin' ? /不支持托管/ : /请先开启保护/);
   const status = await (await fetch(`${helper.url}/claude-desktop`, { headers })).json();
   assert.equal(status.state, 'idle');
   assert.equal(status.gateway, null);

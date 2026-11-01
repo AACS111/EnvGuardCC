@@ -118,6 +118,78 @@ test('退出连接先检查能力；旧版本不发送不支持的退出请求�
   assert.equal(requests.at(-1), '/shutdown');
 });
 
+test('复用现有助手只恢复配置，不关闭它的监听端口', async t => {
+  const requests = [];
+  const server = http.createServer((request, response) => {
+    response.setHeader('Content-Type', 'application/json');
+    if (request.url === '/session') return response.end(JSON.stringify({
+      token: 'a'.repeat(64), helperProtocol: HELPER_PROTOCOL, shutdown: 1, desktopLauncher: 1, environmentScripts: 1, browserCloak: 1,
+    }));
+    if (request.url === '/shutdown' && request.method === 'POST') {
+      let body = '';
+      request.on('data', chunk => { body += chunk; });
+      request.on('end', () => {
+        requests.push(JSON.parse(body));
+        response.end(JSON.stringify({ restored: true }));
+      });
+      return;
+    }
+    response.writeHead(404); response.end(JSON.stringify({ error: 'not found' }));
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  t.after(async () => { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); });
+  const { startRepairHelper } = await import('./local-repair.mjs');
+  const helper = await startRepairHelper(server.address().port);
+  assert.equal(helper.server, null);
+  await helper.closeRuntime();
+  assert.deepEqual(requests, [{ stopServer: false }]);
+  assert.equal(server.listening, true);
+});
+
+test('真实助手可复用退出后仍接受 POST，并能再次完成恢复', { timeout: 15000 }, async t => {
+  const stateDir = await mkdtemp(path.join(tmpdir(), 'checkcc-helper-reuse-'));
+  const previousState = process.env.CHECKCC_STATE_DIR;
+  process.env.CHECKCC_STATE_DIR = stateDir;
+  let helper;
+  t.after(async () => {
+    if (helper?.server?.listening) {
+      helper.server.closeAllConnections();
+      await new Promise(resolve => helper.server.close(resolve));
+    }
+    if (previousState === undefined) delete process.env.CHECKCC_STATE_DIR; else process.env.CHECKCC_STATE_DIR = previousState;
+    await rm(stateDir, { recursive: true, force: true });
+  });
+  let startRepairHelper;
+  try {
+    // A query string isolates this module instance's state and listener from the mock reuse test.
+    ({ startRepairHelper } = await import('./local-repair.mjs?real-reuse-test'));
+  } finally {
+    if (previousState === undefined) delete process.env.CHECKCC_STATE_DIR; else process.env.CHECKCC_STATE_DIR = previousState;
+  }
+  helper = await startRepairHelper(0);
+  const headers = { Origin: 'http://localhost:3000', 'X-CheckCC-Client': 'repair-ui', 'Content-Type': 'application/json' };
+  const session = await (await fetch(`${helper.url}/session`, { headers })).json();
+  const restore = async token => {
+    const response = await fetch(`${helper.url}/shutdown`, {
+      method: 'POST', headers: { ...headers, 'X-CheckCC-Token': token }, body: JSON.stringify({ stopServer: false }),
+    });
+    return { status: response.status, body: await response.json() };
+  };
+  assert.deepEqual(await restore(session.token), { status: 200, body: { restored: true } });
+  assert.equal(helper.server.listening, true);
+  const desktop = await (await fetch(`${helper.url}/claude-desktop`, { headers })).json();
+  assert.equal(desktop.state, 'idle');
+  assert.equal(desktop.pid, null);
+  const post = await fetch(`${helper.url}/protection`, {
+    method: 'POST', headers: { ...headers, 'X-CheckCC-Token': session.token }, body: JSON.stringify({ action: 'observe' }),
+  });
+  assert.equal(post.status, 200);
+  const secondSession = await (await fetch(`${helper.url}/session`, { headers })).json();
+  assert.match(secondSession.token, /^[a-f0-9]{64}$/);
+  assert.deepEqual(await restore(secondSession.token), { status: 200, body: { restored: true } });
+  assert.equal(helper.server.listening, true);
+});
+
 test('失效脚本注册不阻止撤销语言和接口覆盖，仍必须核对原始值', async t => {
   const stateDir = await mkdtemp(path.join(tmpdir(), 'checkcc-stale-script-'));
   t.after(() => rm(stateDir, { force: true, recursive: true }));

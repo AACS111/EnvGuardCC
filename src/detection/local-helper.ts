@@ -2,7 +2,8 @@
 const runtimePorts = typeof window === "undefined" ? undefined : (window as Window & { __CHECKCC_PORTS__?: { helper: number; gateway: number } }).__CHECKCC_PORTS__;
 export const helperUrl = `http://127.0.0.1:${runtimePorts?.helper ?? 3001}`;
 
-export type HelperSession = { token: string; timezone: string; canRestore: boolean; platform: string; profile?: unknown };
+export type HelperCapabilities = { timezoneRead: boolean; timezoneWrite: boolean; timezoneFormat: "iana" | "windows"; timezoneAuthorization: boolean; browserLaunch: boolean; desktopLaunch: boolean; desktopMode: "standard" | "managed"; desktopScripts: boolean; desktopReason: string };
+export type HelperSession = { capabilities?: HelperCapabilities; token: string; timezone: string; canRestore: boolean; platform: string; profile?: unknown };
 export const gatewayUrl = `http://127.0.0.1:${runtimePorts?.gateway ?? 3010}`;
 
 export async function helperRequest(path: string, token?: string, body?: object): Promise<HelperSession & { timezone: string; canRestore: boolean }> {
@@ -10,7 +11,7 @@ export async function helperRequest(path: string, token?: string, body?: object)
     method: body ? "POST" : "GET",
     headers: { "X-CheckCC-Client": "repair-ui", ...(body ? { "Content-Type": "application/json", "X-CheckCC-Token": token ?? "" } : {}) },
     body: body ? JSON.stringify(body) : undefined,
-    signal: AbortSignal.timeout(body ? 20000 : 3500),
+    signal: AbortSignal.timeout(body ? (path.startsWith("/timezone") ? 120000 : 45000) : 8000),
     cache: "no-store",
   });
   const result = await response.json();

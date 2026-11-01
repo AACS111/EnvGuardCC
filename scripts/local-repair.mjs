@@ -1,19 +1,20 @@
-// Optional Windows companion. Only explicit UI requests can change a whitelisted timezone.
+// Local companion. System writes require an authenticated, explicit UI request.
 import http from "node:http";
 import { randomBytes, timingSafeEqual } from "node:crypto";
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
 import { mkdir, readFile, rename, writeFile, rm } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createProtectionService } from "./protection-service.mjs";
 import { EnvironmentRuntime } from "./environment-runtime.mjs";
 import { BrowserCloakController } from "./browser-cloak.mjs";
-import { readWindowsTimezone, windowsSystemExecutable } from "./windows-timezone.mjs";
+import { readSystemTimezone, setSystemTimezone, validIanaTimezone, sameTimezone, timezoneSupported } from "./system-timezone.mjs";
+import { findBrowser, findDesktop } from "./application-paths.mjs";
+import { proxyStatus, proxySettingsFile, validateProxySettings } from "./gateway-proxy.mjs";
 import { DesktopLauncher } from "./desktop-launcher.mjs";
+import { prepareTrafficConfig, applyTrafficConfig, restoreTrafficConfig, trafficStatus, entryStatus } from "./traffic-config.mjs";
+import { startTrafficLayer } from "./traffic-layer.mjs";
 import { HELPER_PROTOCOL, assertCurrentHelper, shutdownHelper } from "./helper-connection.mjs";
 
-const exec = promisify(execFile);
 const port = 3001;
 const localOrigin = /^https?:\/\/(127\.0\.0\.1|localhost)(:\d+)?$/;
 const allowedZones = new Set([
@@ -46,28 +47,56 @@ let protectionChanging = false;
 let closing = false;
 let closePending = null;
 let initializing = true;
+let trafficLayer = null;
+const trafficFile = path.join(stateDir, "traffic-layer.json");
+async function ensureTrafficLayer() {
+  if (trafficLayer) return;
+  try { trafficLayer = await startTrafficLayer(trafficFile); }
+  catch (error) {
+    if (error.code !== "EADDRINUSE") throw error;
+    await entryStatus(JSON.parse(await readFile(trafficFile, "utf8")));
+    trafficLayer = { close: async () => {} };
+  }
+}
+async function restoreTraffic() {
+  let config;
+  try { config = JSON.parse(await readFile(trafficFile, "utf8")); } catch (error) { if (error.code === "ENOENT") return; throw error; }
+  if (config.applied) await restoreTrafficConfig();
+  await trafficLayer?.close(); trafficLayer = null;
+}
 const environmentRuntime = new EnvironmentRuntime({ stateDir });
 const browserCloak = new BrowserCloakController(environmentRuntime, { gatewayUrl: process.env.CHECKCC_GATEWAY_URL || "http://127.0.0.1:3010", acquire: () => { if (changing || protectionChanging || closing) return false; changing = true; return true; }, release: () => { changing = false; } });
 
-const currentZone = () => readWindowsTimezone();
-async function setZone(zone) {
-  if (!allowedZones.has(zone)) {
-    const known = (await exec(windowsSystemExecutable("tzutil.exe"), ["/l"], { windowsHide: true, timeout: 15000 })).stdout;
-    if (!known.split(/\r?\n/).some((line) => line.trim() === zone)) throw new Error("无效的系统时区。");
-  }
-  await exec(windowsSystemExecutable("tzutil.exe"), ["/s", zone], { windowsHide: true, timeout: 15000 });
-  if (await currentZone() !== zone) throw new Error("系统时区复核未通过。");
+const currentZone = () => readSystemTimezone();
+const setZone = zone => setSystemTimezone(zone);
+async function capabilities() {
+  const exists = async find => { try { await find(); return true; } catch { return false; } };
+  return {
+    timezoneRead: timezoneSupported(process.platform), timezoneWrite: timezoneSupported(process.platform),
+    timezoneFormat: process.platform === 'win32' ? 'windows' : 'iana', timezoneAuthorization: process.platform === 'darwin',
+    browserLaunch: await exists(findBrowser), desktopLaunch: await exists(findDesktop),
+    desktopMode: process.platform === 'darwin' ? 'standard' : 'managed', desktopScripts: process.platform === 'win32',
+    desktopReason: process.platform === 'darwin' ? '当前 macOS Claude 不支持已验证的独立资料及调试接入；仅可普通打开，不声明已受保护。' : '',
+  };
 }
-const protection = createProtectionService({ stateDir, runtime: environmentRuntime, browserCloak, currentZone, setZone, canTest: () => !changing && !protectionChanging && !closing });
+const protection = createProtectionService({ stateDir, runtime: environmentRuntime, browserCloak, currentZone, setZone, restoreTimezone: process.platform === "darwin" ? restoreSavedTimezone : undefined, canTest: () => !changing && !protectionChanging && !closing });
 async function readBackup() {
   try {
     const value = JSON.parse(await readFile(backupFile, "utf8"));
-    return typeof value.timezone === "string" && value.timezone.length < 128 ? value : null;
+    if (value.platform && value.platform !== process.platform || !value.platform && process.platform !== "win32") throw new Error("时区备份来自其他平台，请保留原文件并手动核对。");
+    if (typeof value.timezone !== "string" || !value.timezone || value.timezone.length >= 128) throw new Error("原始时区备份格式无效，已保留原文件。");
+    return value;
   } catch (error) { if (error.code === "ENOENT") return null; throw error; }
+}
+async function restoreSavedTimezone() {
+  const backup = await readBackup();
+  if (!backup) return;
+  if (!sameTimezone(await currentZone(), backup.timezone)) await setZone(backup.timezone);
+  await rm(backupFile, { force: true });
 }
 async function saveBackup(timezone) {
   await mkdir(stateDir, { recursive: true });
-  await writeFile(backupFile + ".tmp", JSON.stringify({ timezone, savedAt: new Date().toISOString() }), { mode: 0o600 });
+  await writeFile(backupFile + ".tmp", JSON.stringify({ timezone, platform: process.platform, savedAt: new Date().toISOString() }), { mode: 0o600 });
   await rename(backupFile + ".tmp", backupFile);
 }
 function authenticated(value) {
@@ -113,29 +142,40 @@ async function parseBody(req) {
   return JSON.parse(body);
 }
 
-async function closeRuntime() {
+function resetLifecycleForReuse() {
+  closing = false;
+  closePending = null;
+  desktopLauncher.closed = false;
+  desktopLauncher.state = "idle";
+  desktopLauncher.child = null;
+  desktopLauncher.relay = null;
+  desktopLauncher.gatewayUrl = null;
+  desktopLauncher.startedAt = null;
+  desktopLauncher.error = null;
+}
+
+async function closeRuntime({ reusable = false } = {}) {
   if (closePending) return closePending;
   closing = true;
-  closePending = (async () => {
+  const pending = (async () => {
     while (changing || protectionChanging) await new Promise(resolve => setTimeout(resolve, 100));
     const issues = [];
     const attempt = async operation => { try { return await operation(); } catch (error) { issues.push(error.message); } };
+    await attempt(restoreTraffic);
     await attempt(() => browserCloak.close());
     await attempt(() => desktopLauncher.close());
     const protectionReport = await attempt(() => protection.stop({ shutdown: true }));
     if (protectionReport?.phase === "restore_failed") issues.push(...protectionReport.issues);
     const runtimeReport = await attempt(() => environmentRuntime.close());
     for (const result of runtimeReport?.results ?? []) if (result.state !== "restored") issues.push(result.detail);
-    await attempt(async () => {
-      const backup = await readBackup();
-      if (!backup) return;
-      if (await currentZone() !== backup.timezone) await setZone(backup.timezone);
-      await rm(backupFile, { force: true });
-    });
+    await attempt(restoreSavedTimezone);
     if (issues.length) throw new Error([...new Set(issues)].join("；"));
+    // A reused helper keeps listening after restoration; only a terminal shutdown stays closed.
+    if (reusable) resetLifecycleForReuse();
     return runtimeReport;
   })().catch(error => { closing = false; closePending = null; desktopLauncher.closed = false; throw error; });
-  return closePending;
+  closePending = pending;
+  return pending;
 }
 
 const server = http.createServer(async (req, res) => {
@@ -159,7 +199,7 @@ const server = http.createServer(async (req, res) => {
     if (!authenticated(req.headers["x-checkcc-token"])) return send(403, { error: "会话已失效。" });
     try {
       const body = req.headers["content-type"]?.startsWith("application/json") ? await parseBody(req) : {};
-      await closeRuntime();
+      await closeRuntime({ reusable: body.stopServer !== true });
       if (body.stopServer === true) res.once("finish", () => server.close());
       return send(200, { restored: true });
     }
@@ -171,12 +211,14 @@ const server = http.createServer(async (req, res) => {
     if (!authenticated(req.headers["x-checkcc-token"])) return send(403, { error: "会话已失效，请重新连接本机服务。" });
     if (!req.headers["content-type"]?.startsWith("application/json")) return send(415, { error: "必须使用 JSON。" });
     if (changing || protectionChanging) return send(409, { error: "保护配置正在更新，请稍后启动 Claude。" });
+    const operation = await parseBody(req).catch(() => null);
+    if (process.platform === "darwin" && operation?.action !== "open") return send(409, { error: "Mac 客户端仅支持显式普通打开，不支持托管启动。" });
     const protectionState = protection.report();
-    if (!protectionState.enabled || !["active", "partial"].includes(protectionState.phase)) return send(409, { error: "请先开启保护，再启动 Claude。" });
+    if (process.platform !== "darwin" && (!protectionState.enabled || !["active", "partial"].includes(protectionState.phase))) return send(409, { error: "请先开启保护，再启动 Claude。" });
     changing = true;
     try {
-      const body = await parseBody(req);
-      if (body.action !== "launch") return send(400, { error: "无效启动操作。" });
+      const body = operation;
+      if (!body || (process.platform === "darwin" ? body.action !== "open" : body.action !== "launch")) return send(400, { error: "无效启动操作。" });
       return send(200, await desktopLauncher.launch(protectionState.target));
     } catch (error) { return send(400, { error: error.message }); }
     finally { changing = false; }
@@ -203,11 +245,50 @@ const server = http.createServer(async (req, res) => {
   }
   if (req.method === "GET" && req.url === "/session?tokenOnly=1") return send(200, { token: secret });
   if (req.method === "GET" && req.url === "/session") {
-    try { return send(200, { token: secret, helperProtocol: HELPER_PROTOCOL, shutdown: 1, desktopLauncher: 1, environmentScripts: 1, browserCloak: 1, platform: process.platform, timezone: process.platform === "win32" ? await currentZone() : "", canRestore: Boolean(await readBackup()), profile: await readProfile() }); }
+    try { return send(200, { token: secret, helperProtocol: HELPER_PROTOCOL, shutdown: 1, desktopLauncher: 1, environmentScripts: 1, browserCloak: 1, platform: process.platform, capabilities: await capabilities(), timezone: timezoneSupported(process.platform) ? await currentZone() : "", canRestore: Boolean(await readBackup()), profile: await readProfile() }); }
     catch (error) {
       console.error("[repair] Session initialization failed:", error.message, error.cause?.code ?? error.code ?? "");
       return send(500, { error: "本机助手初始化失败：" + error.message });
     }
+  }
+  if (req.url === '/traffic') {
+    if (req.method === 'GET') { try { return send(200, await trafficStatus()); } catch (error) { return send(500, { error: error.message }); } }
+    if (req.method !== 'POST') return send(405, { error: '仅支持 GET/POST。' });
+    if (!authenticated(req.headers['x-checkcc-token'])) return send(403, { error: '会话已失效。' });
+    if (!req.headers['content-type']?.startsWith('application/json')) return send(415, { error: '必须使用 JSON。' });
+    if (changing || protectionChanging) return send(409, { error: '配置正在执行，请稍后重试。' });
+    changing = true;
+    try {
+      const body = await parseBody(req);
+      if (body.action === 'prepare') {
+        if ((await trafficStatus()).applied) throw new Error('请先恢复当前联动，再准备新的配置。');
+        await prepareTrafficConfig({ defaultPolicy: body.defaultPolicy });
+      } else if (body.action === 'apply') { await ensureTrafficLayer(); await applyTrafficConfig(); }
+      else if (body.action === 'restore') await restoreTraffic();
+      else return send(400, { error: '无效的 FlClash 操作。' });
+      return send(200, await trafficStatus());
+    } catch (error) {
+      if (error.code === 'FLCLASH_RELOAD_REQUIRED') return send(202, await trafficStatus());
+      return send(400, { error: error.message });
+    }
+    finally { changing = false; }
+  }
+  if (req.url === '/proxy') {
+    if (req.method === 'GET') { try { return send(200, proxyStatus()); } catch (error) { return send(500, { error: error.message }); } }
+    if (req.method !== 'POST') return send(405, { error: '仅支持 GET/POST。' });
+    if (!authenticated(req.headers['x-checkcc-token'])) return send(403, { error: '会话已失效。' });
+    if (!req.headers['content-type']?.startsWith('application/json')) return send(415, { error: '必须使用 JSON。' });
+    if (changing || protectionChanging) return send(409, { error: '配置正在执行，请稍后重试。' });
+    changing = true;
+    try {
+      const settings = validateProxySettings(await parseBody(req));
+      await mkdir(stateDir, { recursive: true });
+      await writeFile(proxySettingsFile() + '.tmp', JSON.stringify(settings), { mode: 0o600 });
+      await rename(proxySettingsFile() + '.tmp', proxySettingsFile());
+      browserCloak.invalidate();
+      return send(200, proxyStatus());
+    } catch (error) { return send(400, { error: error.message }); }
+    finally { changing = false; }
   }
   if (req.method === "POST" && ["/environment", "/environment/restore", "/browser-cloak"].includes(req.url)) {
     if (!authenticated(req.headers["x-checkcc-token"])) return send(403, { error: "会话已失效，请重新打开详情。" });
@@ -226,7 +307,7 @@ const server = http.createServer(async (req, res) => {
     changing = true;
     try {
       const body = await parseBody(req);
-      if (req.url === "/browser-cloak") return send(200, await browserCloak.sync(origin, { launch: body.launch === true, force: body.force === true }));
+      if (req.url === "/browser-cloak") { const report = await browserCloak.sync(origin, { launch: body.launch === true, force: body.force === true }); protection.refreshBrowser(report); return send(200, report); }
       browserCloak.detach();
       const targets = protection.report().enabled ? ([...environmentRuntime.clients.keys()].length ? [...environmentRuntime.clients.keys()] : ["web"]) : undefined;
       return send(200, req.url.endsWith("/restore") ? await environmentRuntime.restore() : await environmentRuntime.apply(body.policy, origin, targets));
@@ -253,6 +334,7 @@ const server = http.createServer(async (req, res) => {
   if (!authenticated(req.headers["x-checkcc-token"])) return send(403, { error: "会话已失效，请重新打开详情。" });
   if (!req.headers["content-type"]?.startsWith("application/json")) return send(415, { error: "必须使用 JSON。" });
   if (changing || protectionChanging) return send(409, { error: "已有时区修改正在执行。" });
+  if (!timezoneSupported(process.platform)) return send(400, { error: "当前系统不支持修改时区。" });
   changing = true;
   try {
     const body = await parseBody(req);
@@ -263,24 +345,26 @@ const server = http.createServer(async (req, res) => {
       if (!backup) return send(409, { error: "没有可恢复的原始时区。" });
       target = backup.timezone;
     } else {
-      if (!body || typeof body.timezone !== "string" || !allowedZones.has(body.timezone)) return send(400, { error: "请选择列表中的有效时区。" });
+      if (!body || typeof body.timezone !== "string" || !(process.platform === "darwin" ? validIanaTimezone(body.timezone) : allowedZones.has(body.timezone))) return send(400, { error: "请选择列表中的有效时区。" });
       target = body.timezone;
     }
     // Pass timezone as data, never interpolate a browser value into PowerShell code.
     const before = await currentZone();
-    if (!restoring && !await readBackup()) await saveBackup(before);
-    await setZone(target);
+    if (!sameTimezone(before, target)) {
+      if (!restoring && !await readBackup()) await saveBackup(before);
+      await setZone(target);
+    }
     const actual = await currentZone();
-    if (actual !== target) throw new Error("系统未返回预期时区，请在系统设置中核对。");
+    if (process.platform === "darwin" ? !sameTimezone(actual, target) : actual !== target) throw new Error("系统未返回预期时区，请在系统设置中核对。");
     if (restoring) await rm(backupFile, { force: true });
     return send(200, { timezone: actual, canRestore: Boolean(await readBackup()) });
   } catch (error) {
     if (error instanceof SyntaxError) return send(400, { error: "无效的 JSON 请求。" });
     console.error("[repair] Timezone operation failed:", error.message);
-    return send(500, { error: "时区操作失败，系统可能拒绝了权限。请在 Windows 日期和时间设置中核对；若操作中断，可使用恢复原始时区。" });
+    return send(500, { error: error.message || "时区操作未完成，请核对系统设置；原始备份已保留。" });
   } finally { changing = false; }
 });
-server.requestTimeout = 45000;
+server.requestTimeout = 120000;
 server.headersTimeout = 10000;
 server.on("error", (error) => { if (error.code !== "EADDRINUSE") console.error(`[repair] ${error.code}: ${error.message}`); });
 export async function startRepairHelper(listenPort = port) {
@@ -288,6 +372,13 @@ export async function startRepairHelper(listenPort = port) {
     await new Promise((resolve, reject) => { server.once("error", reject); server.listen(listenPort, "127.0.0.1", resolve); });
     await protection.recover();
     await desktopLauncher.localeProfile.restore();
+    try {
+      const saved = JSON.parse(await readFile(trafficFile, 'utf8'));
+      if (saved.applied) {
+        await ensureTrafficLayer();
+        try { await restoreTraffic(); } catch (error) { console.error('[repair] FlClash 恢复未完成：' + error.message); }
+      }
+    } catch (error) { if (error.code !== 'ENOENT') console.error('[repair] FlClash 状态检查失败：' + error.message); }
     initializing = false;
     return { server, url: `http://127.0.0.1:${server.address().port}`, closeRuntime };
   } catch (error) {
@@ -301,7 +392,8 @@ export async function startRepairHelper(listenPort = port) {
     if (session.environmentScripts !== 1 || session.browserCloak !== 1) throw new Error("3001 端口上的本机助手为旧版本，请退出旧 repair:helper 后重启 npm run dev。");
     assertCurrentHelper(session);
     const url = `http://127.0.0.1:${listenPort}`;
-    return { server: null, url, closeRuntime: () => shutdownHelper(url, "http://localhost:3000", session, true) };
+    // The listener belongs to the existing helper process; restore its runtime only.
+    return { server: null, url, closeRuntime: () => shutdownHelper(url, "http://localhost:3000", session, false) };
   }
 }
 if (path.resolve(process.argv[1] ?? "") === fileURLToPath(import.meta.url)) startRepairHelper().then((helper) => {
@@ -310,8 +402,15 @@ if (path.resolve(process.argv[1] ?? "") === fileURLToPath(import.meta.url)) star
   let stopping = false;
   const stop = async () => {
     if (stopping) return; stopping = true;
-    await new Promise((resolve) => helper.server.close(resolve));
-    await helper.closeRuntime();
+    try {
+      await helper.closeRuntime();
+      if (helper.server.listening) {
+        helper.server.closeAllConnections();
+        await new Promise((resolve) => helper.server.close(resolve));
+      }
+      process.off("SIGINT", onSignal); process.off("SIGTERM", onSignal);
+    } catch (error) { stopping = false; throw error; }
   };
-  process.once("SIGINT", () => void stop()); process.once("SIGTERM", () => void stop());
+  const onSignal = () => void stop().catch((error) => { console.error(`[repair] 自动恢复未完成：${error.message}`); process.exitCode = 1; });
+  process.on("SIGINT", onSignal); process.on("SIGTERM", onSignal);
 }).catch((error) => { console.error(error.message); process.exitCode = 1; });

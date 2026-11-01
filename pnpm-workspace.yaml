@@ -3,8 +3,8 @@ packages:
   - .
 
 allowBuilds:
-  classic-level: set this to true or false
-  sharp: set this to true or false
+  classic-level: true
+  sharp: true
 
 onlyBuiltDependencies:
   - classic-level
