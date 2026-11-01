@@ -43,13 +43,17 @@ Claude 运行环境检测与保护工作台，支持浏览器与客户端环境�
 
 检测指标仅用于环境分析，不代表真实封禁概率，也不保证账号或第三方服务可用性。
 
+## 参与开发
+
+稳定版本使用 `main`，日常开发与 PR 集成测试使用 `develop`。开发前请阅读 [贡献指南](CONTRIBUTING.md)。
+
 ## 本地运行
 
 需要 Node.js 20+ 和 pnpm。Windows 的桌面应用与系统设置操作另需 PowerShell 7。
 
 ### macOS（Apple Silicon，源码开发）
 
-在包含本次 Mac 适配的本地检出目录中执行；上游 b4d27d5 不包含这些未提交改动，不能改用仅含上游代码的副本。
+请先切换到包含 macOS 适配的 `develop` 分支，再执行以下命令。
 
 ```bash
 pnpm install --frozen-lockfile
