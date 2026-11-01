@@ -1,0 +1,93 @@
+name: Desktop release
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [develop]
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            platform: win32
+            arch: x64
+          - os: macos-15
+            platform: darwin
+            arch: arm64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.34.5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - name: Verify build platform
+        shell: bash
+        run: |
+          node -e 'if (process.platform !== "${{ matrix.platform }}" || process.arch !== "${{ matrix.arch }}") throw new Error("Unexpected build platform: " + process.platform + "/" + process.arch)'
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Lint and regression tests
+        shell: bash
+        run: |
+          pnpm lint
+          node --test --test-timeout=60000 scripts/check-dev.mjs scripts/check-desktop-launcher.mjs scripts/check-shutdown-restore.mjs scripts/check-traffic-layer.mjs scripts/check-protection-session.mjs scripts/check-protection-controls.cjs scripts/check-protection-reconnect.mjs scripts/check-application-paths.mjs scripts/check-macos-adapters.mjs scripts/check-flclash-workflow.mjs scripts/check-windows-timezone.mjs
+      - name: Build app and installer
+        run: pnpm desktop:installer
+      - uses: actions/upload-artifact@v4
+        with:
+          name: desktop-${{ matrix.platform }}-${{ matrix.arch }}
+          if-no-files-found: error
+          retention-days: 14
+          include-hidden-files: true
+          path: |
+            node_modules/.checkcc-dist/EnvGuardCC-Setup-*.exe
+            node_modules/.checkcc-dist/EnvGuardCC-Windows-x64.zip
+            node_modules/.checkcc-dist/EnvGuardCC-*-arm64.dmg
+            node_modules/.checkcc-dist/EnvGuardCC-macOS-arm64.zip
+
+  publish:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+      - name: Verify complete release and write checksums
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: node scripts/verify-release.mjs release-assets
+      - name: Publish complete release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          if ! gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --title "EnvGuardCC ${RELEASE_TAG#v}" --notes-file "docs/releases/$RELEASE_TAG.md" --draft
+          fi
+          gh release upload "$RELEASE_TAG" release-assets/* --repo "$GITHUB_REPOSITORY" --clobber
+          gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --notes-file "docs/releases/$RELEASE_TAG.md" --draft=false --latest

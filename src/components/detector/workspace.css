@@ -259,3 +259,9 @@
 @media (prefers-reduced-motion: reduce) {
   .check-workspace *, .check-workspace *::before, .check-workspace *::after { scroll-behavior: auto; animation: none; transition: none; }
 }
+
+.connection-settings { margin-block-end: 16px; }
+.connection-settings__form { display: flex; flex-wrap: wrap; align-items: end; gap: 12px; margin-block: 16px; border: 0; padding: 0; }
+.connection-settings__form label { display: grid; gap: 6px; flex: 1 1 220px; min-width: 0; font-size: 14px; }
+.connection-settings__form input, .connection-settings__form select { width: 100%; min-height: 36px; padding: 6px 10px; border: 1px solid var(--repair-border, #64748b); border-radius: 8px; color: var(--foreground); background: var(--repair-surface, white); }
+.connection-settings__actions { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-block: 12px; }

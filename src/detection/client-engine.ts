@@ -194,7 +194,6 @@ export function collectBrowserSignals(region: RegionCode, text: DetectorLocaleTe
       makeSignal("os", label.os, os, 0, false, text, config),
       makeSignal("device", label.device, detectDeviceName(ua, platform, text), 0, false, text, config),
       makeSignal("deviceLineage", label.deviceLineage, deviceLineage(snapshot, text), 0, false, text, config),
-      makeSignal("gatewayProfile", label.gatewayProfile, `${browserName} / ${os}`, 0, false, text, config),
       makeSignal("webrtcSupport", label.webrtcSupport, webrtc.supported ? value.webrtcSupported : value.webrtcUnsupported, 0, false, text, config),
       makeSignal("webrtcCandidates", label.webrtcCandidates, webrtc.supported ? `${webrtc.candidates} ${value.candidateUnit}` : value.notMeasured, 0, false, text, config),
       makeSignalScore("webrtcLeak", label.webrtcLeak, webrtc.publicIps.length ? `${value.webrtcLeakFound}：${webrtc.publicIps.length}` : value.webrtcNoLeak, 19, rules.webrtcLeakScore(webrtc.publicIps.length), text, config),

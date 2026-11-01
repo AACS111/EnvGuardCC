@@ -1,12 +1,28 @@
-import { access, mkdir, readFile } from 'node:fs/promises';
+import { access, mkdir, readFile, rm } from 'node:fs/promises';
 import { spawn } from 'node:child_process';
 import { createRequire } from 'node:module';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { resolveNpmCli } from './dev-electron.mjs';
 
-if (process.platform !== 'win32' || process.arch !== 'x64') throw new Error('安装包需要 Windows x64 Node。');
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const output = path.join(root, 'node_modules', '.checkcc-dist');
+const run = (command, args, options = {}) => new Promise((resolve, reject) => {
+  const child = spawn(command, args, { cwd: root, windowsHide: true, stdio: 'inherit', ...options });
+  child.once('error', reject); child.once('exit', code => code === 0 ? resolve() : reject(new Error(`Build step failed: ${code}`)));
+});
+
+if (process.platform === 'darwin' && process.arch === 'arm64') {
+  const app = path.join(output, 'EnvGuardCC-darwin-arm64', 'EnvGuardCC.app');
+  await access(path.join(app, 'Contents', 'Info.plist'));
+  const version = JSON.parse(await readFile(path.join(root, 'package.json'), 'utf8')).version;
+  const dmg = path.join(output, `EnvGuardCC-${version}-arm64.dmg`);
+  await rm(dmg, { force: true });
+  await run('hdiutil', ['create', '-volname', 'EnvGuardCC', '-srcfolder', app, '-ov', '-format', 'UDZO', dmg]);
+  console.log(`macOS disk image: ${dmg}`);
+  process.exit(0);
+}
+if (process.platform !== 'win32' || process.arch !== 'x64') throw new Error('安装包需要 macOS arm64 或 Windows x64 Node。');
 const application = path.join(output, 'EnvGuardCC-win32-x64');
 await access(path.join(application, 'EnvGuardCC.exe'));
 const toolsDir = path.join(root, 'node_modules', '.envguardcc-installer-build');
@@ -15,7 +31,7 @@ const require = createRequire(path.join(toolsDir, 'package.json'));
 try { require.resolve('electron-builder'); }
 catch (error) {
   if (error.code !== 'MODULE_NOT_FOUND') throw error;
-  const npmCli = path.join(path.dirname(process.execPath), 'node_modules', 'npm', 'bin', 'npm-cli.js');
+  const npmCli = resolveNpmCli();
   await new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [npmCli, 'install', '--prefix', toolsDir, '--save-exact', '--no-audit', '--no-fund', 'electron-builder@26.0.12'], {
       cwd: root, windowsHide: true, stdio: 'inherit',

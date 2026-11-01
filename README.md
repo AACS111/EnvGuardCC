@@ -6,9 +6,11 @@ Claude 运行环境检测与保护工作台，支持浏览器与客户端环境�
 
 ## 下载
 
-- [Windows x64 安装包（.exe）](https://github.com/AACS111/EnvGuardCC/releases/download/v0.1.0/EnvGuardCC-Setup-0.1.0.exe)
-- [Windows x64 便携包（.zip）](https://github.com/AACS111/EnvGuardCC/releases/download/v0.1.0/EnvGuardCC-Windows-x64.zip)
-- [SHA-256 校验值](https://github.com/AACS111/EnvGuardCC/releases/download/v0.1.0/SHA256SUMS.txt) · [全部版本](https://github.com/AACS111/EnvGuardCC/releases)
+- [Windows x64 安装包（.exe）](https://github.com/AACS111/EnvGuardCC/releases/download/v0.1.1/EnvGuardCC-Setup-0.1.1.exe)
+- [Windows x64 便携包（.zip）](https://github.com/AACS111/EnvGuardCC/releases/download/v0.1.1/EnvGuardCC-Windows-x64.zip)
+- [Apple Silicon Mac 安装镜像（.dmg）](https://github.com/AACS111/EnvGuardCC/releases/download/v0.1.1/EnvGuardCC-0.1.1-arm64.dmg)
+- [Apple Silicon Mac 应用（.zip）](https://github.com/AACS111/EnvGuardCC/releases/download/v0.1.1/EnvGuardCC-macOS-arm64.zip)
+- [SHA-256 校验值](https://github.com/AACS111/EnvGuardCC/releases/download/v0.1.1/SHA256SUMS.txt) · [全部版本](https://github.com/AACS111/EnvGuardCC/releases)
 
 安装包下载后直接运行；便携包请完整解压后运行 EnvGuardCC.exe，保留同目录运行文件。均已包含运行环境，无需另行安装 Node.js。安装包尚未进行代码签名。
 
@@ -39,13 +41,40 @@ Claude 运行环境检测与保护工作台，支持浏览器与客户端环境�
 - 启停环境保护、定时复检及逐项配置说明。
 - 保护前后对比，展示原生通过、保护后通过、异常与未判定。
 - 修改前保存原始配置，正常退出时尝试恢复；失败时保留备份和真实原因。
-- Windows 桌面应用与本地网页运行模式。
+- Windows 桌面应用、macOS 源码开发模式与本地网页运行模式。
 
 检测指标仅用于环境分析，不代表真实封禁概率，也不保证账号或第三方服务可用性。
 
+## 参与开发
+
+稳定版本使用 `main`，日常开发与 PR 集成测试使用 `develop`。开发前请阅读 [贡献指南](CONTRIBUTING.md)。
+
 ## 本地运行
 
-需要 Node.js 20+、pnpm；Windows 桌面和系统设置操作使用 PowerShell 7。
+需要 Node.js 20+ 和 pnpm。Windows 的桌面应用与系统设置操作另需 PowerShell 7。
+
+### macOS（Apple Silicon，源码开发）
+
+请先切换到包含 macOS 适配的 `develop` 分支，再执行以下命令。
+
+```bash
+pnpm install --frozen-lockfile
+pnpm dev:electron
+```
+
+首次启动可能需要下载 Electron。桌面模式使用本机 3030 页面端口；`Cmd+Q` 或关闭窗口会退出应用，并在退出时尝试恢复配置、释放本次启动占用的端口。
+
+只运行本地网页：
+
+```bash
+pnpm dev
+```
+
+启动后使用终端显示的本机地址。
+
+### Windows
+
+以下命令用于 Windows；Apple Silicon 可下载上方 Mac 安装包，或使用 macOS 源码开发步骤。
 
 ```powershell
 git clone https://github.com/AACS111/EnvGuardCC.git
@@ -62,6 +91,12 @@ pnpm dev
 
 启动后使用终端显示的本机地址。桌面模式使用本地 3030 页面端口；首次启动可能需要下载 Electron。
 
+## 平台支持范围
+
+macOS 已完成阶段二、三的源码适配：系统代理读取与手动连接设置、受控浏览器、显式授权的系统时区与恢复、FlClash 配置联动。Claude 当前版本仅提供普通打开；FlClash 写入后需在 FlClash 中重新应用并启动配置，恢复后重新应用并核验。使用步骤及真实验证边界见 [阶段二、三结果](docs/MACOS-STAGE23-RESULTS.md)。
+
+已生成 Apple Silicon 本地试用包（`.app`、ZIP、DMG，ad-hoc 签名），产物在 `node_modules/.checkcc-dist`；`pnpm desktop:package` 生成 `.app` 和 ZIP，`pnpm desktop:installer` 再生成 DMG。按当前交付定位不申请 Developer ID 和公证，其他 Mac 首次打开需在系统设置 > 隐私与安全性中授权；已安装到本机 `/Applications`，异机验证仍未完成。当前实测为 Apple Silicon、macOS 27.0，不据此声明更旧系统或 Intel 支持。详见 [阶段四结果](docs/MACOS-STAGE4-RESULTS.md)。
+
 ## 构建与验证
 
 ```powershell
@@ -73,7 +108,7 @@ pnpm build
 pnpm desktop:installer
 ```
 
-桌面发布包名为 `EnvGuardCC-Windows-x64.zip`，具体目录见打包命令输出。
+`desktop:installer` 仅生成 Windows 安装包；Windows 发布包名为 `EnvGuardCC-Windows-x64.zip`，具体目录见打包命令输出。
 
 ## 技术栈
 

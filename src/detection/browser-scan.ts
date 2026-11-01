@@ -19,7 +19,7 @@ export type BrowserScan = {
   reachability: BrowserReachability | null;
 };
 
-const DATACENTER_PATTERN = /(cloud|amazon|aws|google|azure|digitalocean|ovh|hetzner|linode|vultr|alibaba|aliyun|tencent|m247|choopa|leaseweb|contabo|oracle|cloudflare|fastly|akamai|hosting|datacenter|server|vpn|proxy)/i;
+const DATACENTER_PATTERN = /(cloud|amazon|aws|google|azure|digitalocean|ovh|hetzner|linode|vultr|alibaba|aliyun|tencent|m247|choopa|leaseweb|contabo|oracle|cloudflare|fastly|akamai|akari|hosting|datacenter|server|vpn|proxy)/i;
 
 export async function runBrowserScan(region: RegionCode, locale: LocaleCode, text: DetectorLocaleText, signalId?: string): Promise<BrowserScan> {
   const snapshot = collectBrowserEnvironment(text);
@@ -68,7 +68,6 @@ export async function runBrowserScan(region: RegionCode, locale: LocaleCode, tex
     : "Measured by three browser-side IP providers; reflects this browser's exit only, not necessarily what Claude sees.";
   const notInBrowser = locale.startsWith("zh") ? "需切换到 Claude 环境实测" : "Requires the Claude environment";
   const notMeasured = value.notMeasured;
-  const reachOk = (probe?: { ok: boolean; elapsedMs: number | null } | null) => probe?.ok === true;
 
   const put = (id: string, signal: SignalResult) => byId.set(id, signal);
 
@@ -110,24 +109,27 @@ export async function runBrowserScan(region: RegionCode, locale: LocaleCode, tex
       ["claudeReachability", reachability.claude],
       ["anthropicReachability", reachability.anthropic],
     ];
+    const restricted = locale.startsWith("zh") ? "浏览器跨站探测受限（CORS/网络），不计分；以客户端网关结果为准" : "Browser cross-site probe restricted (CORS/network); not scored; use the client gateway result";
     for (const [id, probe] of probeMap) {
       put(id, {
-        ...makeSignalScore(id, label[id], probe.ok ? `${probe.elapsedMs} ms` : `${locale.startsWith("zh") ? "跨站探测未完成，无法判定网站可达性" : "Cross-site probe incomplete; site reachability is inconclusive"}${probe.error ? ` (${probe.error})` : ""}`, id === "claudeReachability" ? 6 : 0, 0, text, detectionConfig),
-        assessment: probe.ok ? "ok" : "unknown",
-        ...(!probe.ok ? { observation: "inconclusive" as const } : {}),
-        detail: locale.startsWith("zh") ? "这里从本地检测页发起不带登录凭证的 no-cors 请求，与地址栏打开网站不同。CORP/COEP 响应策略、扩展拦截、重定向或网络错误都可能使脚本请求失败，即使网站可以正常打开。TypeError 不提供足够信息区分这些原因，超时也不能证明网站不可达。本项因此显示无法判定、不加分；可打开网站人工核对，点击打开不会自动标记通过。网关探测结果独立显示。" : "This credential-free no-cors request starts on the local checker; it differs from opening the site in the address bar. CORP/COEP policies, extensions, redirects or network errors can fail the script even when navigation works. TypeError cannot distinguish these causes, and a timeout does not prove unreachability. Incomplete probes remain inconclusive without risk points. Open the site to check manually; opening it is not an automatic pass. Gateway evidence is separate.",
+        ...makeSignalScore(id, label[id], probe.ok ? `${probe.elapsedMs} ms` : restricted, id === "claudeReachability" ? 6 : 0, 0, text, detectionConfig),
+        assessment: probe.ok ? "ok" : "not_applicable",
+        detail: probe.ok
+          ? (locale.startsWith("zh") ? "这里从本地检测页发起不带登录凭证的 no-cors 请求；opaque 响应不提供状态码。网关探测结果独立显示。" : "A credential-free no-cors request from the local checker; an opaque response exposes no status. Gateway evidence is separate.")
+          : (locale.startsWith("zh") ? "本地检测页无法确认跨站可达性；TypeError 可能来自 CORP/COEP、扩展、重定向或网络，不能据此判定网站不可达。本项不计分，以客户端网关的 HTTP 响应为准。" : "The local page cannot confirm cross-site reachability. CORP/COEP, extensions, redirects or network errors can throw TypeError; this does not prove unreachability. The item is not scored; use the gateway HTTP response."),
         environment: "browser",
       });
     }
   }
   const riskyExit = riskyCountries.length > 0;
   const accessRisk = riskyExit;
-  const completeAccessEvidence = Boolean(primary?.countryCode && reachOk(reachability?.claude));
+  const completeAccessEvidence = Boolean(primary?.countryCode);
+  const reachRestricted = Boolean(reachability?.claude && !reachability.claude.ok);
   put("claudeAccessRisk", {
     ...makeSignalScore("claudeAccessRisk", label.claudeAccessRisk, accessRisk ? (locale.startsWith("zh") ? "浏览器出口命中风险国家" : "Browser exit hits a risk country") : (!completeAccessEvidence ? (locale.startsWith("zh") ? "网络采样不完整，无法判定访问风险" : "Network evidence incomplete; access risk is inconclusive") : (locale.startsWith("zh") ? "未命中访问风险规则" : "No access-risk rule hit")), 16, accessRisk ? 1 : 0, text, detectionConfig),
     assessment: accessRisk ? "error" : completeAccessEvidence ? "ok" : "unknown",
     ...(!accessRisk && !completeAccessEvidence ? { observation: "inconclusive" as const } : {}),
-    detail: locale.startsWith("zh") ? "结合实际出口国家与浏览器探测的启发式结论。跨站脚本请求失败不能证明网站不可达，不因此增加访问风险分；缺少证据也不标记通过。实际命中风险出口国家时仍保留加分。此项不证明账号可用性。" : "Heuristic using exit-country evidence and the browser probe. A failed cross-site script does not prove unreachability or add access-risk points; missing evidence is not a pass. Actual risky-exit evidence retains its points. This does not verify account access.",
+    detail: locale.startsWith("zh") ? `结合实际出口国家与浏览器探测的启发式结论。${reachRestricted ? "浏览器跨站探测受限，不参与本项，按出口国家判断。" : ""}跨站脚本请求失败不能证明网站不可达，不因此增加访问风险分；缺少证据也不标记通过。实际命中风险出口国家时仍保留加分。此项不证明账号可用性。` : `Heuristic using exit-country evidence and the browser probe. ${reachRestricted ? "The browser cross-site probe is restricted and does not participate; country evidence is used." : ""} A failed cross-site script does not prove unreachability or add access-risk points; missing evidence is not a pass. Actual risky-exit evidence retains its points. This does not verify account access.`,
     environment: "browser",
   });
 

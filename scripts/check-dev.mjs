@@ -1,7 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import http from "node:http";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { startGateway } from "./dev.mjs";
+import { resolveNpmCli } from "./dev-electron.mjs";
 
 const close = (server) => new Promise((resolve) => {
   server.closeAllConnections();
@@ -43,4 +47,42 @@ test("端口被其他服务占用时拒绝启动，保留原服务", async () =>
     await assert.rejects(startGateway(other.address().port), /不是可用的 EnvGuardCC 网关/);
     assert.equal(other.listening, true);
   } finally { await close(other); }
+});
+
+test("Electron 安装回退识别 Homebrew 前缀中的 npm，而不是只看 node 同目录", async t => {
+  const prefix = await mkdtemp(path.join(tmpdir(), "checkcc-homebrew-"));
+  t.after(() => rm(prefix, { recursive: true, force: true }));
+  const npmCli = path.join(prefix, "lib", "node_modules", "npm", "bin", "npm-cli.js");
+  await mkdir(path.dirname(npmCli), { recursive: true });
+  await writeFile(npmCli, "");
+  const resolved = resolveNpmCli({
+    execPath: path.join(prefix, "Cellar", "node", "26.8.2", "bin", "node"),
+    npmExecPath: "",
+    env: {},
+  });
+  assert.equal(resolved, npmCli);
+});
+
+test("Electron 安装优先使用 npm_execpath，缺少 npm 时给出可操作的失败信息", () => {
+  const npmCli = path.join("tmp", "npm", "bin", "npm-cli.js");
+  assert.equal(resolveNpmCli({ execPath: "/missing/node", npmExecPath: npmCli, env: {}, exists: candidate => candidate === npmCli }), npmCli);
+  assert.throws(
+    () => resolveNpmCli({ execPath: "/missing/node", npmExecPath: "", env: {}, exists: () => false }),
+    /未找到 npm/,
+  );
+});
+
+
+test('pnpm 启动时安装 Electron 使用真正的 npm CLI', () => {
+  const npmCli = path.join(path.parse(process.cwd()).root, 'runtime', 'node_modules', 'npm', 'bin', 'npm-cli.js');
+  const pnpmCli = path.join(path.parse(process.cwd()).root, 'tools', 'pnpm', 'bin', 'pnpm.cjs');
+  assert.equal(resolveNpmCli({ execPath: path.join(path.parse(process.cwd()).root, 'runtime', 'node'), npmExecPath: pnpmCli, env: {}, exists: file => [npmCli, pnpmCli].includes(file) }), npmCli);
+});
+
+
+test('优先使用 npm 的 JavaScript CLI，避免把 Windows shell 包装脚本交给 Node', () => {
+  const directory = path.join(path.parse(process.cwd()).root, 'runtime');
+  const cli = path.join(directory, 'node_modules', 'npm', 'bin', 'npm-cli.js');
+  const wrapper = path.join(directory, 'npm');
+  assert.equal(resolveNpmCli({ execPath: path.join(directory, 'node'), npmExecPath: '', env: {}, exists: file => [cli, wrapper].includes(file) }), cli);
 });

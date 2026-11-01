@@ -283,7 +283,7 @@ test('启动保护不打开浏览器，已有连接继续验证，未连接或�
     };
     const browserCloak = new BrowserCloakController(runtime, { intervalMs: 1000000 });
     browserCloak.gatewayState = async () => ({ cloak: { enabled: true, updatedAt: 'one' }, profile: { language: target.language, locale: target.locale } });
-    const session = createProtectionService({ stateDir, runtime, browserCloak,
+    const session = createProtectionService({ stateDir, runtime, browserCloak, platform: 'win32',
       currentZone: async () => target.windowsTimezone,
       setZone: async () => assert.fail('时区相同时不应修改系统'),
       gatewayRequest: async () => ({ cloak: { enabled: false } }),
@@ -299,11 +299,49 @@ test('启动保护不打开浏览器，已有连接继续验证，未连接或�
       assert.equal(report.phase, 'partial');
       assert.ok(report.issues.includes(scenario === 'apply' ? 'browser configuration failed' : 'browser headers not verified'));
       if (scenario === 'disconnected') assert.equal(runtime.clients.size, 0);
+      session.refreshBrowser({ results: [{ target: 'web', state: 'verified', detail: 'sample verified' }], requestProbe: { state: 'verified' } });
+      assert.deepEqual(session.report().issues, []);
+      assert.equal(session.report().phase, 'active');
     } else {
       assert.equal(browserCloak.report.requestProbe.state, 'verified');
       assert.equal(browserCloak.report.results[0].state, 'verified');
-      assert.deepEqual(report.issues, process.platform === 'win32' ? [] : ['本机系统时区自动适配仅支持 Windows。']);
-      if (process.platform === 'win32') assert.equal(report.phase, 'active');
+      assert.deepEqual(report.issues, []);
+      assert.equal(report.phase, 'active');
     }
+  });
+});
+
+
+test('macOS 开启保护适配 IANA 时区，复检不覆盖手动设置，关闭时恢复基线', async t => {
+  for (const denied of [false, true]) await t.test(denied ? '取消系统授权' : '应用与恢复', async t => {
+    const stateDir = await mkdtemp(path.join(os.tmpdir(), 'checkcc-mac-timezone-'));
+    t.after(() => rm(stateDir, { recursive: true, force: true }));
+    let zone = 'Asia/Shanghai';
+    const calls = [];
+    const runtime = { policy: {}, enabled: false, clients: new Map(), load: async () => {}, restore: async () => ({ results: [] }) };
+    const browserCloak = { sync: async () => ({ results: [], requestProbe: { state: 'verified' } }), close: async () => {} };
+    const session = createProtectionService({ stateDir, runtime, browserCloak, platform: 'darwin',
+      currentZone: async () => zone,
+      setZone: async target => { calls.push(target); if (denied) throw new Error('已取消系统授权'); zone = target; },
+      gatewayRequest: async () => ({ cloak: { enabled: false } }),
+    });
+    session.detect = async () => targetFromExit({ primary: { ip: '1.2.3.4', countryCode: 'KR', timezone: 'Asia/Seoul' } });
+    session.test = async () => ({ state: 'passed' });
+    const started = await session.start('http://localhost:3000');
+    assert.deepEqual(calls, ['Asia/Seoul']);
+    if (denied) {
+      assert.equal(zone, 'Asia/Shanghai');
+      assert.equal(started.phase, 'partial');
+      assert.match(started.issues.join(), /系统时区适配失败.*取消/);
+    } else {
+      assert.equal(zone, 'Asia/Seoul');
+      zone = 'Asia/Tokyo';
+      await session.retest();
+      assert.equal(zone, 'Asia/Tokyo');
+      assert.equal(calls.length, 1, '周期复检不得写入或恢复系统时区');
+    }
+    const stopped = await session.stop();
+    assert.equal(stopped.phase, 'idle');
+    assert.equal(zone, 'Asia/Shanghai');
   });
 });

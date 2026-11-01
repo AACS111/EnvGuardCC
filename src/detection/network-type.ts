@@ -12,7 +12,7 @@ export function exitNetworkType(org: string | null | undefined, locale: string, 
   const asnNumber = asn?.trim().toUpperCase().match(/^(?:AS)?([0-9]+)$/)?.[1];
   const asnCode = asnNumber ? `AS${asnNumber}` : null;
   const provider = asnCode ? datacenterAsns[asnCode] : undefined;
-  const datacenter = /cloud|amazon|google(?! fiber)|microsoft|azure|digitalocean|ovh|hetzner|linode|vultr|alibaba|tencent|m247|choopa|leaseweb|contabo|oracle|hosting|data[ -]?cent(?:er|re)|colo(?:cation)?\b/i;
+  const datacenter = /cloud|amazon|google(?! fiber)|microsoft|azure|digitalocean|ovh|hetzner|linode|vultr|alibaba|tencent|m247|choopa|leaseweb|contabo|oracle|akari|hosting|data[ -]?cent(?:er|re)|colo(?:cation)?\b/i;
   const broadband = /comcast|xfinity|charter communications|spectrum|cox communications|rogers|shaw communications|bell canada|verizon|at&t|google fiber|chunghwa telecom|hinet|korea telecom|kt corporation|sk broadband|lg uplus|kddi|softbank|orange s\.?a\.?|deutsche telekom|british telecommunications|telstra|china telecom|china unicom|中国电信|中国联通|中国移动|中华电信/i;
   const kind = provider || datacenter.test(name) ? 'datacenter' : broadband.test(name) ? 'residential' : 'unknown';
   const label = kind === 'datacenter' ? text('机房网络（推断）', 'Datacenter (inferred)')
