@@ -23,7 +23,7 @@ try {
   };
   require.extensions[".ts"] = (module, filename) => {
     const source = require("node:fs").readFileSync(filename, "utf8");
-    module._compile(ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 } }).outputText, filename);
+    module._compile(ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020, esModuleInterop: true } }).outputText, filename);
   };
   ({ buildGatewayCheck } = require(path.join(root, "src/detection/gateway-check.ts")));
   ({ verifiedOptimization, signalOptimization } = require(path.join(root, "src/detection/environment-evidence.ts")));

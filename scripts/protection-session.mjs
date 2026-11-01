@@ -32,6 +32,11 @@ export class ProtectionSession {
     await writeFile(this.file + '.tmp', JSON.stringify(this.pending), { mode: 0o600 });
     await rename(this.file + '.tmp', this.file);
   }
+  updateIssues(issues) {
+    if (!this.state.enabled || !['active', 'partial'].includes(this.state.phase)) return;
+    this.state.issues = [...new Set(issues)];
+    this.state.phase = issues.length || this.state.testState === 'failed' ? 'partial' : 'active';
+  }
   serialize(operation) {
     const next = this.queue.then(operation);
     this.queue = next.catch(() => {});

@@ -227,7 +227,7 @@ export function createGateway({ upstreamBase = "https://api.anthropic.com", prof
         // 改写前的客户端原始声明头，用于对比模拟保护是否真的生效。
         originalHeaders: safeHeaders(request.headers),
         method: request.method, endpoint: target.pathname.startsWith("/v1/") ? target.pathname.split("/").slice(0, 3).join("/") : "other",
-        profileUpdatedAt: profile?.updatedAt ?? null, status: null, elapsedMs: null, tls: null,
+        profileUpdatedAt: profile?.updatedAt ?? null, cloakUpdatedAt: cloaked.updatedAt, status: null, elapsedMs: null, tls: null,
       };
       if (!isSimulation && profile && cloaked.enabled) rewrites += 1;
       const proxy = transportRequest(target, { method: request.method, headers, signal: AbortSignal.timeout(120000) }, (upstreamResponse) => {
@@ -243,7 +243,7 @@ export function createGateway({ upstreamBase = "https://api.anthropic.com", prof
         upstreamResponse.pipe(response);
       });
       proxy.on("error", (error) => {
-        if (isClaudeRequest) lastFailure = { at: new Date().toISOString(), error: error.code ?? "UPSTREAM_ERROR" };
+        if (isClaudeRequest) lastFailure = { at: new Date().toISOString(), error: error.code ?? "UPSTREAM_ERROR", profileUpdatedAt: record.profileUpdatedAt, cloakUpdatedAt: record.cloakUpdatedAt };
         if (!response.headersSent) sendJson(response, 502, { error: `网关无法连接上游：${error.code ?? "UPSTREAM_ERROR"}` });
         else response.destroy();
       });

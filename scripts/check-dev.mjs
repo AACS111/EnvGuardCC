@@ -1,7 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import http from "node:http";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { startGateway } from "./dev.mjs";
+import { resolveNpmCli } from "./dev-electron.mjs";
 
 const close = (server) => new Promise((resolve) => {
   server.closeAllConnections();
@@ -43,4 +47,27 @@ test("端口被其他服务占用时拒绝启动，保留原服务", async () =>
     await assert.rejects(startGateway(other.address().port), /不是可用的 EnvGuardCC 网关/);
     assert.equal(other.listening, true);
   } finally { await close(other); }
+});
+
+test("Electron 安装回退识别 Homebrew 前缀中的 npm，而不是只看 node 同目录", async t => {
+  const prefix = await mkdtemp(path.join(tmpdir(), "checkcc-homebrew-"));
+  t.after(() => rm(prefix, { recursive: true, force: true }));
+  const npmCli = path.join(prefix, "lib", "node_modules", "npm", "bin", "npm-cli.js");
+  await mkdir(path.dirname(npmCli), { recursive: true });
+  await writeFile(npmCli, "");
+  const resolved = resolveNpmCli({
+    execPath: path.join(prefix, "Cellar", "node", "26.8.2", "bin", "node"),
+    npmExecPath: "",
+    env: {},
+  });
+  assert.equal(resolved, npmCli);
+});
+
+test("Electron 安装优先使用 npm_execpath，缺少 npm 时给出可操作的失败信息", () => {
+  const npmCli = path.join("tmp", "npm", "bin", "npm-cli.js");
+  assert.equal(resolveNpmCli({ execPath: "/missing/node", npmExecPath: npmCli, env: {}, exists: candidate => candidate === npmCli }), npmCli);
+  assert.throws(
+    () => resolveNpmCli({ execPath: "/missing/node", npmExecPath: "", env: {}, exists: () => false }),
+    /未找到 npm/,
+  );
 });

@@ -6,9 +6,9 @@ const ts = require('typescript');
 const path = require('node:path');
 const vm = require('node:vm');
 const file = path.join(__dirname, '../src/detection/network-type.ts');
-const compiled = ts.transpileModule(fs.readFileSync(file, 'utf8'), { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 } });
+const compiled = ts.transpileModule(fs.readFileSync(file, 'utf8'), { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020, esModuleInterop: true } });
 const output = { exports: {} };
-vm.runInNewContext(compiled.outputText, { exports: output.exports });
+vm.runInNewContext(compiled.outputText, { exports: output.exports, require: require('node:module').createRequire(file) });
 const { exitNetworkType } = output.exports;
 
 test('云厂商、宽带运营商与未知网络分开，未命中云厂商不能当作住宅', () => {
@@ -29,4 +29,14 @@ test('名称推断明确保留不确定性和依据，支持首页中英文', ()
   assert.match(home.detail, /Comcast/);
   assert.match(exitNetworkType('Tencent Cloud', 'en').label, /Datacenter \(inferred\)/);
   assert.equal(exitNetworkType(null, 'en').label, 'Undetermined');
+});
+test('离线 ASN 快照覆盖美欧日新托管商，未知 ASN 不自动判为住宅', () => {
+  for (const [asn, name] of [['AS16509','Amazon'], ['AS16265','LeaseWeb'], ['AS9370','SAKURA'], ['AS59349','GMO']]) {
+    const result = exitNetworkType(null, 'zh-CN', asn);
+    assert.equal(result.kind, 'datacenter', asn);
+    assert.match(result.detail, new RegExp(name, 'i'));
+    assert.match(result.detail, /推断/);
+    assert.match(result.detail, /非 IP 类型数据库实测/);
+  }
+  assert.equal(exitNetworkType(null, 'zh-CN', 'AS999999').kind, 'unknown');
 });

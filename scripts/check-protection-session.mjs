@@ -299,11 +299,14 @@ test('启动保护不打开浏览器，已有连接继续验证，未连接或�
       assert.equal(report.phase, 'partial');
       assert.ok(report.issues.includes(scenario === 'apply' ? 'browser configuration failed' : 'browser headers not verified'));
       if (scenario === 'disconnected') assert.equal(runtime.clients.size, 0);
+      session.refreshBrowser({ results: [{ target: 'web', state: 'verified', detail: 'sample verified' }], requestProbe: { state: 'verified' } });
+      assert.deepEqual(session.report().issues, []);
+      assert.equal(session.report().phase, 'active');
     } else {
       assert.equal(browserCloak.report.requestProbe.state, 'verified');
       assert.equal(browserCloak.report.results[0].state, 'verified');
-      assert.deepEqual(report.issues, process.platform === 'win32' ? [] : ['本机系统时区自动适配仅支持 Windows。']);
-      if (process.platform === 'win32') assert.equal(report.phase, 'active');
+      assert.deepEqual(report.issues, []);
+      assert.equal(report.phase, 'active');
     }
   });
 });

@@ -45,42 +45,42 @@ export function OptimizeDialog({ optimization, optimizationBusy, optimizationNot
   const [helperAttempt, setHelperAttempt] = useState(0);
 
   // 助手执行系统时区与浏览器接口保护；共享开关由父组件协调网关和浏览器。
-  const timezoneSupported = session?.platform === "win32";
+  const timezoneSupported = session?.capabilities?.timezoneWrite === true;
   const working = busy || optimizationBusy;
 
   const target = useMemo(() => buildExitTarget(exitGeo), [exitGeo]);
   const exitLabel = exitTargetLabel(target);
   const rows = useMemo<Row[]>(() => signals.flatMap((signal) => {
     if (signal.state !== "done") return [];
-    const choice = recommendedChoice(signal, target);
+    const choice = recommendedChoice(signal, target, session?.platform);
     if (!choice || choice.id === "current" || choice.contribution >= signal.contribution) return [];
-    const auto = choice.action === "timezone" && Boolean(choice.windowsTimezone);
+    const auto = choice.action === "timezone" && timezoneSupported;
     const manual = choice.action === "language" || choice.action === "locale";
     // 语言与区域类可以通过网关层对齐，不需要修改本机环境。
     const gateway = choice.action === "language" || choice.action === "locale";
     return [{ signal, targetLabel: choice.label, points: choice.contribution, preview: previewTotal(signals, choice), auto, manual, gateway }];
-  }), [signals, target]);
+  }), [signals, target, session?.platform, timezoneSupported]);
   const projected = useMemo(() => {
     const values = new Map(signals.filter((signal) => signal.state === "done").map((signal) => [signal.id, signal.contribution]));
     for (const row of rows) {
-      const choice = recommendedChoice(row.signal, target);
+      const choice = recommendedChoice(row.signal, target, session?.platform);
       if (!choice) continue;
       for (const [id, contribution] of Object.entries(choice.impacts)) if (values.has(id)) values.set(id, contribution);
     }
     return Math.min(100, Array.from(values.values()).reduce((sum, value) => sum + value, 0));
-  }, [rows, signals, target]);
+  }, [rows, signals, target, session?.platform]);
   const timezoneTarget = rows.find((row) => row.signal.id === "timezone" || row.signal.id === "timezoneOffset");
-  const timezoneZone = timezoneTarget ? recommendedChoice(timezoneTarget.signal, target)?.windowsTimezone ?? null : null;
+  const timezoneZone = timezoneTarget ? (session?.capabilities?.timezoneFormat === "iana" ? recommendedChoice(timezoneTarget.signal, target, session?.platform)?.value : recommendedChoice(timezoneTarget.signal, target, session?.platform)?.windowsTimezone) ?? null : null;
   const manualRows = rows.filter((row) => row.manual);
   // 出口地区本身被规则判为高风险时（例：出口在中国大陆），最佳选项与出口不一致，必须说明冲突。
   const conflicts = useMemo(() => signals.flatMap((signal) => {
     if (signal.state !== "done") return [];
-    const choices = repairChoices(signal, target);
+    const choices = repairChoices(signal, target, session?.platform);
     const targetChoice = choices.find((choice) => choice.match === "target" && choice.id !== "current");
     const best = choices[0];
     if (!targetChoice || !best || targetChoice.contribution <= best.contribution) return [];
     return [{ signal, targetChoice, best }];
-  }), [signals, target]);
+  }), [signals, target, session?.platform]);
   const currentTotal = Math.min(100, signals.filter((signal) => signal.state === "done").reduce((sum, signal) => sum + signal.contribution, 0));
 
   useEffect(() => {
@@ -216,7 +216,7 @@ export function OptimizeDialog({ optimization, optimizationBusy, optimizationNot
       {exitError && <p className="repair-feedback repair-feedback--error" role="alert">{exitError}</p>}
       {!optimization && !optimizationBusy && <p className="repair-feedback" role="status">{zh ? "网关未连接。请在项目目录运行 npm run gateway，再点击重连网关。" : "Gateway disconnected. Run npm run gateway in the project, then reconnect."}</p>}
       {connection === "offline" && <p className="repair-feedback" role="status">{zh ? "本机助手未连接，浏览器执行器与自动修改时区暂不可用。重启 npm run dev，或运行 npm run repair:helper 后重试；API 网关独立运行。" : "Local helper disconnected; browser protection and automatic timezone changes are unavailable. Restart npm run dev or run npm run repair:helper. The API gateway operates independently."}<button type="button" className="repair-button repair-button--quiet" disabled={working} onClick={() => { setConnection("checking"); setHelperAttempt((value) => value + 1); }}>{zh ? "重连时区助手" : "Reconnect timezone helper"}</button></p>}
-      {connection === "ready" && !timezoneSupported && <p className="repair-feedback" role="status">{zh ? "当前系统不是 Windows，自动修改系统时区不可用；时区请手动调整。语言/区域仍可走网关层。" : "Automatic timezone changes need Windows; adjust the timezone manually. Language and region can still go through the gateway layer."}</p>}
+      {connection === "ready" && !timezoneSupported && <p className="repair-feedback" role="status">{zh ? "当前助手不支持修改系统时区，请在系统设置中手动调整。" : "This helper cannot change the system timezone; use system settings."}</p>}
     </dialog>
   );
 }

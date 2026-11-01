@@ -26,8 +26,8 @@ export type GatewayReport = {
   profile: { language: string; locale: string; timezone: string | null; countryName: string | null; city: string | null; updatedAt: string | null } | null;
   proxy?: { mode: "direct" | "http-connect"; source: string; address: string | null };
   transport: string; proxyEnvironmentDetected: boolean; rewrites: number; previewHeaders: Record<string, string>;
-  lastRequest: { startedAt: string; headers: Record<string, string>; originalHeaders?: Record<string, string>; profileUpdatedAt: string | null; status: number | null; elapsedMs: number | null; tls: Probe["tls"] } | null;
-  lastFailure: { at: string; error: string } | null;
+  lastRequest: { startedAt: string; headers: Record<string, string>; originalHeaders?: Record<string, string>; profileUpdatedAt: string | null; cloakUpdatedAt?: string | null; status: number | null; elapsedMs: number | null; tls: Probe["tls"] } | null;
+  lastFailure: { at: string; error: string; profileUpdatedAt?: string | null; cloakUpdatedAt?: string | null } | null;
   checkedAt?: string;
   testedSignals?: string[];
   probes?: { claude: Probe; anthropic: Probe; api: Probe };
@@ -146,7 +146,17 @@ export function buildGatewayCheck(report: GatewayReport | null, locale: LocaleCo
     : tr("拦截迷惑层已关闭：网关原样转发客户端声明，可直接对比未改写状态。", "Cloak layer disabled: client declarations pass through unchanged for direct comparison.");
   const headerDetail = tr("仅对真实转发记录计分。预览值不是 Claude 已收到的值；自定义 x-checkcc-target-locale 也不是 Anthropic 官方区域参数。", "Only observed forwarded headers are scored. Previews are not observed Claude values; x-checkcc-target-locale is not an official Anthropic locale parameter.");
 
-  const current = report.lastRequest && report.lastRequest.profileUpdatedAt === (report.profile?.updatedAt ?? null) ? report.lastRequest : null;
+  const request = report.lastRequest;
+  const cloakMatches = !cloak?.updatedAt || (request?.cloakUpdatedAt !== undefined
+    ? request.cloakUpdatedAt === cloak.updatedAt
+    : Boolean(request && Date.parse(request.startedAt) >= Date.parse(cloak.updatedAt)));
+  const current = request && request.profileUpdatedAt === (report.profile?.updatedAt ?? null) && cloakMatches ? request : null;
+  const failure = report.lastFailure;
+  const failureProfileMatches = failure?.profileUpdatedAt === undefined || failure.profileUpdatedAt === (report.profile?.updatedAt ?? null);
+  const failureCloakMatches = !cloak?.updatedAt || (failure?.cloakUpdatedAt !== undefined
+    ? failure.cloakUpdatedAt === cloak.updatedAt
+    : Boolean(failure && Date.parse(failure.at) >= Date.parse(cloak.updatedAt)));
+  const currentFailure = failure && failureProfileMatches && failureCloakMatches ? failure : null;
   const successful = Boolean(current?.status && current.status >= 200 && current.status < 300);
   const headers = current?.headers;
   const original = current?.originalHeaders ?? null;
@@ -194,12 +204,12 @@ export function buildGatewayCheck(report: GatewayReport | null, locale: LocaleCo
     const value = status ? `HTTP ${status} · ${probe.elapsedMs} ms${status >= 300 && status < 400 ? tr(" · 已收到响应，网络可达", " · response received, network reachable") : status === 401 ? tr(" · 未验证授权", " · authorization not verified") : ""}` : probe.error ?? missing;
     put(id, value, !status ? "error" : status >= 400 ? "warning" : "ok", tr("网关直出探测，不携带 API Key、不创建消息、不验证账号或模型权限。收到 HTTP 响应表示网络已连通，3xx 按网络可达计分；401/403/429 不等于账号可用。重定向未跟随，未验证最终页面。", "Gateway egress probe without API keys or message creation. An HTTP response proves network reachability; 3xx counts as reachable. 401/403/429 do not verify account access. Redirects are not followed and the final page is not verified."), id === "claudeReachability" && !status ? 1 : 0);
   }
-  put("claudeTrigger", report.lastFailure ? tr(`上游失败：${report.lastFailure.error}`, `Upstream failure: ${report.lastFailure.error}`) : current?.status ? `HTTP ${current.status} · ${current.startedAt}` : tr("等待真实 Claude 请求", "Awaiting a real Claude request"), report.lastFailure ? "error" : current?.status ? successful ? "ok" : "warning" : "unknown", `${tr("仅记录经此网关转发后收到的真实上游响应，自动诊断请求不计入。保存配置后需要再发起一次 Claude 请求。", "Only actual forwarded upstream responses count; diagnostic probes do not. Send a new Claude request after changing the profile.")} ${cloakNote}`);
+  put("claudeTrigger", currentFailure ? tr(`上游失败：${currentFailure.error}`, `Upstream failure: ${currentFailure.error}`) : current?.status ? `HTTP ${current.status} · ${current.startedAt}` : tr("等待真实 Claude 请求", "Awaiting a real Claude request"), currentFailure ? "error" : current?.status ? successful ? "ok" : "warning" : "unknown", `${tr("仅记录经此网关转发后收到的真实上游响应，自动诊断请求不计入。保存配置后需要再发起一次 Claude 请求。", "Only actual forwarded upstream responses count; diagnostic probes do not. Send a new Claude request after changing the profile.")} ${cloakNote}`);
   put("claudeLatency", current?.elapsedMs != null ? `${current.elapsedMs} ms` : missing, current?.elapsedMs != null ? "ok" : "unknown", tr("从收到真实请求至上游返回响应头的耗时，不是完整生成耗时或首 token 延迟。", "Time from actual inbound request to upstream response headers, not generation completion or first-token latency."));
 
   const httpLanguageObserved = original?.["accept-language"] ?? language ?? null;
   put("httpLanguage", httpLanguageObserved ?? missing, httpLanguageObserved ? "ok" : "unknown", httpLanguageObserved ? tr(`客户端原始 HTTP 语言偏好 ${httpLanguageObserved}（改写前观测值）。`, `Original client HTTP language ${httpLanguageObserved} (pre-rewrite observation).`) : missing, 0, Boolean(httpLanguageObserved && rewritten && cloakOn));
-  const clues = report.clues ?? null;
+  const clues = current ? report.clues ?? null : null;
   const httpSample = observations.get("httpLanguage");
   if (httpSample?.cloaked) { httpSample.originalValue = httpLanguageObserved ?? undefined; httpSample.value = language ?? httpSample.value; }
   if (clues) {
@@ -209,14 +219,20 @@ export function buildGatewayCheck(report: GatewayReport | null, locale: LocaleCo
     put("clientHints", clues.clientHintBrands ?? clues.clientHintPlatform ?? missing, clues.clientHintBrands ? "ok" : "not_applicable", clues.clientHintBrands ? tr(`Client Hints ${clues.clientHintBrands}${clues.clientHintPlatform ? ` · ${clues.clientHintPlatform}` : ""}。`, `Client Hints ${clues.clientHintBrands}${clues.clientHintPlatform ? ` · ${clues.clientHintPlatform}` : ""}.`) : tr("未发送 Client Hints；服务端客户端的 UA 与浏览器差异属于正常情况。", "No Client Hints sent; a server-side client's UA differing from a browser is expected."));
     put("deviceLineage", clues.sdk ?? missing, clues.sdk ? "ok" : "not_applicable", tr(`Stainless/客户端线索：${clues.sdk ?? missing}${clues.app ? ` · app ${clues.app}` : ""}。该信息说明请求方是 SDK 而非浏览器。`, `Stainless/client signals: ${clues.sdk ?? missing}${clues.app ? ` · app ${clues.app}` : ""}. This shows the caller is an SDK, not a browser.`));
   } else {
-    for (const id of ["requestHeaders", "secFetch", "clientHints", "deviceLineage"]) put(id, missing, "unknown", tr("尚无真实 Claude 请求经过网关；接入后复检才能读到客户端线索。", "No real Claude request has passed through the gateway yet; recheck after integration to read client clues."));
+    for (const id of ["requestHeaders", "secFetch", "clientHints", "deviceLineage"]) put(id, missing, "unknown", tr("当前网关配置下尚无真实 Claude 请求；接入后复检才能读取客户端线索。", "No real Claude request has passed through the current gateway configuration; recheck after integration to read client clues."));
   }
+
+  if (current) for (const id of ["language", "languageVariant", "locale", "httpLanguage", "requestHeaders", "secFetch", "clientHints", "deviceLineage", "claudeTrigger", "claudeLatency"]) {
+    const sample = observations.get(id);
+    if (sample) sample.testedAt = current.startedAt;
+  }
+  if (currentFailure) observations.get("claudeTrigger")!.testedAt = currentFailure.at;
 
   const edge = report.edge ?? null;
   if (edge) {
     const ok = edge.http === 200 && edge.colo;
     put("edgeCountry", edge.loc ? countryDisplayName(edge.loc, locale) : missing, edge.loc ? "ok" : ok ? "unknown" : "error", ok ? tr(`边缘 trace 返回 ${edge.loc}（仅供参考，不代表 Claude 处理节点）。`, `Edge trace returned ${edge.loc} (reference only, not the Claude processing node).`) : (edge.error ?? missing));
-    put("edgeCity", edge.city ?? tr("响应未提供城市字段", "Response has no city field"), edge.city ? "ok" : ok ? "unknown" : "error", ok ? tr("trace 自报城市；Cloudflare 不一定返回城市字段。", "City reported by trace; Cloudflare does not always include it.") : (edge.error ?? missing), 0, false, ok && !edge.city ? "unavailable" : undefined);
+    put("edgeCity", edge.city ?? tr("Cloudflare trace 不提供城市字段", "Cloudflare trace does not provide a city"), edge.city ? "ok" : ok ? "not_applicable" : "error", ok ? tr("trace 自报城市；Cloudflare 的 trace 响应不提供城市字段，本项不适用。", "City reported by trace; the Cloudflare trace response does not provide a city field, so this item is not applicable.") : (edge.error ?? missing), 0, false, undefined);
     put("edgeColo", edge.colo ?? missing, ok ? "ok" : "error", ok ? tr(`Cloudflare 边缘机房 ${edge.colo}（cdn-cgi/trace 实测）。`, `Cloudflare edge colo ${edge.colo} (measured via cdn-cgi/trace).`) : (edge.error ?? missing));
   } else {
     for (const id of ["edgeCountry", "edgeCity", "edgeColo"]) put(id, missing, "unknown", offline);
@@ -263,11 +279,18 @@ export function buildGatewayCheck(report: GatewayReport | null, locale: LocaleCo
   for (const id of report.testedSignals ?? []) {
     const signal = observations.get(id);
     if (signal) {
-      signal.testedAt = report.checkedAt ?? new Date().toISOString();
+      signal.testedAt ??= report.checkedAt ?? new Date().toISOString();
       if (signal.assessment === "unknown" && !signal.observation) signal.observation = signal.value === missing ? "unavailable" : "inconclusive";
     }
   }
-  return { signals: sortSignals(observations), geo, report, error: null, verifiedRequest: successful && !report.lastFailure, cloak };
+  // Values derived from the current report are measurements too: gateway profile,
+  // observed headers and client clues otherwise stay "untested" forever.
+  for (const signal of observations.values()) {
+    if (signal.environment === "browser" || signal.testedAt) continue;
+    if (!signal.value || signal.value === missing || signal.assessment === "unknown" || signal.assessment === "not_applicable") continue;
+    signal.testedAt = report.checkedAt ?? new Date().toISOString();
+  }
+  return { signals: sortSignals(observations), geo, report, error: null, verifiedRequest: successful && !currentFailure, cloak };
 }
 
 function sortSignals(observations: Map<string, SignalResult>) {

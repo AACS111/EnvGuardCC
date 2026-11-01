@@ -8,7 +8,7 @@ const ts = require('typescript');
 const root = path.resolve(__dirname, '..');
 const nativeResolve = Module._resolveFilename;
 Module._resolveFilename = function(id, parent, ...rest) { return nativeResolve.call(this, id.startsWith('@/') ? path.join(root,'src',id.slice(2)) : id, parent, ...rest); };
-require.extensions['.ts'] = (module, filename) => module._compile(ts.transpileModule(fs.readFileSync(filename,'utf8'), {compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2020}}).outputText,filename);
+require.extensions['.ts'] = (module, filename) => module._compile(ts.transpileModule(fs.readFileSync(filename,'utf8'), {compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2020,esModuleInterop:true}}).outputText,filename);
 require.extensions['.tsx'] = (module, filename) => module._compile(ts.transpileModule(fs.readFileSync(filename,'utf8'), {compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2020,jsx:ts.JsxEmit.ReactJSX}}).outputText,filename);
 const {buildGatewayCheck} = require(path.join(root,'src/detection/gateway-check.ts'));
 const {signalConfig} = require(path.join(root,'src/detection/config/signals.ts'));
@@ -103,9 +103,10 @@ test('opaque browser reachability never invents an HTTP status and failures stay
     const scan=await runBrowserScan('auto','zh',detectorLocaleText.zh,'claudeReachability');
     assert.equal(scan.signals[0].assessment,'unknown');
     assert.equal(scan.signals[0].observation,'inconclusive');
+    assert.equal(scan.signals[0].unscored,true);
     assert.equal(scan.signals[0].contribution,0);
-    assert.match(scan.signals[0].value,/跨站探测未完成/);
-    assert.match(scan.signals[0].detail,/即使网站可以正常打开/);
+    assert.match(scan.signals[0].value,/浏览器跨站探测未完成/);
+    assert.match(scan.signals[0].detail,/CORP\/COEP/);
   } finally {global.fetch=originalFetch;}
 });
 
@@ -147,15 +148,19 @@ test('browser script failures do not become reachability or aggregate access-ris
       failure=error;
       const reach=(await runBrowserScan('auto','zh',detectorLocaleText.zh,'claudeReachability')).signals[0];
       const risk=(await runBrowserScan('auto','zh',detectorLocaleText.zh,'claudeAccessRisk')).signals[0];
-      for(const sample of [reach,risk]) {
-        assert.equal(sample.assessment,'unknown'); assert.equal(sample.observation,'inconclusive');
-        assert.equal(sample.contribution,0); assert.equal(signalScoreLabel(sample,true),'无法判定');
-      }
+      assert.equal(reach.assessment,'unknown');
+      assert.equal(reach.observation,'inconclusive');
+      assert.equal(reach.unscored,true);
+      assert.equal(reach.contribution,0);
+      assert.equal(signalScoreLabel(reach,true),'无法判定');
+      assert.equal(risk.assessment,'ok');
+      assert.equal(risk.contribution,0);
+      assert.equal(signalScoreLabel(risk,true),'0');
       const html=renderCard(reach,null,{browser:reach,claude:gateway});
-      assert.match(html,/data-signal-state="pending"/);
-      assert.match(html,/无法判定/);
       assert.match(html,/HTTP 302/);
-      assert.doesNotMatch(html,/测试失败|网关改写后通过|适用侧均通过/);
+      assert.match(html,/无法判定/);
+      assert.match(html,/data-signal-state="pending"/);
+      assert.doesNotMatch(html,/测试失败|不适用/);
     }
     country='CN';
     const actualRisk=(await runBrowserScan('auto','zh',detectorLocaleText.zh,'claudeAccessRisk')).signals[0];
@@ -167,6 +172,8 @@ test('browser script failures do not become reachability or aggregate access-ris
     const html=renderToStaticMarkup(React.createElement(RepairDialog,{signal:gateway,claude:gateway,signals:[gateway],locale:'zh',loading:false,onClose:()=>{},onRecheck:async()=>{},onApplyGateway:async()=>{}}));
     assert.match(html,/重新检测/);
     assert.match(html,/打开网站人工核对/);
+    assert.match(html,/网关响应不能证明浏览器路径可用/);
+    assert.doesNotMatch(html,/以客户端网关的 HTTP 响应为准/);
   } finally {probes.collectBrowserIpIntel=originalIp;probes.collectBrowserReachability=originalReach;}
 });
 
@@ -201,6 +208,7 @@ test('cloak state is surfaced and rewritten headers are flagged',()=>{
   const off = buildGatewayCheck(report,'zh');
   assert.equal(off.cloak.enabled,false);
   assert.equal(index(off).language.cloaked,false);
+  assert.equal(index(off).language.assessment,'unknown');
 });
 
 const {environmentScores, comparisonEvidence} = require(path.join(root,'src/detection/environment-evidence.ts'));
@@ -457,8 +465,8 @@ test('gateway ASN aliases and received trace countries produce measured values; 
   const rows=index(buildGatewayCheck(report,'zh'));
   assert.equal(rows.gatewayAsn.assessment,'ok');
   assert.equal(rows.edgeCountry.assessment,'ok');
-  assert.equal(rows.edgeCity.assessment,'unknown');
-  assert.match(rows.edgeCity.value,/未提供城市/);
+  assert.equal(rows.edgeCity.assessment,'not_applicable');
+  assert.match(rows.edgeCity.value,/不提供城市/);
 });
 
 test('native browser language point refreshes linked variant without remote network probes',async()=>{
@@ -533,10 +541,10 @@ test('completed inconclusive and unavailable diagnostics are distinct from unrun
     assert.match(html,/无法判定/);
     assert.doesNotMatch(html,/待测试|待测|data-signal-state="measured"/);
   }
-  assert.equal(rows.edgeCity.observation,'unavailable');
-  assert.equal(signalScoreLabel(rows.edgeCity,true),'已测·无数据');
-  assert.equal(signalScoreLabel(rows.edgeCity,false),'Tested · no data');
-  assert.match(renderCard(rows.edgeCity,null,{claude:rows.edgeCity}),/未返回数据/);
+  assert.equal(rows.edgeCity.observation,undefined);
+  assert.equal(signalScoreLabel(rows.edgeCity,true),'不适用');
+  assert.equal(signalScoreLabel(rows.edgeCity,false),'N/A');
+  assert.match(renderCard(rows.edgeCity,null,{claude:rows.edgeCity}),/不适用/);
   assert.equal(signalScoreLabel(undefined,true),'待测试');
   assert.equal(signalResultStatus({...rows.dnsReview,value:'未测得'}),'pending');
   assert.equal(signalResultStatus({...rows.dnsReview,state:'running'}),'running');
@@ -605,7 +613,7 @@ test('read-only dialogs ignore legacy targets while cards preserve measured evid
       assert.doesNotMatch(card,/处理目标/);
       assert.match(card,/Browser request failed/);
       assert.match(card,/data-signal-state="flagged"/);
-      assert.match(card,/data-score-side="claude"[^>]*>\+10</);
+      assert.match(card,/data-score-side="claude"[^>]*>\+20</);
     }
     assert.equal(notifications,2);
     testWindow.dispatchEvent(new Event('storage'));
@@ -983,3 +991,90 @@ test('read-only exit type matches inferred network labels and disables target ed
   assert.match(residential[0].value,/Residential/);
   assert.equal(repairChoices({...base,value:'暂无法判定',assessment:'unknown'}).some(choice=>choice.current),false);
 });
+
+test('derived gateway values are measured, hosting orgs classify, and dialog separates risk from verification',()=>{
+  const rows=index(buildGatewayCheck(fixtures(),'zh'));
+  const {verificationLabel}=require(path.join(root,'src/detection/verification-score.ts'));
+  assert.equal(rows.gatewayProfile.label,'网关出口目标配置');
+  assert.ok(rows.gatewayProfile.testedAt);
+  assert.equal(verificationLabel(rows.gatewayProfile,true),'通过 +1');
+  const {exitNetworkType}=require(path.join(root,'src/detection/network-type.ts'));
+  assert.equal(exitNetworkType('Akari Networks Limited','zh').kind,'datacenter');
+  const emoji={id:'emojiStyle',label:'Emoji 渲染风格',value:'Apple Emoji 风格',score:0.5,weight:2,contribution:1,assessment:'warning',testedAt:new Date().toISOString(),source:'browser'};
+  const html=renderToStaticMarkup(React.createElement(RepairDialog,{signal:emoji,browser:emoji,signals:[emoji],locale:'zh',loading:false,onClose:()=>{},onRecheck:async()=>{},onApplyGateway:async()=>{}}));
+  assert.match(html,/风险 \+1/);
+  assert.match(html,/未达标/);
+});
+
+test('non-global and malformed IPs do not become WebRTC public candidates', async()=>{
+  const {isPublicIp}=require(path.join(root,'src/detection/client-engine.ts'));
+  for (const ip of ['100.64.0.1','100.127.255.254','999.1.2.3','192.168.1.2','192.0.0.170','198.18.1.1','203.0.113.5','::1','fd00::1','fe80::1','::ffff:192.168.1.1','64:ff9b:1::1','100::1','2001:2::1','3fff::1','5f00::1','not-an-ip']) assert.equal(isPublicIp(ip),false,ip);
+  for (const ip of ['1.1.1.1','100.128.0.1','192.0.0.9','2606:4700:4700::1111']) assert.equal(isPublicIp(ip),true,ip);
+  const {probeWebrtc}=require(path.join(root,'src/detection/browser-probes.ts'));
+  const previous=global.window;
+  try {
+    global.window={RTCPeerConnection:class {
+      createDataChannel(){} createOffer(){return Promise.resolve({});} close(){}
+      setLocalDescription(){this.onicecandidate({candidate:{candidate:'candidate:1 1 udp 1 100.64.10.1 1234 typ host'}});this.onicecandidate({candidate:null});return Promise.resolve();}
+    }};
+    assert.deepEqual((await probeWebrtc()).publicIps,[]);
+  } finally { if(previous===undefined) delete global.window; else global.window=previous; }
+});
+
+test('request evidence keeps its real time and expires only when its gateway configuration changes',()=>{
+  const report=fixtures();
+  report.checkedAt='2026-10-24T00:00:00Z';
+  report.lastRequest={profileUpdatedAt:'new',cloakUpdatedAt:report.cloak.updatedAt,startedAt:'2026-10-23T00:00:10Z',status:200,elapsedMs:19,headers:{'accept-language':'en-US','x-checkcc-target-locale':'en-US'},originalHeaders:{'accept-language':'en-US'},tls:null};
+  report.clues={headers:{a:'a',b:'b',c:'c',d:'d'},clientHintBrands:'Example',clientHintPlatform:'macOS',secFetch:'cors',sdk:'SDK',app:null,uaLooksBrowser:true};
+  let rows=index(buildGatewayCheck(report,'zh'));
+  for(const id of ['language','requestHeaders','clientHints','deviceLineage']) { assert.equal(rows[id].testedAt,report.lastRequest.startedAt,id); assert.equal(rows[id].assessment,'ok',id); }
+  report.checkedAt='2026-10-25T00:00:00Z';
+  assert.equal(index(buildGatewayCheck(report,'zh')).requestHeaders.testedAt,report.lastRequest.startedAt);
+  report.profile={...report.profile,updatedAt:'different'};
+  rows=index(buildGatewayCheck(report,'zh'));
+  for(const id of ['language','requestHeaders','clientHints','deviceLineage']) { assert.equal(rows[id].assessment,'unknown',id); assert.equal(rows[id].testedAt,undefined,id); }
+  report.profile={...report.profile,updatedAt:'new'};
+  report.cloak={...report.cloak,updatedAt:'2026-10-23T00:00:20Z'};
+  rows=index(buildGatewayCheck(report,'zh'));
+  assert.equal(rows.requestHeaders.assessment,'unknown');
+  assert.equal(rows.language.assessment,'unknown');
+  report.lastRequest={...report.lastRequest,cloakUpdatedAt:report.cloak.updatedAt,startedAt:'2026-10-23T00:00:30Z'};
+  assert.equal(index(buildGatewayCheck(report,'zh')).requestHeaders.testedAt,report.lastRequest.startedAt);
+  report.lastFailure={at:'2026-10-23T00:00:15Z',error:'OLD_FAILURE',profileUpdatedAt:'new',cloakUpdatedAt:'2026-10-23T00:00:00Z'};
+  assert.equal(buildGatewayCheck(report,'zh').verifiedRequest,true);
+});
+
+test('risk findings and actual diagnostic failures have different labels',()=>{
+  const {verificationLabel}=require(path.join(root,'src/detection/verification-score.ts'));
+  const {measurementStatus}=require(path.join(root,'src/detection/measurement-status.ts'));
+  const report=fixtures(); report.exit.sources[0].countryCode='CN'; report.exit.primary.countryCode='CN';
+  const rows=index(buildGatewayCheck(report,'zh'));
+  for(const id of ['ipCountryRisk','claudeAccessRisk']) {
+    assert.ok(rows[id].contribution>0,id);
+    assert.equal(verificationLabel(rows[id],true),'未达标 · 0分',id);
+    if(id==='ipCountryRisk') assert.equal(measurementStatus(id,undefined,rows[id]),'measured');
+  }
+  const failed={...rows.claudeReachability,assessment:'error',contribution:6};
+  assert.equal(verificationLabel(failed,true),'检测失败 · 0分');
+  assert.equal(measurementStatus('claudeReachability',undefined,failed),'error');
+});
+
+test('an unscored browser probe stays unresolved without earning or losing points',()=>{
+  const {verificationItem,verificationPoint,verificationScores,verificationLabel}=require(path.join(root,'src/detection/verification-score.ts'));
+  const all=Object.entries(signalConfig).filter(([,config])=>config.enabled).map(([id])=>({id,value:'ok',assessment:'ok',contribution:0,testedAt:'2026-10-24T00:00:00Z'}));
+  const restricted={...all.find(item=>item.id==='claudeReachability'),assessment:'unknown',observation:'inconclusive',unscored:true};
+  const browser=all.map(item=>item.id===restricted.id?restricted:item);
+  const client=all.find(item=>item.id===restricted.id);
+  const full=verificationScores(all,all), partial=verificationScores(browser,all);
+  assert.equal(verificationPoint(restricted),null);
+  assert.equal(verificationLabel(restricted,true),'无法判定 · 不计分');
+  assert.equal(verificationItem(restricted.id,restricted,client),'pending');
+  assert.equal(partial.coverage.browser.maximum,full.coverage.browser.maximum-6);
+  assert.equal(partial.coverage.browser.score,full.coverage.browser.score-6);
+  assert.equal(partial.coverage.combined.maximum,full.coverage.combined.maximum-6);
+  assert.equal(partial.coverage.claude.score,full.coverage.claude.score);
+  const failed={...client,assessment:'error'};
+  assert.equal(verificationItem(restricted.id,restricted,failed),'failed');
+  assert.equal(verificationScores(browser,all.map(item=>item.id===failed.id?failed:item)).coverage.combined.maximum,full.coverage.combined.maximum);
+});
+

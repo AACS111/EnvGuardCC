@@ -86,7 +86,7 @@ export type BrowserIpIntelligence = {
   checkedAt: string;
 };
 
-const DATACENTER_PATTERN = /(cloud|amazon|aws|google|azure|digitalocean|ovh|hetzner|linode|vultr|alibaba|aliyun|tencent|m247|choopa|leaseweb|contabo|oracle|cloudflare|fastly|akamai|hosting|datacenter|server|vpn|proxy)/i;
+const DATACENTER_PATTERN = /(cloud|amazon|aws|google|azure|digitalocean|ovh|hetzner|linode|vultr|alibaba|aliyun|tencent|m247|choopa|leaseweb|contabo|oracle|cloudflare|fastly|akamai|akari|hosting|datacenter|server|vpn|proxy)/i;
 
 type Provider = {
   source: string;
