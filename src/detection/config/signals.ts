@@ -9,6 +9,7 @@ type SignalInput = {
   weight: number;
   environment: DetectionEnvironment;
   enabled?: boolean;
+  informational?: boolean;
 };
 
 const ordered: Array<[string, SignalInput]> = [
@@ -24,7 +25,7 @@ const ordered: Array<[string, SignalInput]> = [
   ["locale", { labelKey: "locale", source: "browser", weight: 4, environment: "both" }],
   // 第 3 行
   ["timezoneOffset", { labelKey: "timezoneOffset", source: "browser", weight: 3, environment: "browser" }],
-  ["emojiStyle", { labelKey: "emojiStyle", source: "browser", weight: 2, environment: "browser" }],
+  ["emojiStyle", { labelKey: "emojiStyle", source: "browser", weight: 0, environment: "browser", informational: true }],
   ["country", { labelKey: "country", source: "server", weight: 18, environment: "both" }],
   ["proxyCountry", { labelKey: "proxyCountry", source: "server", weight: 0, environment: "claude" }],
   // 第 4 行
@@ -80,6 +81,7 @@ const ordered: Array<[string, SignalInput]> = [
 export const signalConfig: Record<string, DetectionSignalConfig> = Object.fromEntries(
   ordered.map(([id, input], index) => [id, {
     enabled: input.enabled !== false,
+    ...(input.informational ? { informational: true } : {}),
     labelKey: input.labelKey,
     source: input.source,
     weight: input.weight,

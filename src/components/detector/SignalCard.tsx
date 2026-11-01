@@ -28,11 +28,11 @@ export function SignalCard({ signal, browser, claude, locale, testing, detailLab
     if (status === "pending") return zh ? "未采样" : "Not sampled";
     if (status === "running") return zh ? "检测中…" : "Testing…";
     if (status === "unavailable") return zh ? "未返回数据" : "No data returned";
-    if (status === "inconclusive" || status === "review") return zh ? "无法判定" : "Inconclusive";
+    if (status === "inconclusive" || status === "review") return signal.id === "claudeReachability" && sample?.value ? sample.value : zh ? "无法判定" : "Inconclusive";
     if (status === "failed") return sample?.value || (zh ? "检测失败" : "Test failed");
     return sample?.value || (zh ? "未判定" : "Unresolved");
   };
-  const stateLabels = zh ? { measured: "原生通过", simulated: "保护后通过", flagged: "异常", pending: "未判定", inapplicable: "不适用" } : { measured: "Native pass", simulated: "Protected pass", flagged: "Flagged", pending: "Unresolved", inapplicable: "Not applicable" };
+  const stateLabels = zh ? { measured: "原生通过", simulated: "保护后通过", flagged: "异常", pending: "未判定", inapplicable: "不适用", informational: '仅供参考' } : { measured: "Native pass", simulated: "Protected pass", flagged: "Flagged", pending: "Unresolved", inapplicable: "Not applicable", informational: 'Informational' };
   return <article className="signal-card" aria-label={signal.label} data-signal-card={signal.id} data-signal-state={evidence.state} data-signal-scope={scope} aria-busy={testing || undefined}>
     <div className="signal-card__header">
       <strong title={signal.label}>{signal.label}</strong>

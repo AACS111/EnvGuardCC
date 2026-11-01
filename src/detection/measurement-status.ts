@@ -2,11 +2,15 @@ import { signalPolicy } from './signal-policy';
 import type { SignalResult } from './types';
 
 export function measurementContribution(sample?: SignalResult) {
-  return sample?.assessment !== 'not_applicable' && Number.isFinite(sample?.contribution) ? Math.max(0, sample!.contribution) : 0;
+  return sample && !sample.unscored && !signalPolicy(sample.id).informational && sample.assessment !== 'not_applicable' && Number.isFinite(sample.contribution) ? Math.max(0, sample.contribution) : 0;
 }
 
 export function measurementAbnormal(sample?: SignalResult) {
-  return Boolean(sample && sample.assessment !== 'not_applicable' && (measurementContribution(sample) > 0 || sample.assessment === 'error'));
+  return Boolean(sample && !signalPolicy(sample.id).informational && sample.assessment !== 'not_applicable' && (measurementContribution(sample) > 0 || sample.assessment === 'error'));
+}
+
+export function measurementFailed(sample?: SignalResult) {
+  return Boolean(sample?.assessment === 'error' && (measurementContribution(sample) === 0 || /Reachability$|^dns/.test(sample.id)));
 }
 
 export function measurementPoints(id: string, browser?: SignalResult, claude?: SignalResult) {
@@ -20,7 +24,7 @@ export function measurementStatus(id: string, browser?: SignalResult, claude?: S
   const samples = scope === 'browser' ? [browser] : scope === 'claude' ? [claude] : [browser, claude];
   if (samples.every(sample => sample?.assessment === 'not_applicable')) return 'not_applicable';
   const applicable = samples.filter(sample => sample?.assessment !== 'not_applicable');
-  if (applicable.some(sample => sample?.assessment === 'error')) return 'error';
+  if (applicable.some(measurementFailed)) return 'error';
   if (applicable.some(sample => !sample?.testedAt || !sample.value || sample.assessment === 'unknown')) return 'pending';
   return 'measured';
 }

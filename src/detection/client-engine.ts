@@ -170,7 +170,6 @@ export function collectBrowserSignals(region: RegionCode, text: DetectorLocaleTe
   const domesticDevice = matchAny(`${uaLower} ${platform ?? ""}`, ["harmonyos", "huawei", "honor", "xiaomi", "redmi", "oppo", "vivo", "realme", "oneplus", "miui"]);
   const chineseVariant = languages.some((lang) => /zh-(tw|hk|mo)|zh-hant/i.test(lang)) ? text.signalValues.traditionalChinese : languages.some((lang) => /zh-cn|zh-sg|zh-hans|zh/i.test(lang)) ? text.signalValues.simplifiedChinese : null;
   const offset = -new Date().getTimezoneOffset() / 60;
-  const emojiStyle = /iphone|ipad|mac os/i.test(ua) ? text.signalValues.appleEmoji : /android|harmonyos/i.test(ua) ? text.signalValues.androidEmoji : /windows/i.test(ua) ? text.signalValues.windowsEmoji : text.signalValues.unknownEmoji;
   const label = text.signalLabels;
   const value = text.signalValues;
   const os = detectOS(ua, platform, text);
@@ -189,7 +188,7 @@ export function collectBrowserSignals(region: RegionCode, text: DetectorLocaleTe
       makeSignal("domesticDevice", label.domesticDevice, domesticDevice ? `${value.domesticDeviceFound}：${domesticDevice}` : value.noDomesticDevice, 0, Boolean(domesticDevice), text, config),
       makeSignalScore("locale", label.locale, locale, 4, rules.localeScore(locale ?? ""), text, config),
       makeSignalScore("timezoneOffset", label.timezoneOffset, `UTC${offset >= 0 ? "+" : ""}${offset}`, 3, rules.offsetScore(offset), text, config),
-      makeSignalScore("emojiStyle", label.emojiStyle, emojiStyle, 2, rules.emojiScore(ua), text, config),
+      { ...makeSignalScore("emojiStyle", label.emojiStyle, null, 0, 0, text, config), value: null, unscored: true },
       makeSignal("browser", label.browser, browserName, 0, false, text, config),
       makeSignal("os", label.os, os, 0, false, text, config),
       makeSignal("device", label.device, detectDeviceName(ua, platform, text), 0, false, text, config),
@@ -205,20 +204,14 @@ export function collectBrowserSignals(region: RegionCode, text: DetectorLocaleTe
   };
 }
 
-export function isPublicIp(ip: string) {
-  if (ip.includes(":")) return !/^(::1|fc|fd|fe80:)/i.test(ip);
-  const parts = ip.split(".").map(Number);
-  if (parts.length !== 4 || parts.some((part) => Number.isNaN(part))) return false;
-  const [a, b] = parts;
-  return !(a === 10 || a === 127 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || (a === 169 && b === 254) || a === 0);
-}
+export { isPublicIp } from "./ip-address.cjs";
 
 // 总分 = 所有命中项加分之�和，封顶 100；浏览器侧与 Claude 侧同一项只取一次更高分。
 export function signalsScore(...groups: SignalResult[][]) {
   const scoreMap = new Map<string, number>();
   for (const signals of groups) {
     for (const signal of signals) {
-      if (!signal || !(signal.contribution > 0)) continue;
+      if (!signal || signal.unscored || detectionConfig.signals[signal.id]?.informational || !(signal.contribution > 0)) continue;
       const current = scoreMap.get(signal.id) ?? 0;
       if (signal.contribution > current) scoreMap.set(signal.id, signal.contribution);
     }

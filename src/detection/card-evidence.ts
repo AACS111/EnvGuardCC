@@ -1,13 +1,13 @@
 import type { SignalResult } from "./types";
 import { signalPolicy } from "./signal-policy";
-import { measurementAbnormal } from "./measurement-status";
+import { measurementAbnormal, measurementFailed } from "./measurement-status";
 import { verificationItem, verificationPassed } from "./verification-score";
 
 export function signalResultStatus(signal?: SignalResult & { state?: string }) {
   if (!signal || signal.state === "pending") return "pending";
   if (signal.state === "running") return "running";
   if (signal.assessment === "not_applicable") return "inapplicable";
-  if (signal.assessment === "error" && (signal.contribution === 0 || /Reachability$|^dns/.test(signal.id))) return "failed";
+  if (measurementFailed(signal)) return "failed";
   if (signal.testedAt && signal.assessment === "unknown") return signal.observation === "unavailable" || !signal.value || /^(未测得|Not measured)$/.test(signal.value) ? "unavailable" : "inconclusive";
   if (!signal.value || /^(未测得|未检测|Not measured|Not checked)$|等待真实|Awaiting a real/i.test(signal.value)) return "pending";
   if (signal.observation) return signal.observation;
@@ -40,6 +40,6 @@ export function cardEvidence(id: string, browser?: SignalResult, client?: Signal
   const allPassed = verificationItem(id, browser, client) === "passed";
   const browserProtected = scope !== "claude" && browser?.cloaked === true && allPassed;
   const inapplicable = sides.length === expected && sides.every((side) => side.assessment === "not_applicable");
-  const state: "flagged" | "simulated" | "measured" | "inapplicable" | "pending" = flagged ? "flagged" : allPassed ? gatewayPassed || browserProtected ? "simulated" : "measured" : inapplicable ? "inapplicable" : "pending";
+  const state: "flagged" | "simulated" | "measured" | "inapplicable" | "pending" | "informational" = inapplicable ? 'inapplicable' : signalPolicy(id).informational ? 'informational' : flagged ? "flagged" : allPassed ? gatewayPassed || browserProtected ? "simulated" : "measured" : "pending";
   return { scope, state, gatewayPassed, browserProtected, allPassed };
 }

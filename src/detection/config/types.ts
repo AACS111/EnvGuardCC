@@ -21,6 +21,7 @@ export type DetectionEnvironment = "browser" | "claude" | "both";
 
 export type DetectionSignalConfig = {
   enabled: boolean;
+  informational?: boolean;
   labelKey: string;
   source: SignalSource;
   weight: number;
