@@ -1,4 +1,4 @@
-import { app, BrowserWindow, Menu, dialog, shell, powerMonitor, powerSaveBlocker } from 'electron';
+import { app, BrowserWindow, Menu, dialog, shell, powerMonitor, powerSaveBlocker, Tray, nativeImage, ipcMain } from 'electron';
 import http from 'node:http';
 import { constants, mkdirSync } from 'node:fs';
 import { access, readFile, stat, mkdir, writeFile } from 'node:fs/promises';
@@ -6,11 +6,40 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { shutdownHelper } from '../scripts/helper-connection.mjs';
 import { watchDesktopPower } from '../scripts/desktop-power.mjs';
+import { createDesktopSettings, shouldHideOnClose } from '../scripts/desktop-settings.mjs';
+import { createClaudeReset } from '../scripts/claude-reset.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const devURL = process.env.CHECKCC_DESKTOP_DEV_URL;
 let window, helper, gateway, site, quitting = false, stopping = false;
 let stopPower, startup, failureExitCode = 0;
+let tray, desktopSettings;
+let resettingClaude = false;
+const claudeReset = createClaudeReset({ trash: target => shell.trashItem(target) });
+const settingsController = createDesktopSettings({ app, userData: process.env.CHECKCC_DESKTOP_USER_DATA || path.join(app.getPath('appData'), app.isPackaged ? 'CheckCC' : 'check-cc') });
+function showWindow() {
+  if (stopping || quitting || !window || window.isDestroyed()) return;
+  if (window.isMinimized()) window.restore();
+  window.show(); window.focus();
+}
+function hideWindow() {
+  if (!tray) { window.minimize(); return; }
+  if (window.isFullScreen()) {
+    window.once('leave-full-screen', () => { if (!quitting && !stopping) window.hide(); });
+    window.setFullScreen(false);
+  } else window.hide();
+}
+async function configureProtectionStartup(helperUrl, origin) {
+  const headers = { Origin: origin, 'X-CheckCC-Client': 'repair-ui' };
+  const current = await (await fetch(helperUrl + '/protection', { headers })).json();
+  if (current.phase !== 'idle') return; // Never take over another running protection session.
+  const session = await (await fetch(helperUrl + '/session?tokenOnly=1', { headers })).json();
+  const result = await fetch(helperUrl + '/protection', {
+    method: 'POST', headers: { ...headers, 'Content-Type': 'application/json', 'X-CheckCC-Token': session.token },
+    body: JSON.stringify({ action: 'startup', enabled: desktopSettings.autoStartProtection }), signal: AbortSignal.timeout(10000),
+  });
+  if (!result.ok) throw new Error('无法应用启动保护设置：' + (await result.json()).error);
+}
 
 async function closeServer(server) {
   if (!server?.listening) return;
@@ -28,14 +57,14 @@ if (!app.requestSingleInstanceLock()) {
 } else {
   if (devURL) process.stdin.on('data', data => { if (data.toString().trim() === 'quit') app.quit(); });
   app.on('second-instance', () => {
-    if (stopping || quitting || !window || window.isDestroyed()) return;
-    if (window.isMinimized()) window.restore();
-    window.focus();
+    showWindow();
   });
-  app.on('window-all-closed', () => app.quit());
+  app.on('activate', showWindow);
+  app.on('window-all-closed', () => { if (!quitting && !stopping) app.quit(); });
   app.on('before-quit', (event) => {
     if (quitting) return;
     event.preventDefault();
+    if (resettingClaude) { showWindow(); return; }
     if (stopping) return;
     stopping = true;
     if (window && !window.isDestroyed()) { window.setEnabled(false); window.setTitle('EnvGuardCC · 正在自动恢复配置…'); }
@@ -63,13 +92,15 @@ if (!app.requestSingleInstanceLock()) {
           app.exit(failureExitCode || 1);
           return;
         }
-        if (window && !window.isDestroyed()) { window.setEnabled(true); window.setTitle('EnvGuardCC · 配置恢复未完成'); }
+        if (window && !window.isDestroyed()) { window.setEnabled(true); window.setTitle('EnvGuardCC · 配置恢复未完成'); window.show(); }
         await dialog.showMessageBox({ type: 'error', title: '自动恢复未完成', message: '原始备份已保留。请检查权限或连接，随后再次关闭模拟保护或退出应用。', detail: error.message, buttons: ['返回应用'] });
       }
     })();
   });
   startup = app.whenReady().then(async () => {
     if (stopping) return;
+    desktopSettings = await settingsController.load();
+    app.once('will-quit', () => { tray?.destroy(); tray = null; });
     if (process.platform === 'darwin') {
       Menu.setApplicationMenu(Menu.buildFromTemplate([
         { label: app.name, submenu: [{ role: 'about' }, { type: 'separator' }, { role: 'services' }, { type: 'separator' }, { role: 'hide' }, { role: 'hideOthers' }, { role: 'unhide' }, { type: 'separator' }, { role: 'quit' }] },
@@ -111,12 +142,67 @@ if (!app.requestSingleInstanceLock()) {
     }
     const siteOrigin = devURL || `http://127.0.0.1:${site.address().port}`;
     if (stopping) return;
-    window = new BrowserWindow({ width: 1440, height: 1000, minWidth: 420, minHeight: 640, title: 'EnvGuardCC', icon: process.platform === 'darwin' ? path.join(root, 'public', 'envguardcc-icon.png') : path.join(root, 'desktop', 'envguardcc.ico'), show: false, webPreferences: { nodeIntegration: false, contextIsolation: true, sandbox: true, backgroundThrottling: false } });
+    await configureProtectionStartup(helper?.url || 'http://127.0.0.1:3001', new URL(siteOrigin).origin);
+    const checkSender = event => {
+      if (!window || event.sender !== window.webContents || event.senderFrame !== window.webContents.mainFrame || new URL(event.senderFrame.url).origin !== new URL(siteOrigin).origin) throw new Error('拒绝非主窗口的设置请求。');
+    };
+    ipcMain.handle('envguardcc:desktop-settings:get', event => { checkSender(event); return settingsController.get(); });
+    ipcMain.handle('envguardcc:desktop-settings:update', async (event, patch) => {
+      checkSender(event);
+      const value = await settingsController.update(patch);
+      desktopSettings = value;
+      return value;
+    });
+    ipcMain.handle('envguardcc:claude-reset', async event => {
+      checkSender(event);
+      if (resettingClaude || stopping || quitting) return { error: '应用正在处理操作，请稍后重试。' };
+      resettingClaude = true;
+      try {
+        const response = await fetch((helper?.url || 'http://127.0.0.1:3001') + '/protection', {
+          headers: { Origin: new URL(siteOrigin).origin, 'X-CheckCC-Client': 'repair-ui' }, signal: AbortSignal.timeout(5000),
+        });
+        if (!response.ok) throw new Error('无法确认保护状态，未清理任何数据。');
+        const protection = await response.json();
+        if (protection.enabled || protection.phase !== 'idle') throw new Error('请先关闭保护并完成配置恢复，再重置 Claude。');
+        const plan = await claudeReset.preview();
+        if (plan.running) throw new Error('请先从 Claude 菜单退出客户端，并结束其后台任务，再重试。');
+        if (!plan.paths.length) return { complete: true, cleared: [], message: '未发现支持的 Claude 桌面客户端本地数据目录。若客户端仍保留数据，请使用 Claude 自带的“重置应用数据”。' };
+        const confirmation = await dialog.showMessageBox(window, {
+          type: 'warning', title: 'Claude 恢复初始化',
+          message: '重置 Claude 桌面客户端的本地数据？',
+          detail: '将清除下列位置的登录状态、缓存、设置、MCP 配置及本地 Cowork/桌面会话数据。云端聊天和账号记录、浏览器及 Claude Code 数据不受影响。\n\n数据将移至系统废纸篓/回收站，未清空前仍可恢复。不会修改设备标识或保证解除账号关联。\n\n' + plan.paths.join('\n'),
+          buttons: ['取消', '恢复初始化'], defaultId: 0, cancelId: 0, noLink: true,
+        });
+        if (confirmation.response !== 1) return { cancelled: true };
+        const result = await claudeReset.reset(plan.paths);
+        return { ...result, message: '已将支持位置的 Claude 桌面客户端本地数据移至废纸篓/回收站。重新打开 Claude 检查初始设置和登录状态。废纸篓清空前数据仍可恢复。' };
+      } catch (error) { return { error: error.message, cleared: error.cleared ?? [] }; }
+      finally { resettingClaude = false; }
+    });
+    window = new BrowserWindow({ width: 1440, height: 1000, minWidth: 420, minHeight: 640, title: 'EnvGuardCC', icon: process.platform === 'darwin' ? path.join(root, 'public', 'envguardcc-icon.png') : path.join(root, 'desktop', 'envguardcc.ico'), show: false, webPreferences: { preload: path.join(root, 'desktop/preload.cjs'), nodeIntegration: false, contextIsolation: true, sandbox: true, backgroundThrottling: false } });
     if (process.platform !== 'darwin') window.removeMenu();
     const external = (url) => { if (/^https?:\/\//.test(url)) void shell.openExternal(url); };
     window.webContents.setWindowOpenHandler(({ url }) => { external(url); return { action: 'deny' }; });
     window.webContents.on('will-navigate', (event, url) => { if (new URL(url).origin !== siteOrigin) { event.preventDefault(); external(url); } });
-    window.on('close', (event) => { if (!quitting) { event.preventDefault(); app.quit(); } });
+    try {
+      const image = nativeImage.createFromPath(path.join(root, 'public', 'envguardcc-icon.png')).resize({ width: 18, height: 18 });
+      tray = new Tray(image);
+      tray.setToolTip('EnvGuardCC');
+      tray.setContextMenu(Menu.buildFromTemplate([
+        { label: '显示主窗口 / Show window', click: showWindow },
+        { type: 'separator' },
+        { label: '退出并恢复配置 / Quit and restore', click: () => app.quit() },
+      ]));
+      tray.on('click', showWindow);
+      tray.on('double-click', showWindow);
+    } catch (error) { console.warn('[desktop] 无法创建托盘，将使用任务栏最小化：' + error.message); }
+    window.on('close', event => {
+      if (quitting) return;
+      event.preventDefault();
+      if (stopping) return;
+      if (shouldHideOnClose({ quitting, stopping })) hideWindow();
+      else app.quit();
+    });
     await window.loadURL(siteOrigin + "/");
     if (stopping) return;
     stopPower = watchDesktopPower({
@@ -222,7 +308,10 @@ if (!app.requestSingleInstanceLock()) {
       const output = process.env.CHECKCC_SMOKE_REPORT || path.join(process.env.CHECKCC_STATE_DIR, 'smoke.json');
       await mkdir(path.dirname(output), { recursive: true }); await writeFile(output, JSON.stringify(result, null, 2));
       app.quit();
-    } else window.show();
+    } else {
+      const loginLaunch = process.argv.includes('--envguardcc-login') || (process.platform === 'darwin' && app.getLoginItemSettings().wasOpenedAtLogin);
+      if (!loginLaunch || !tray) window.show();
+    }
   }).catch(async (error) => {
     if (process.env.CHECKCC_DESKTOP_SMOKE === '1') {
       console.error(error);

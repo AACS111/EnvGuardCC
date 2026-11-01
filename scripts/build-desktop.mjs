@@ -67,6 +67,7 @@ if (isMac) {
   }
   await cp(nodeBin, path.join(stage, 'runtime', 'node'));
   await chmod(path.join(stage, 'runtime', 'node'), 0o755);
+  await run(process.execPath, [path.join(root, 'scripts/build-timezone-service.mjs'), path.join(stage, 'runtime/timezone-service')]);
   try { await cp(path.join(nodeDir, 'LICENSE'), path.join(stage, 'runtime', 'LICENSE')); } catch { /* optional */ }
 } else {
   await cp(process.execPath, path.join(stage, 'runtime', 'node.exe'));
@@ -87,7 +88,6 @@ async function copyRuntime(name, resolver = createRequire(path.join(root, 'packa
   for (const dependency of Object.keys(metadata.dependencies ?? {})) await copyRuntime(dependency, createRequire(packageFile));
 }
 await copyRuntime('classic-level');
-await copyRuntime('js-yaml');
 const manifest = JSON.parse(await readFile(path.join(root, 'package.json'), 'utf8'));
 await writeFile(path.join(stage, 'package.json'), JSON.stringify({ name: 'envguardcc-desktop', productName: 'EnvGuardCC', version: manifest.version, main: 'desktop/main.mjs', description: '环境检测与模拟保护工作台', author: 'EnvGuardCC', license: 'MIT' }, null, 2));
 const guide = isMac
@@ -120,8 +120,17 @@ const artifacts = await packager({ dir: stage, out: output, name: 'EnvGuardCC', 
 const appPath = isMac ? path.join(artifacts[0], 'EnvGuardCC.app') : artifacts[0];
 if (isMac) {
   // No Developer ID; ad-hoc signature keeps the local trial runnable.
+  // Native service cdhashes are pinned to the bridge built before packaging.
+  // The bridge and daemon are signed standalone; preserve those exact signatures.
   await run('codesign', ['--force', '--deep', '--sign', '-', appPath]);
   await run('codesign', ['--verify', '--deep', '--strict', '--verbose=2', appPath]);
+  const nativeDir = path.join(appPath, 'Contents/Resources/app/runtime/timezone-service');
+  const bridgeInfo = await new Promise((resolve, reject) => {
+    const child = spawn('/usr/bin/codesign', ['-d', '--verbose=4', path.join(nativeDir, 'bridge')], { stdio: ['ignore', 'ignore', 'pipe'] });
+    let info = ''; child.stderr.on('data', data => { info += data; });
+    child.once('error', reject); child.once('exit', code => code === 0 ? resolve(info) : reject(new Error('时区服务签名核验失败')));
+  });
+  if (bridgeInfo.match(/^CDHash=([a-f0-9]+)$/m)?.[1] !== (await readFile(path.join(nativeDir, 'client-cdhash'), 'utf8')).trim()) throw new Error('打包改变了时区服务客户端签名，已拒绝交付。');
 }
 // Replace the release ZIP only after compression has completed successfully.
 const archive = path.join(output, isMac ? 'EnvGuardCC-macOS-arm64.zip' : 'EnvGuardCC-Windows-x64.zip');

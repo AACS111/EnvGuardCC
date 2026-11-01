@@ -4,7 +4,6 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createGateway } from "./claude-gateway.mjs";
 import { startRepairHelper } from "./local-repair.mjs";
-import { startConfiguredTrafficLayer } from "./traffic-layer.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const require = createRequire(import.meta.url);
@@ -47,7 +46,6 @@ export async function startDev(args = process.argv.slice(2), { handleSignals = t
   if (process.env.CHECKCC_GATEWAY_PORT && process.env.CHECKCC_GATEWAY_PORT !== "3010") {
     throw new Error("npm run dev 使用网关端口 3010，请移除 CHECKCC_GATEWAY_PORT 后重试。");
   }
-  const traffic = await startConfiguredTrafficLayer(path.join(process.env.CHECKCC_STATE_DIR || path.join(root,"node_modules/.check-cc-local"),"traffic-layer.json"));
   let gateway, helper, next;
   try {
     gateway = await startGateway();
@@ -55,7 +53,6 @@ export async function startDev(args = process.argv.slice(2), { handleSignals = t
   } catch (error) {
     // Release only listeners this launcher acquired; reused services stay untouched.
     try { await closeServer(gateway?.server); } catch { /* Preserve the startup error. */ }
-    try { await traffic?.close(); } catch { /* Preserve the startup error. */ }
     throw error;
   }
   process.stdout.write(`[dev] 本机助手 ${helper.url}\n`);
@@ -96,7 +93,6 @@ export async function startDev(args = process.argv.slice(2), { handleSignals = t
       process.off("SIGTERM", onSignal);
       await attempt("关闭网关", () => closeServer(gateway.server));
       await attempt("关闭 Next", stopNext);
-      await attempt("关闭流量层", () => traffic?.close());
       await attempt("关闭本机助手", () => closeServer(helper.server));
       process.exitCode = failures.length ? (code || 1) : code;
       if (failures.length) throw new Error(failures.join("；"));

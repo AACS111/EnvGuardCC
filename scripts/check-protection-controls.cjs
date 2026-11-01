@@ -280,3 +280,19 @@ test('手动关闭成功后忽略先前轮询的旧结果，唤醒不重新开�
   hold = false; hook.wake(); await new Promise(resolve => setImmediate(resolve));
   assert.equal(attempts, 0); assert.equal(hook.state().report.enabled, false);
 });
+
+
+test('工作台不显示连接、代理选择或时区服务管理面板', () => {
+  const html = workspace('active');
+  assert.doesNotMatch(html, /连接设置|连接方式|保存连接方式|指定 HTTP|系统时区授权|安装并授权|卸载时区服务/);
+});
+
+
+test('保护配置包含桌面行为开关，网页模式不冒充可修改系统登录项', () => {
+  const html = workspace('active');
+  assert.doesNotMatch(html, /关闭窗口后保持后台运行/);
+  for (const label of ['开机自启动', '启动后自动开启保护']) {
+    assert.ok(html.includes(label));
+    assert.ok(html.includes('aria-label="' + label + '" disabled'));
+  }
+});

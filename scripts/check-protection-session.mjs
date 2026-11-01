@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, rm, readFile } from 'node:fs/promises';
+import { mkdtemp, rm, readFile, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { ProtectionSession } from './protection-session.mjs';
@@ -205,28 +205,89 @@ test('关闭等待进行中的启动结束，再恢复；重复关闭幂等', as
 test('周期任务真实发起测试，不并发；关闭监测后停止调度', async t => {
   let concurrent = 0, peak = 0, count = 0;
   const f = await fixture(t, { intervalMs: 15, test: async () => { peak = Math.max(peak, ++concurrent); await delay(25); concurrent--; return { runId: String(++count), state: 'passed' }; } });
-  await f.session.start('http://localhost:3000'); await delay(85); f.session.monitor(false, 60000); await f.session.queue;
+  await f.session.start('http://localhost:3000'); await delay(85); await f.session.monitor(false, 60000); await f.session.queue;
   assert.ok(count >= 2); assert.equal(peak, 1); assert.equal(f.session.report().nextTestAt, null);
   const stoppedAt = count; await delay(45); assert.equal(count, stoppedAt);
 });
 test('检测间隔更新实际调度，非法间隔不改变状态', async t => {
   const f = await fixture(t); await f.session.start('http://localhost:3000');
-  let report = f.session.monitor(true, 300000);
+  let report = await f.session.monitor(true, 300000);
   assert.equal(report.intervalMs, 300000);
   assert.ok(Math.abs(Date.parse(report.nextTestAt) - Date.now() - 300000) < 1000);
   for (const value of [0, -1, 29999, 600001, '60000', NaN, Infinity]) assert.throws(() => f.session.monitor(true, value), /检测间隔/);
   assert.equal(f.session.report().intervalMs, 300000);
-  report = f.session.monitor(false, 30000);
+  report = await f.session.monitor(false, 30000);
   assert.equal(report.nextTestAt, null); assert.equal(report.intervalMs, 30000);
-  report = f.session.monitor(true);
+  report = await f.session.monitor(true);
   assert.ok(Math.abs(Date.parse(report.nextTestAt) - Date.now() - 30000) < 1000);
+});
+
+test('实时检测开关和间隔立即落盘，停止、退出和启动意愿修改不会覆盖；重启恢复调度', async t => {
+  const f = await fixture(t);
+  await f.session.monitor(false, 300000);
+  let saved = JSON.parse(await readFile(f.session.preferenceFile, 'utf8'));
+  assert.deepEqual(saved, { enabled: false, monitoring: false, intervalMs: 300000 });
+  await f.session.startupPreference(true);
+  await f.session.resume('http://localhost:3000');
+  assert.equal(f.session.report().nextTestAt, null);
+  await f.session.stop({ shutdown: true });
+  const reopened = new ProtectionSession(f.options);
+  t.after(() => reopened.stop());
+  let report = await reopened.recover();
+  assert.equal(report.desiredEnabled, true);
+  assert.equal(report.monitoring, false);
+  assert.equal(report.intervalMs, 300000);
+  await reopened.resume('http://localhost:3000');
+  assert.equal(reopened.report().nextTestAt, null);
+  await reopened.monitor(true, 600000);
+  await reopened.stop();
+  saved = JSON.parse(await readFile(f.session.preferenceFile, 'utf8'));
+  assert.deepEqual(saved, { enabled: false, monitoring: true, intervalMs: 600000 });
+  const again = new ProtectionSession(f.options);
+  t.after(() => again.stop());
+  await again.recover();
+  report = await again.start('http://localhost:3000');
+  assert.equal(report.intervalMs, 600000);
+  assert.ok(Math.abs(Date.parse(report.nextTestAt) - Date.now() - 600000) < 1000);
+});
+
+test('旧配置兼容默认实时检测；无效监测字段回退，不影响开启保护意愿', async t => {
+  for (const extra of [{}, { monitoring: 'false', intervalMs: 0 }, { monitoring: true, intervalMs: 600001 }]) {
+    const f = await fixture(t);
+    await writeFile(f.session.preferenceFile, JSON.stringify({ enabled: true, ...extra }));
+    const report = await f.session.recover();
+    assert.equal(report.desiredEnabled, true);
+    assert.equal(report.monitoring, true);
+    assert.equal(report.intervalMs, 60000);
+  }
+});
+
+test('连续修改按顺序保存，写入失败不改变已生效的开关、间隔或定时器', async t => {
+  const f = await fixture(t);
+  await f.session.start('http://localhost:3000');
+  await Promise.all([f.session.monitor(false, 300000), f.session.monitor(true, 30000), f.session.monitor(false)]);
+  assert.deepEqual(JSON.parse(await readFile(f.session.preferenceFile, 'utf8')), { enabled: true, monitoring: false, intervalMs: 30000 });
+  await f.session.monitor(true);
+  const before = f.session.report();
+  const timer = f.session.timer;
+  const originalFile = f.session.preferenceFile;
+  const blocker = path.join(f.options.stateDir, 'not-a-directory');
+  await writeFile(blocker, 'block');
+  f.session.preferenceFile = path.join(blocker, 'preference.json');
+  try {
+    await assert.rejects(f.session.monitor(false, 600000));
+    assert.equal(f.session.report().monitoring, before.monitoring);
+    assert.equal(f.session.report().intervalMs, before.intervalMs);
+    assert.equal(f.session.report().nextTestAt, before.nextTestAt);
+    assert.equal(f.session.timer, timer);
+  } finally { f.session.preferenceFile = originalFile; }
 });
 
 test('手动复检真实执行且保留监测配置，未启动时拒绝保护测试', async t => {
   const f = await fixture(t);
   await assert.rejects(f.session.retest(), /先启动/);
   await f.session.start('http://localhost:3000');
-  f.session.monitor(false, 300000);
+  await f.session.monitor(false, 300000);
   const before = f.session.report();
   const after = await f.session.retest();
   assert.notEqual(after.runId, before.runId); assert.equal(after.testState, 'passed');
@@ -344,4 +405,17 @@ test('macOS 开启保护适配 IANA 时区，复检不覆盖手动设置，关�
     assert.equal(stopped.phase, 'idle');
     assert.equal(zone, 'Asia/Shanghai');
   });
+});
+
+
+test('启动保护开关独立控制下一次启动，不依赖上次手动开关结果且不覆盖活跃会话', async t => {
+  const stateDir = await mkdtemp(path.join(os.tmpdir(), 'checkcc-startup-preference-'));
+  t.after(() => rm(stateDir, { recursive: true, force: true }));
+  const session = new ProtectionSession({ stateDir, snapshot: async () => ({}), apply: async () => [], restore: async () => [], detect: async () => ({ ip: '1.2.3.4', language: 'en', locale: 'en-US' }), test: async () => ({ state: 'passed' }) });
+  assert.equal((await session.startupPreference(true)).desiredEnabled, true);
+  assert.equal(session.report().enabled, false, '启动配置只设定意愿，由正常恢复流程开启保护');
+  assert.equal((await session.startupPreference(false)).desiredEnabled, false);
+  await session.start('http://localhost:3000');
+  await assert.rejects(session.startupPreference(false), /尚未恢复/);
+  await session.stop();
 });

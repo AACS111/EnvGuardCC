@@ -93,7 +93,7 @@ pnpm dev
 
 ## 平台支持范围
 
-macOS 已完成阶段二、三的源码适配：系统代理读取与手动连接设置、受控浏览器、显式授权的系统时区与恢复、FlClash 配置联动。Claude 当前版本仅提供普通打开；FlClash 写入后需在 FlClash 中重新应用并启动配置，恢复后重新应用并核验。使用步骤及真实验证边界见 [阶段二、三结果](docs/MACOS-STAGE23-RESULTS.md)。
+macOS 自动跟随系统 HTTP/HTTPS 代理或系统路由（含 TUN），无需在应用内手动配置代理。应用不读取或改写第三方代理软件的订阅、策略组或路由配置。受控浏览器、系统时区修改与恢复均使用独立的通用功能；Claude 桌面端仅提供普通打开。
 
 已生成 Apple Silicon 本地试用包（`.app`、ZIP、DMG，ad-hoc 签名），产物在 `node_modules/.checkcc-dist`；`pnpm desktop:package` 生成 `.app` 和 ZIP，`pnpm desktop:installer` 再生成 DMG。按当前交付定位不申请 Developer ID 和公证，其他 Mac 首次打开需在系统设置 > 隐私与安全性中授权；已安装到本机 `/Applications`，异机验证仍未完成。当前实测为 Apple Silicon、macOS 27.0，不据此声明更旧系统或 Intel 支持。详见 [阶段四结果](docs/MACOS-STAGE4-RESULTS.md)。
 
@@ -108,7 +108,7 @@ pnpm build
 pnpm desktop:installer
 ```
 
-`desktop:installer` 仅生成 Windows 安装包；Windows 发布包名为 `EnvGuardCC-Windows-x64.zip`，具体目录见打包命令输出。
+`desktop:installer` 在 Windows 上生成安装程序，在 macOS arm64 上生成 DMG。Mac DMG 包含 EnvGuardCC、Applications 快捷入口及中英文安装说明；将应用拖入 Applications 后，从“应用程序”启动。具体目录见打包命令输出。
 
 ## 技术栈
 
@@ -117,3 +117,19 @@ Next.js 16、React 19、TypeScript、Tailwind CSS 4、Electron。
 ## 许可证
 
 MIT，详见 [LICENSE](LICENSE)。
+
+### 系统时区授权
+
+macOS 13 及以上在首次开启保护时通过系统弹窗绑定时区辅助服务，此后修改和恢复时区自动复用授权。支持开源源码构建，不要求使用者拥有开发者证书；页面不显示连接方式或服务管理面板。详见 [时区服务说明](docs/timezone-service.md)。
+
+### 桌面启动与后台运行
+
+Windows 和 macOS 安装版可在“保护配置”中设置开机自启动（登录系统后后台启动）及启动后自动开启保护。开发预览不注册系统自启动。点击窗口关闭按钮会保留后台运行和当前保护；从托盘或应用菜单退出时会先恢复配置。
+
+### Claude 恢复初始化
+
+“保护配置”中的“Claude 恢复初始化”用于重置官方桌面客户端的本地应用资料。先关闭保护、退出 Claude 和后台任务，再查看确认窗口列出的清理位置。支持 macOS 常用应用资料位置，以及 Windows 普通安装和已识别的 MSIX 资料目录；遇到未知位置、符号链接、锁定或权限问题会停止并报告，不声明已全部清除。
+
+登录状态、缓存、偏好、MCP 配置及本地 Cowork/桌面会话数据将移至系统废纸篓/回收站；清空前仍可恢复。此操作保留 Claude 程序、浏览器、Claude Code、用户项目和云端数据；不修改设备标识，不处理系统凭据管理器中的其他记录，也不保证解除服务端账号关联。重新打开 Claude 后检查初始设置和登录状态；若版本使用其他存储位置，请使用 Claude 自带的“重置应用数据”。
+
+实时检测开关与检测间隔修改成功后会立即保存到本地，退出重启、关闭和重新开启保护都会保留。若保存失败，页面会显示错误并保留原有配置。开机自启动与启动后自动开启保护也分别保存。

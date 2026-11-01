@@ -2,6 +2,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { realpath, access } from 'node:fs/promises';
 import { setTimeout as delay } from 'node:timers/promises';
+import { applyTimezoneWithService } from './timezone-service.mjs';
 import { readWindowsTimezone, windowsSystemExecutable } from './windows-timezone.mjs';
 
 const exec = promisify(execFile);
@@ -39,7 +40,7 @@ export async function readAutomaticTimezone({ run = exec } = {}) {
   throw new Error('无法读取 macOS 自动时区设置，未修改系统配置。');
 }
 
-export async function setSystemTimezone(zone, { automaticTimezone = false, readAutomatic = readAutomaticTimezone, platform = process.platform, run = exec, read = readSystemTimezone, checkZone = zone => access('/var/db/timezone/zoneinfo/' + zone) } = {}) {
+export async function setSystemTimezone(zone, { automaticTimezone = false, readAutomatic = readAutomaticTimezone, platform = process.platform, run = exec, useService = run === exec, service = applyTimezoneWithService, read = readSystemTimezone, checkZone = zone => access('/var/db/timezone/zoneinfo/' + zone) } = {}) {
   if (platform === 'win32') {
     if (typeof zone !== 'string' || zone.length > 128 || /[\r\n\0]/.test(zone)) throw new Error('无效的 Windows 时区。');
     await run(windowsSystemExecutable('tzutil.exe'), ['/s', zone], { windowsHide: true, timeout: 15000 });
@@ -47,6 +48,8 @@ export async function setSystemTimezone(zone, { automaticTimezone = false, readA
     if (!validIanaTimezone(zone)) throw new Error('无效的 IANA 系统时区。');
     try { await checkZone(zone); } catch { throw new Error('本机未安装该系统时区，未执行修改。'); }
     if (typeof automaticTimezone !== 'boolean') throw new Error('无效的自动时区设置。');
+    const handled = useService && await service(zone, automaticTimezone);
+    if (!handled) {
     // Disable location-based timezone selection, not network clock synchronization.
     // Every privileged command is fixed; the IANA zone remains shell-quoted data.
     const restoreAutomatic = automaticTimezone ? ' && /usr/bin/defaults write /Library/Preferences/com.apple.timezone.auto Active -bool true' : '';
@@ -55,6 +58,7 @@ export async function setSystemTimezone(zone, { automaticTimezone = false, readA
     catch (error) {
       if (/-128|canceled|cancelled|用户取消/i.test(error.stderr || error.message)) throw new Error('已取消系统授权，时区未确认修改；原始备份已保留。');
       throw new Error('macOS 时区操作未完成，请核对系统授权及自动时区设置；原始备份已保留。', { cause: error });
+    }
     }
   } else throw new Error('当前系统不支持自动修改时区。');
   let actual;

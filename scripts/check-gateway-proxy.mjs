@@ -1,4 +1,7 @@
 import test from "node:test";
+import { mkdtemp, writeFile, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import assert from "node:assert/strict";
 import http from "node:http";
 import net from "node:net";
@@ -139,4 +142,18 @@ test("HTTPS uses TLS inside CONNECT rather than sending message credentials in p
     assert.equal(record[0], 0x16);
     assert.equal(record.includes(Buffer.from("private-local-key")), false);
   } finally { await close(proxy, sockets); }
+});
+
+
+test('自动跟随系统代理，忽略旧版手动设置且不破坏旧文件', async t => {
+  const directory = await mkdtemp(path.join(tmpdir(), 'checkcc-auto-proxy-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const file = path.join(directory, 'proxy-settings.json');
+  const raw = JSON.stringify({ mode: 'manual', address: 'http://127.0.0.1:1' });
+  await writeFile(file, raw);
+  const env = { CHECKCC_STATE_DIR: directory };
+  assert.equal(selectedProxy({ env, providedSystemProxy: 'http://127.0.0.1:7897' }).url.port, '7897');
+  assert.equal(selectedProxy({ env, providedSystemProxy: 'http://127.0.0.1:7898' }).url.port, '7898');
+  assert.equal(selectedProxy({ env, providedSystemProxy: null }), null);
+  assert.equal(await readFile(file, 'utf8'), raw);
 });

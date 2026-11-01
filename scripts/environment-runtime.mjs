@@ -74,14 +74,12 @@ export class EnvironmentRuntime {
   async load() {
     if (this.loaded) return;
     try { this.policy = validatePolicy(migrateRuntimePolicy(JSON.parse(await readFile(path.join(this.stateDir, "environment-policy.json"), "utf8")))); } catch { this.policy = {}; }
-    try { this.trafficScope = JSON.parse(await readFile(path.join(this.stateDir,"traffic-layer.json"),"utf8")); } catch { this.trafficScope = null; }
     this.loaded = true;
   }
   source(origin) {
     if (!this.enabled || !Object.keys(this.policy).length) return "void 0";
     const install = runtimePolicyScript(this.policy);
-    const allWeb = this.trafficScope?.applied === true && this.trafficScope?.allOverseas === true;
-    return `(() => { const u = new URL(location.href); if ((${JSON.stringify(allWeb)} && ['http:','https:'].includes(u.protocol)) || u.hostname === 'claude.ai' || u.hostname.endsWith('.claude.ai') || u.origin === ${JSON.stringify(origin)} || u.protocol === 'file:') return ${install}; return null; })()`;
+    return `(() => { const u = new URL(location.href); if (u.hostname === 'claude.ai' || u.hostname.endsWith('.claude.ai') || u.origin === ${JSON.stringify(origin)} || u.protocol === 'file:') return ${install}; return null; })()`;
   }
   async launch(kind, origin) {
     const profile = path.join(this.stateDir, `protected-${kind}`);
@@ -181,7 +179,6 @@ export class EnvironmentRuntime {
   async apply(delta, origin, kinds = ["web", "desktop"]) {
     if (!/^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)) throw new Error("仅支持本机检测页面。");
     await this.load();
-    try { this.trafficScope = JSON.parse(await readFile(path.join(this.stateDir,"traffic-layer.json"),"utf8")); } catch { this.trafficScope = null; }
     this.policy = { ...this.policy, ...validatePolicy(delta) };
     this.enabled = true;
     await mkdir(this.stateDir, { recursive: true });
