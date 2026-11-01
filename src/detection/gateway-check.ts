@@ -26,8 +26,8 @@ export type GatewayReport = {
   profile: { language: string; locale: string; timezone: string | null; countryName: string | null; city: string | null; updatedAt: string | null } | null;
   proxy?: { mode: "direct" | "http-connect"; source: string; address: string | null };
   transport: string; proxyEnvironmentDetected: boolean; rewrites: number; previewHeaders: Record<string, string>;
-  lastRequest: { startedAt: string; headers: Record<string, string>; originalHeaders?: Record<string, string>; profileUpdatedAt: string | null; status: number | null; elapsedMs: number | null; tls: Probe["tls"] } | null;
-  lastFailure: { at: string; error: string } | null;
+  lastRequest: { startedAt: string; headers: Record<string, string>; originalHeaders?: Record<string, string>; profileUpdatedAt: string | null; cloakUpdatedAt?: string | null; status: number | null; elapsedMs: number | null; tls: Probe["tls"] } | null;
+  lastFailure: { at: string; error: string; profileUpdatedAt?: string | null; cloakUpdatedAt?: string | null } | null;
   checkedAt?: string;
   testedSignals?: string[];
   probes?: { claude: Probe; anthropic: Probe; api: Probe };
@@ -146,7 +146,17 @@ export function buildGatewayCheck(report: GatewayReport | null, locale: LocaleCo
     : tr("拦截迷惑层已关闭：网关原样转发客户端声明，可直接对比未改写状态。", "Cloak layer disabled: client declarations pass through unchanged for direct comparison.");
   const headerDetail = tr("仅对真实转发记录计分。预览值不是 Claude 已收到的值；自定义 x-checkcc-target-locale 也不是 Anthropic 官方区域参数。", "Only observed forwarded headers are scored. Previews are not observed Claude values; x-checkcc-target-locale is not an official Anthropic locale parameter.");
 
-  const current = report.lastRequest && report.lastRequest.profileUpdatedAt === (report.profile?.updatedAt ?? null) ? report.lastRequest : null;
+  const request = report.lastRequest;
+  const cloakMatches = !cloak?.updatedAt || (request?.cloakUpdatedAt !== undefined
+    ? request.cloakUpdatedAt === cloak.updatedAt
+    : Boolean(request && Date.parse(request.startedAt) >= Date.parse(cloak.updatedAt)));
+  const current = request && request.profileUpdatedAt === (report.profile?.updatedAt ?? null) && cloakMatches ? request : null;
+  const failure = report.lastFailure;
+  const failureProfileMatches = failure?.profileUpdatedAt === undefined || failure.profileUpdatedAt === (report.profile?.updatedAt ?? null);
+  const failureCloakMatches = !cloak?.updatedAt || (failure?.cloakUpdatedAt !== undefined
+    ? failure.cloakUpdatedAt === cloak.updatedAt
+    : Boolean(failure && Date.parse(failure.at) >= Date.parse(cloak.updatedAt)));
+  const currentFailure = failure && failureProfileMatches && failureCloakMatches ? failure : null;
   const successful = Boolean(current?.status && current.status >= 200 && current.status < 300);
   const headers = current?.headers;
   const original = current?.originalHeaders ?? null;
@@ -202,12 +212,12 @@ export function buildGatewayCheck(report: GatewayReport | null, locale: LocaleCo
     put(id, value, pending ? "unknown" : !status ? "error" : status >= 400 ? "warning" : "ok", tr("网关后台请求不携带浏览器登录 Cookie 或 API Key，也不执行验证页脚本。收到 HTTP 响应说明此路径网络已通；验证、鉴权或限流响应不计分，请用受控浏览器继续验证。此项不证明账号或聊天可用。重定向未跟随，未验证最终页面。", "The gateway request carries no browser login cookies or API keys and does not execute challenge scripts. An HTTP response establishes network connectivity on this route. Challenges, authentication and rate limits are unscored; continue in the managed browser. Account and messaging access are unverified. Redirects are not followed and the final page is not verified."), id === "claudeReachability" && !status ? 1 : 0, false, pending ? "inconclusive" : undefined);
     if (pending) observations.get(id)!.unscored = true;
   }
-  put("claudeTrigger", report.lastFailure ? tr(`上游失败：${report.lastFailure.error}`, `Upstream failure: ${report.lastFailure.error}`) : current?.status ? `HTTP ${current.status} · ${current.startedAt}` : tr("等待真实 Claude 请求", "Awaiting a real Claude request"), report.lastFailure ? "error" : current?.status ? successful ? "ok" : "warning" : "unknown", `${tr("仅记录经此网关转发后收到的真实上游响应，自动诊断请求不计入。保存配置后需要再发起一次 Claude 请求。", "Only actual forwarded upstream responses count; diagnostic probes do not. Send a new Claude request after changing the profile.")} ${cloakNote}`);
+  put("claudeTrigger", currentFailure ? tr(`上游失败：${currentFailure.error}`, `Upstream failure: ${currentFailure.error}`) : current?.status ? `HTTP ${current.status} · ${current.startedAt}` : tr("等待真实 Claude 请求", "Awaiting a real Claude request"), currentFailure ? "error" : current?.status ? successful ? "ok" : "warning" : "unknown", `${tr("仅记录经此网关转发后收到的真实上游响应，自动诊断请求不计入。保存配置后需要再发起一次 Claude 请求。", "Only actual forwarded upstream responses count; diagnostic probes do not. Send a new Claude request after changing the profile.")} ${cloakNote}`);
   put("claudeLatency", current?.elapsedMs != null ? `${current.elapsedMs} ms` : missing, current?.elapsedMs != null ? "ok" : "unknown", tr("从收到真实请求至上游返回响应头的耗时，不是完整生成耗时或首 token 延迟。", "Time from actual inbound request to upstream response headers, not generation completion or first-token latency."));
 
   const httpLanguageObserved = original?.["accept-language"] ?? language ?? null;
   put("httpLanguage", httpLanguageObserved ?? missing, httpLanguageObserved ? "ok" : "unknown", httpLanguageObserved ? tr(`客户端原始 HTTP 语言偏好 ${httpLanguageObserved}（改写前观测值）。`, `Original client HTTP language ${httpLanguageObserved} (pre-rewrite observation).`) : missing, 0, Boolean(httpLanguageObserved && rewritten && cloakOn));
-  const clues = report.clues ?? null;
+  const clues = current ? report.clues ?? null : null;
   const httpSample = observations.get("httpLanguage");
   if (httpSample?.cloaked) { httpSample.originalValue = httpLanguageObserved ?? undefined; httpSample.value = language ?? httpSample.value; }
   if (clues) {
@@ -217,8 +227,14 @@ export function buildGatewayCheck(report: GatewayReport | null, locale: LocaleCo
     put("clientHints", clues.clientHintBrands ?? clues.clientHintPlatform ?? missing, clues.clientHintBrands ? "ok" : "not_applicable", clues.clientHintBrands ? tr(`Client Hints ${clues.clientHintBrands}${clues.clientHintPlatform ? ` · ${clues.clientHintPlatform}` : ""}。`, `Client Hints ${clues.clientHintBrands}${clues.clientHintPlatform ? ` · ${clues.clientHintPlatform}` : ""}.`) : tr("未发送 Client Hints；服务端客户端的 UA 与浏览器差异属于正常情况。", "No Client Hints sent; a server-side client's UA differing from a browser is expected."));
     put("deviceLineage", clues.sdk ?? missing, clues.sdk ? "ok" : "not_applicable", tr(`Stainless/客户端线索：${clues.sdk ?? missing}${clues.app ? ` · app ${clues.app}` : ""}。该信息说明请求方是 SDK 而非浏览器。`, `Stainless/client signals: ${clues.sdk ?? missing}${clues.app ? ` · app ${clues.app}` : ""}. This shows the caller is an SDK, not a browser.`));
   } else {
-    for (const id of ["requestHeaders", "secFetch", "clientHints", "deviceLineage"]) put(id, missing, "unknown", tr("尚无真实 Claude 请求经过网关；接入后复检才能读到客户端线索。", "No real Claude request has passed through the gateway yet; recheck after integration to read client clues."));
+    for (const id of ["requestHeaders", "secFetch", "clientHints", "deviceLineage"]) put(id, missing, "unknown", tr("当前网关配置下尚无真实 Claude 请求；接入后复检才能读取客户端线索。", "No real Claude request has passed through the current gateway configuration; recheck after integration to read client clues."));
   }
+
+  if (current) for (const id of ["language", "languageVariant", "locale", "httpLanguage", "requestHeaders", "secFetch", "clientHints", "deviceLineage", "claudeTrigger", "claudeLatency"]) {
+    const sample = observations.get(id);
+    if (sample) sample.testedAt = current.startedAt;
+  }
+  if (currentFailure) observations.get("claudeTrigger")!.testedAt = currentFailure.at;
 
   const edge = report.edge ?? null;
   if (edge) {
@@ -271,7 +287,7 @@ export function buildGatewayCheck(report: GatewayReport | null, locale: LocaleCo
   for (const id of report.testedSignals ?? []) {
     const signal = observations.get(id);
     if (signal) {
-      signal.testedAt = report.checkedAt ?? new Date().toISOString();
+      signal.testedAt ??= report.checkedAt ?? new Date().toISOString();
       if (signal.assessment === "unknown" && !signal.observation) signal.observation = signal.value === missing ? "unavailable" : "inconclusive";
     }
   }
@@ -282,7 +298,7 @@ export function buildGatewayCheck(report: GatewayReport | null, locale: LocaleCo
     if (!signal.value || signal.value === missing || signal.assessment === "unknown" || signal.assessment === "not_applicable") continue;
     signal.testedAt = report.checkedAt ?? new Date().toISOString();
   }
-  return { signals: sortSignals(observations), geo, report, error: null, verifiedRequest: successful && !report.lastFailure, cloak };
+  return { signals: sortSignals(observations), geo, report, error: null, verifiedRequest: successful && !currentFailure, cloak };
 }
 
 function sortSignals(observations: Map<string, SignalResult>) {

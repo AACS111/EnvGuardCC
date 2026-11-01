@@ -20,6 +20,7 @@ test("real forwarding, profile reload, CORS, diagnostics isolation and secret re
     let body = "";
     for await (const chunk of request) body += chunk;
     seen = { headers: request.headers, body, url: request.url };
+    if (request.url.includes("disconnect")) return request.socket.destroy();
     response.writeHead(request.url.includes("denied") ? 401 : 200, { "Content-Type": "text/event-stream", "Connection": "keep-alive" });
     response.write("data: first\n\n");
     response.end("data: done\n\n");
@@ -66,6 +67,7 @@ test("real forwarding, profile reload, CORS, diagnostics isolation and secret re
     const after = await (await get("/__checkcc/diagnostics")).json();
     assert.equal(after.lastRequest.status, 200);
     assert.equal(after.lastRequest.profileUpdatedAt, "one");
+    assert.equal(after.lastRequest.cloakUpdatedAt, after.cloak.updatedAt);
     const serialized = JSON.stringify(after);
     for (const secret of ["secret-key", "secret-auth", "private-prompt", "private=secret", "profile-secret"]) assert.ok(!serialized.includes(secret), "Must not disclose " + secret);
     await Promise.all([get("/__checkcc/diagnostics"),get("/__checkcc/diagnostics")]);
@@ -81,6 +83,11 @@ test("real forwarding, profile reload, CORS, diagnostics isolation and secret re
     assert.equal(denied.status, 401);
     await denied.text();
     assert.equal((await (await get("/__checkcc/status")).json()).lastRequest.status, 401);
+    const disconnected = await fetch(gatewayUrl + "/v1/messages?disconnect=true", {method:"POST"});
+    assert.equal(disconnected.status, 502);
+    const failure = await (await get("/__checkcc/status")).json();
+    assert.equal(failure.lastFailure.profileUpdatedAt, "two");
+    assert.equal(failure.lastFailure.cloakUpdatedAt, failure.cloak.updatedAt);
     await writeFile(profileFile, "invalid");
     assert.equal((await (await get("/__checkcc/status")).json()).profileError, "INVALID_PROFILE");
     assert.equal((await fetch(gatewayUrl + "/v1/messages")).status, 503);
@@ -98,7 +105,7 @@ test("probes distinguish HTTP authorization failures, malformed responses and ti
     assert.equal((await probe(url + "/auth")).status, 401);
     assert.equal((await probe(url, {method:"GET",json:true})).error, "INVALID_JSON");
     assert.equal((await probe(url + "/timeout", {timeout:40})).status, null);
-    for (const invalid of ["999.1.2.3", "127.0.0.1", "192.168.1.2", "100.64.1.2", "::1", "fc00::1", "fe80::1", "::ffff:127.0.0.1"]) assert.equal(publicIp(invalid), null);
+    for (const invalid of ["999.1.2.3", "127.0.0.1", "192.168.1.2", "100.64.1.2", "192.0.0.170", "198.18.1.1", "::1", "fc00::1", "fe80::1", "64:ff9b:1::1", "3fff::1", "::ffff:127.0.0.1"]) assert.equal(publicIp(invalid), null);
     assert.equal(publicIp("8.8.8.8"), "8.8.8.8");
     assert.equal(publicIp("2606:4700:4700::1111"), "2606:4700:4700::1111");
   } finally { await close(server); }
@@ -135,6 +142,8 @@ test("optimization configures the gateway without the timezone helper and switch
     await forward();
     assert.equal(seen["accept-language"], "ko-KR,ko;q=0.9,en;q=0.5");
     assert.equal(seen["x-checkcc-target-locale"], "ko-KR");
+    const current = await status();
+    assert.equal(current.lastRequest.cloakUpdatedAt, current.cloak.updatedAt);
     assert.equal((await toggle({ enabled: true, target: { language: "invalid", locale: "ko-KR" } })).status, 400);
     assert.equal((await status()).cloak.enabled, true, "A rejected request must preserve the confirmed state");
     assert.equal((await toggle({ enabled: false })).status, 200);

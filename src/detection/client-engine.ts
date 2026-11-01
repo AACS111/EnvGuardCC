@@ -204,13 +204,7 @@ export function collectBrowserSignals(region: RegionCode, text: DetectorLocaleTe
   };
 }
 
-export function isPublicIp(ip: string) {
-  if (ip.includes(":")) return !/^(::1|fc|fd|fe80:)/i.test(ip);
-  const parts = ip.split(".").map(Number);
-  if (parts.length !== 4 || parts.some((part) => Number.isNaN(part))) return false;
-  const [a, b] = parts;
-  return !(a === 10 || a === 127 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || (a === 169 && b === 254) || a === 0);
-}
+export { isPublicIp } from "./ip-address.cjs";
 
 // 总分 = 所有命中项加分之�和，封顶 100；浏览器侧与 Claude 侧同一项只取一次更高分。
 export function signalsScore(...groups: SignalResult[][]) {

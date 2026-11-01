@@ -1,5 +1,6 @@
 import { detectionConfig } from './config';
 import { signalPolicy } from './signal-policy';
+import { measurementFailed } from './measurement-status';
 import type { SignalResult } from './types';
 
 // Reference: https://github.com/AACS111/EnvGuardCC/blob/main/src/detection/config/signals.ts
@@ -36,7 +37,7 @@ export function verificationLabel(sample: (SignalResult & { state?: string }) | 
     const points = verificationWeight(sample!.id);
     return points > 0 ? (zh ? '通过 +' + points : 'Passed +' + points) : (zh ? '通过 · 不计分' : 'Passed · informational');
   }
-  if (status === 'failed') return sample?.assessment === 'error' ? (zh ? '检测失败 · 0分' : 'Failed · 0 pts') : (zh ? '未达标 · 0分' : 'Not met · 0 pts');
+  if (status === 'failed') return measurementFailed(sample) ? (zh ? '检测失败 · 0分' : 'Test failed · 0 pts') : (zh ? '未达标 · 0分' : 'Not met · 0 pts');
   if (status === 'not_applicable') return zh ? '不适用' : 'N/A';
   if (sample?.unscored) return zh ? '无法判定 · 不计分' : 'Inconclusive · not scored';
   if (sample?.assessment === 'error') return zh ? '测试失败' : 'Failed';

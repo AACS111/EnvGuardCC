@@ -6,16 +6,32 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { shutdownHelper } from '../scripts/helper-connection.mjs';
 import { watchDesktopPower } from '../scripts/desktop-power.mjs';
+import { showTrafficRecoveryDialog } from './traffic-recovery-dialog.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const devURL = process.env.CHECKCC_DESKTOP_DEV_URL;
-let window, helper, gateway, site, quitting = false, stopping = false;
+let window, helper, gateway, site, quitting = false, stopping = false, recoveryPrompt = false;
 let stopPower, startup, failureExitCode = 0;
 
 async function closeServer(server) {
   if (!server?.listening) return;
   server.closeAllConnections();
   await new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+}
+async function trafficRequest(body) {
+  const url = helper?.url || 'http://127.0.0.1:3001';
+  const origin = new URL(devURL || `http://127.0.0.1:${site.address().port}`).origin;
+  const headers = { Origin: origin, 'X-CheckCC-Client': 'repair-ui' };
+  if (body) {
+    const session = await fetch(url + '/session?tokenOnly=1', { headers, signal: AbortSignal.timeout(5000) });
+    if (!session.ok) throw new Error('无法连接本机恢复服务。');
+    headers['X-CheckCC-Token'] = (await session.json()).token;
+    headers['Content-Type'] = 'application/json';
+  }
+  const response = await fetch(url + '/traffic', { method: body ? 'POST' : 'GET', headers, body: body ? JSON.stringify(body) : undefined, signal: AbortSignal.timeout(120000) });
+  const result = await response.json();
+  if (!response.ok) throw Object.assign(new Error(result.error ?? '恢复操作未完成。'), { code: result.code });
+  return result;
 }
 // Keep existing profiles and recovery backups when changing the display name.
 const userData = process.env.CHECKCC_DESKTOP_USER_DATA || path.join(app.getPath('appData'), app.isPackaged ? 'CheckCC' : 'check-cc');
@@ -36,7 +52,7 @@ if (!app.requestSingleInstanceLock()) {
   app.on('before-quit', (event) => {
     if (quitting) return;
     event.preventDefault();
-    if (stopping) return;
+    if (stopping || recoveryPrompt) return;
     stopping = true;
     if (window && !window.isDestroyed()) { window.setEnabled(false); window.setTitle('EnvGuardCC · 正在自动恢复配置…'); }
     void (async () => {
@@ -64,7 +80,17 @@ if (!app.requestSingleInstanceLock()) {
           return;
         }
         if (window && !window.isDestroyed()) { window.setEnabled(true); window.setTitle('EnvGuardCC · 配置恢复未完成'); }
-        await dialog.showMessageBox({ type: 'error', title: '自动恢复未完成', message: '原始备份已保留。请检查权限或连接，随后再次关闭模拟保护或退出应用。', detail: error.message, buttons: ['返回应用'] });
+        if (typeof error.code === 'string' && error.code.startsWith('FLCLASH_')) {
+          recoveryPrompt = true;
+          let retry = false;
+          try { retry = await showTrafficRecoveryDialog({ dialog, error, getStatus: () => trafficRequest(), request: (action, options = {}) => trafficRequest({ action, ...options }) }); }
+          catch (failure) { await dialog.showMessageBox({ type: 'error', title: '恢复提示未完成', message: failure.message, buttons: ['返回应用'] }); }
+          finally { recoveryPrompt = false; }
+          if (window && !window.isDestroyed()) void window.webContents.executeJavaScript("window.dispatchEvent(new Event('checkcc:traffic-recovery'))").catch(() => {});
+          if (retry) app.quit();
+        } else {
+          await dialog.showMessageBox({ type: 'error', title: '自动恢复未完成', message: '原始备份已保留。请检查权限或连接，随后再次关闭模拟保护或退出应用。', detail: error.message, buttons: ['返回应用'] });
+        }
       }
     })();
   });

@@ -14,6 +14,7 @@ import { DesktopLauncher } from "./desktop-launcher.mjs";
 import { prepareTrafficConfig, applyTrafficConfig, restoreTrafficConfig, trafficStatus, entryStatus } from "./traffic-config.mjs";
 import { startTrafficLayer } from "./traffic-layer.mjs";
 import { HELPER_PROTOCOL, assertCurrentHelper, shutdownHelper } from "./helper-connection.mjs";
+import { openFlclash, openRecoveryFolder } from "./flclash-runtime.mjs";
 
 const port = 3001;
 const localOrigin = /^https?:\/\/(127\.0\.0\.1|localhost)(:\d+)?$/;
@@ -58,10 +59,10 @@ async function ensureTrafficLayer() {
     trafficLayer = { close: async () => {} };
   }
 }
-async function restoreTraffic() {
+async function restoreTraffic(options) {
   let config;
   try { config = JSON.parse(await readFile(trafficFile, "utf8")); } catch (error) { if (error.code === "ENOENT") return; throw error; }
-  if (config.applied) await restoreTrafficConfig();
+  if (config.applied) await restoreTrafficConfig(options);
   await trafficLayer?.close(); trafficLayer = null;
 }
 const environmentRuntime = new EnvironmentRuntime({ stateDir });
@@ -174,7 +175,7 @@ async function closeRuntime({ reusable = false } = {}) {
   const pending = (async () => {
     while (changing || protectionChanging) await new Promise(resolve => setTimeout(resolve, 100));
     const issues = [];
-    const attempt = async operation => { try { return await operation(); } catch (error) { issues.push(error.message); } };
+    const attempt = async operation => { try { return await operation(); } catch (error) { issues.push(error); } };
     await attempt(restoreTraffic);
     await attempt(() => browserCloak.close());
     await attempt(() => desktopLauncher.close());
@@ -183,7 +184,11 @@ async function closeRuntime({ reusable = false } = {}) {
     const runtimeReport = await attempt(() => environmentRuntime.close());
     for (const result of runtimeReport?.results ?? []) if (result.state !== "restored") issues.push(result.detail);
     await attempt(restoreSavedTimezone);
-    if (issues.length) throw new Error([...new Set(issues)].join("；"));
+    if (issues.length) {
+      const error = new Error([...new Set(issues.map(issue => issue?.message ?? String(issue)))].join("；"));
+      error.code = issues.find(issue => typeof issue?.code === 'string' && issue.code.startsWith('FLCLASH_'))?.code;
+      throw error;
+    }
     // A reused helper keeps listening after restoration; only a terminal shutdown stays closed.
     if (reusable) resetLifecycleForReuse();
     return runtimeReport;
@@ -217,7 +222,7 @@ const server = http.createServer(async (req, res) => {
       if (body.stopServer === true) res.once("finish", () => server.close());
       return send(200, { restored: true });
     }
-    catch (error) { return send(500, { error: error.message }); }
+    catch (error) { return send(500, { error: error.message, code: error.code }); }
   }
   if (req.url === "/claude-desktop") {
     if (req.method === "GET") return send(200, desktopLauncher.snapshot());
@@ -293,11 +298,19 @@ const server = http.createServer(async (req, res) => {
         await prepareTrafficConfig({ defaultPolicy: body.defaultPolicy });
       } else if (body.action === 'apply') { await ensureTrafficLayer(); await applyTrafficConfig(); }
       else if (body.action === 'restore') await restoreTraffic();
+      else if (body.action === 'restore-preserving-changes') await restoreTraffic({ mode: 'preserve', expectedHash: body.fingerprint });
+      else if (body.action === 'restore-original' && body.confirm === true) await restoreTraffic({ mode: 'original', expectedHash: body.fingerprint });
+      else if (body.action === 'open-flclash') await openFlclash();
+      else if (body.action === 'open-recovery-backup') {
+        const directory = (await trafficStatus()).recovery?.backupDir;
+        if (!directory || !path.resolve(directory).startsWith(path.resolve(stateDir, 'traffic-recovery-'))) throw new Error('尚无可打开的恢复备份。');
+        await openRecoveryFolder(directory);
+      }
       else return send(400, { error: '无效的 FlClash 操作。' });
       return send(200, await trafficStatus());
     } catch (error) {
       if (error.code === 'FLCLASH_RELOAD_REQUIRED') return send(202, await trafficStatus());
-      return send(400, { error: error.message });
+      return send(400, { error: error.message, code: error.code });
     }
     finally { changing = false; }
   }

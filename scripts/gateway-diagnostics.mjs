@@ -1,7 +1,7 @@
 // Diagnostic probes share the gateway's native HTTP transport. No API credentials or request bodies are sampled.
 import { proxyRequest, proxyInfo } from "./gateway-proxy.mjs";
 import dns from "node:dns";
-import { isIP } from "node:net";
+import { isPublicIp } from "../src/detection/ip-address.cjs";
 import { httpReachability, networkFailure } from "./claude-reachability.mjs";
 
 export function transportRequest(url, options, onResponse) {
@@ -9,12 +9,7 @@ export function transportRequest(url, options, onResponse) {
 }
 
 export function publicIp(value) {
-  if (typeof value !== "string" || !isIP(value)) return null;
-  if (isIP(value) === 4) {
-    const [a, b] = value.split(".").map(Number);
-    if (a === 0 || a === 10 || a === 127 || a >= 224 || (a === 100 && b >= 64 && b <= 127) || (a === 169 && b === 254) || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168)) return null;
-  } else if (/^(::|::1|::ffff:|f[cd]|fe[89ab]|ff)/i.test(value)) return null;
-  return value;
+  return typeof value === "string" && isPublicIp(value) ? value : null;
 }
 
 export function probe(rawUrl, { method = "HEAD", family, json = false, text = false, timeout = 4500, headers = {} } = {}) {
