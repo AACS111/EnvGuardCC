@@ -47,6 +47,8 @@ test('Mac FlClash 读取系统偏好的精确配置 ID，控制端口必须本�
   } });
   assert.equal(profile, path.join(dir, 'profiles', `${id}.yaml`));
   assert.equal(flclashDirectory({ platform: 'darwin', env: {}, home: '/test-user' }), '/test-user/Library/Application Support/com.follow.clash');
+  // Keep the controller test isolated from the user's real macOS preferences.
+  await writeFile(path.join(dir, 'shared_preferences.json'), JSON.stringify({ 'flutter.config': '{}' }));
   await writeFile(path.join(dir, 'config.yaml'), 'external-controller: 0.0.0.0:9090\nsecret: local-test-only');
   await assert.rejects(flclashController(dir), /本机/);
   await writeFile(path.join(dir, 'config.yaml'), 'external-controller: 127.0.0.1:9090');

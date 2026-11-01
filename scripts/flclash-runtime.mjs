@@ -1,4 +1,4 @@
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import { readFile, access } from 'node:fs/promises';
 import { homedir } from 'node:os';
@@ -69,5 +69,32 @@ export async function controllerRequest(controller, route, body) {
   }); } catch (error) { throw new Error('FlClash 控制接口连接失败，请确认内核已运行且本机控制地址可用。', { cause: error }); }
   if (!response.ok) throw new Error(`FlClash 内核操作失败（HTTP ${response.status}），原始备份已保留。`);
   return response.status === 204 ? null : response.json();
+}
+
+export async function openFlclash() {
+  if (process.platform === 'darwin') { await exec('/usr/bin/open', ['-a', 'FlClash'], { timeout: 10000 }); return; }
+  if (process.platform === 'win32') {
+    const candidates = [
+      path.join(process.env.LOCALAPPDATA || '', 'Programs', 'FlClash', 'FlClash.exe'),
+      path.join(process.env.ProgramFiles || 'C:/Program Files', 'FlClash', 'FlClash.exe'),
+    ];
+    for (const file of candidates) {
+      try { await access(file); } catch { continue; }
+      const child = spawn(file, [], { detached: true, stdio: 'ignore', windowsHide: true });
+      await new Promise((resolve, reject) => { child.once('spawn', resolve); child.once('error', reject); });
+      child.unref(); return;
+    }
+  }
+  throw new Error('未找到 FlClash，请手动打开它后再检查。');
+}
+
+export async function openRecoveryFolder(directory) {
+  if (process.platform === 'darwin') { await exec('/usr/bin/open', [directory], { timeout: 10000 }); return; }
+  if (process.platform === 'win32') {
+    const child = spawn('explorer.exe', [directory], { detached: true, stdio: 'ignore', windowsHide: true });
+    await new Promise((resolve, reject) => { child.once('spawn', resolve); child.once('error', reject); });
+    child.unref(); return;
+  }
+  throw new Error('无法自动打开备份目录，请手动打开：' + directory);
 }
 

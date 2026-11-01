@@ -87,6 +87,7 @@ async function copyRuntime(name, resolver = createRequire(path.join(root, 'packa
 }
 await copyRuntime('classic-level');
 await copyRuntime('js-yaml');
+await copyRuntime('yaml');
 const manifest = JSON.parse(await readFile(path.join(root, 'package.json'), 'utf8'));
 await writeFile(path.join(stage, 'package.json'), JSON.stringify({ name: 'envguardcc-desktop', productName: 'EnvGuardCC', version: manifest.version, main: 'desktop/main.mjs', description: '环境检测与模拟保护工作台', author: 'EnvGuardCC', license: 'MIT' }, null, 2));
 const guide = isMac
