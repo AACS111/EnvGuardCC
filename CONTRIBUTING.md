@@ -27,4 +27,4 @@ node --test --test-timeout=60000 scripts/check-*.mjs scripts/check-*.cjs tools/l
 
 ## 发布
 
-开发分支测试完成后向 `main` 提交 PR，检查通过并审核后合并。现有 Windows 发布工作流仍以 `main` 为触发入口。GitHub 默认分支和分支保护策略由仓库设置管理，本流程文件不提供强制保护。
+开发分支测试完成后向 `main` 提交 PR，检查通过并审核后合并。`develop` 推送后构建 Windows x64 与 macOS arm64 安装包用于验证；将通过验证的代码合入 `main` 后，推送与 package.json 版本一致的 `v<版本>` 标签。标签工作流等待两平台构建成功，汇总四个安装包和校验值，再发布 GitHub Release。GitHub 默认分支和分支保护策略由仓库设置管理，本流程文件不提供强制保护。

@@ -1,7 +1,7 @@
 {
   "name": "envguardcc",
   "productName": "EnvGuardCC",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Claude environment checker and account-risk analysis tool.",
   "license": "MIT",
   "homepage": "https://github.com/AACS111/EnvGuardCC",

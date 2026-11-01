@@ -21,7 +21,7 @@ export function resolveNpmCli({
 } = {}) {
   const nodeDir = path.dirname(execPath);
   const candidates = [];
-  if (npmExecPath) candidates.push(npmExecPath);
+  if (npmExecPath && /^npm(?:-cli)?(?:\.[cm]?js)?$/i.test(path.basename(npmExecPath))) candidates.push(npmExecPath);
   candidates.push(
     path.join(nodeDir, "npm"),
     path.join(nodeDir, "node_modules", "npm", "bin", "npm-cli.js"),

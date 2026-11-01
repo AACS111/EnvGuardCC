@@ -6,9 +6,11 @@ Claude 运行环境检测与保护工作台，支持浏览器与客户端环境�
 
 ## 下载
 
-- [Windows x64 安装包（.exe）](https://github.com/AACS111/EnvGuardCC/releases/download/v0.1.0/EnvGuardCC-Setup-0.1.0.exe)
-- [Windows x64 便携包（.zip）](https://github.com/AACS111/EnvGuardCC/releases/download/v0.1.0/EnvGuardCC-Windows-x64.zip)
-- [SHA-256 校验值](https://github.com/AACS111/EnvGuardCC/releases/download/v0.1.0/SHA256SUMS.txt) · [全部版本](https://github.com/AACS111/EnvGuardCC/releases)
+- [Windows x64 安装包（.exe）](https://github.com/AACS111/EnvGuardCC/releases/download/v0.1.1/EnvGuardCC-Setup-0.1.1.exe)
+- [Windows x64 便携包（.zip）](https://github.com/AACS111/EnvGuardCC/releases/download/v0.1.1/EnvGuardCC-Windows-x64.zip)
+- [Apple Silicon Mac 安装镜像（.dmg）](https://github.com/AACS111/EnvGuardCC/releases/download/v0.1.1/EnvGuardCC-0.1.1-arm64.dmg)
+- [Apple Silicon Mac 应用（.zip）](https://github.com/AACS111/EnvGuardCC/releases/download/v0.1.1/EnvGuardCC-macOS-arm64.zip)
+- [SHA-256 校验值](https://github.com/AACS111/EnvGuardCC/releases/download/v0.1.1/SHA256SUMS.txt) · [全部版本](https://github.com/AACS111/EnvGuardCC/releases)
 
 安装包下载后直接运行；便携包请完整解压后运行 EnvGuardCC.exe，保留同目录运行文件。均已包含运行环境，无需另行安装 Node.js。安装包尚未进行代码签名。
 
@@ -72,7 +74,7 @@ pnpm dev
 
 ### Windows
 
-以下命令用于 Windows；Apple Silicon 请使用上方的 macOS 源码开发步骤，现有发行包仅面向 Windows。
+以下命令用于 Windows；Apple Silicon 可下载上方 Mac 安装包，或使用 macOS 源码开发步骤。
 
 ```powershell
 git clone https://github.com/AACS111/EnvGuardCC.git

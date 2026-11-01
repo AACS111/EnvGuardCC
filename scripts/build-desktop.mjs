@@ -4,6 +4,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createHash } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { createRequire } from 'node:module';
+import { resolveNpmCli } from './dev-electron.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const toolsDir = path.join(root, 'node_modules', '.checkcc-desktop-build');
@@ -31,7 +32,7 @@ const packagerVersion = isMac ? '20.3.0' : '19.1.1';
 let installedPackager = null;
 try { installedPackager = JSON.parse(await readFile(path.join(toolsDir, 'node_modules', '@electron', 'packager', 'package.json'), 'utf8')).version; } catch { /* install below */ }
 if (installedPackager !== packagerVersion) {
-  const npmCli = process.env.npm_execpath || path.join(path.dirname(process.execPath), 'node_modules/npm/bin/npm-cli.js');
+  const npmCli = resolveNpmCli();
   // 19.1.1 leaves the zip extraction pending on Node 26; macOS uses 20.3.0.
   await run(process.execPath, [npmCli, 'install', '--prefix', toolsDir, '--save-exact', 'electron@42.11.18', `@electron/packager@${packagerVersion}`], { env: { ...process.env, npm_config_cache: path.join(toolsDir, 'cache'), ELECTRON_CACHE: path.join(toolsDir, 'electron-cache') } });
 }

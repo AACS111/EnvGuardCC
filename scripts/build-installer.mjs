@@ -3,6 +3,7 @@ import { spawn } from 'node:child_process';
 import { createRequire } from 'node:module';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { resolveNpmCli } from './dev-electron.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const output = path.join(root, 'node_modules', '.checkcc-dist');
@@ -30,7 +31,7 @@ const require = createRequire(path.join(toolsDir, 'package.json'));
 try { require.resolve('electron-builder'); }
 catch (error) {
   if (error.code !== 'MODULE_NOT_FOUND') throw error;
-  const npmCli = path.join(path.dirname(process.execPath), 'node_modules', 'npm', 'bin', 'npm-cli.js');
+  const npmCli = resolveNpmCli();
   await new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [npmCli, 'install', '--prefix', toolsDir, '--save-exact', '--no-audit', '--no-fund', 'electron-builder@26.0.12'], {
       cwd: root, windowsHide: true, stdio: 'inherit',

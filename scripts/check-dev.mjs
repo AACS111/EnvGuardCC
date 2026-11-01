@@ -71,3 +71,10 @@ test("Electron 安装优先使用 npm_execpath，缺少 npm 时给出可操作�
     /未找到 npm/,
   );
 });
+
+
+test('pnpm 启动时安装 Electron 使用真正的 npm CLI', () => {
+  const npmCli = '/runtime/node_modules/npm/bin/npm-cli.js';
+  const pnpmCli = '/tools/pnpm/bin/pnpm.cjs';
+  assert.equal(resolveNpmCli({ execPath: '/runtime/node', npmExecPath: pnpmCli, env: {}, exists: file => [npmCli, pnpmCli].includes(file) }), npmCli);
+});

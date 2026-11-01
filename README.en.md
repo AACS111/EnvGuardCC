@@ -6,9 +6,11 @@ A Claude runtime environment inspection and protection workspace with browser an
 
 ## Download
 
-- [Windows x64 installer (.exe)](https://github.com/AACS111/EnvGuardCC/releases/download/v0.1.0/EnvGuardCC-Setup-0.1.0.exe)
-- [Windows x64 portable package (.zip)](https://github.com/AACS111/EnvGuardCC/releases/download/v0.1.0/EnvGuardCC-Windows-x64.zip)
-- [SHA-256 checksums](https://github.com/AACS111/EnvGuardCC/releases/download/v0.1.0/SHA256SUMS.txt) · [All releases](https://github.com/AACS111/EnvGuardCC/releases)
+- [Apple Silicon Mac DMG](https://github.com/AACS111/EnvGuardCC/releases/download/v0.1.1/EnvGuardCC-0.1.1-arm64.dmg)
+- [Apple Silicon Mac ZIP](https://github.com/AACS111/EnvGuardCC/releases/download/v0.1.1/EnvGuardCC-macOS-arm64.zip)
+- [Windows x64 installer (.exe)](https://github.com/AACS111/EnvGuardCC/releases/download/v0.1.1/EnvGuardCC-Setup-0.1.1.exe)
+- [Windows x64 portable package (.zip)](https://github.com/AACS111/EnvGuardCC/releases/download/v0.1.1/EnvGuardCC-Windows-x64.zip)
+- [SHA-256 checksums](https://github.com/AACS111/EnvGuardCC/releases/download/v0.1.1/SHA256SUMS.txt) · [All releases](https://github.com/AACS111/EnvGuardCC/releases)
 
 Run the installer directly, or extract the entire portable package and launch EnvGuardCC.exe with its accompanying files. Both packages include the runtime; Node.js is not required. The installer is not code-signed.
 
@@ -70,7 +72,7 @@ Open the local URL printed by the terminal.
 
 ### Windows
 
-The existing Windows x64 installer and portable packages are Windows-only. Use the macOS source-development steps above on Apple Silicon; the commands below are for Windows.
+Apple Silicon Mac packages are available above. The commands below are for Windows; see the macOS source-development steps for local development.
 
 ```powershell
 git clone https://github.com/AACS111/EnvGuardCC.git
