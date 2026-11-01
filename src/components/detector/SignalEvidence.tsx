@@ -1,5 +1,6 @@
 import type { SignalResult } from "@/detection/types";
 import type { LocaleCode } from "@/i18n/messages";
+import { signalPolicy } from '@/detection/signal-policy';
 
 function evidenceCopy(locale: LocaleCode) {
   if (locale.startsWith("zh")) return {
@@ -17,7 +18,7 @@ function evidenceCopy(locale: LocaleCode) {
 }
 
 export function SignalEvidence({ browser, locale }: { browser?: SignalResult; locale: LocaleCode }) {
-  if (!browser || browser.contribution <= 0 || browser.assessment === "unknown" || browser.assessment === "not_applicable") return null;
+  if (!browser || signalPolicy(browser.id).informational || browser.contribution <= 0 || browser.assessment === "unknown" || browser.assessment === "not_applicable") return null;
   return <span className="signal-evidence" data-signal-id={browser.id}>
     <span className="signal-status signal-status--flagged">{evidenceCopy(locale).browser} +{browser.contribution}</span>
   </span>;

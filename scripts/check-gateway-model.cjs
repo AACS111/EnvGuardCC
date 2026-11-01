@@ -10,6 +10,7 @@ const nativeResolve = Module._resolveFilename;
 Module._resolveFilename = function(id, parent, ...rest) { return nativeResolve.call(this, id.startsWith('@/') ? path.join(root,'src',id.slice(2)) : id, parent, ...rest); };
 require.extensions['.ts'] = (module, filename) => module._compile(ts.transpileModule(fs.readFileSync(filename,'utf8'), {compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2020}}).outputText,filename);
 require.extensions['.tsx'] = (module, filename) => module._compile(ts.transpileModule(fs.readFileSync(filename,'utf8'), {compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2020,jsx:ts.JsxEmit.ReactJSX}}).outputText,filename);
+require.extensions['.css'] = () => {};
 const {buildGatewayCheck} = require(path.join(root,'src/detection/gateway-check.ts'));
 const {signalConfig} = require(path.join(root,'src/detection/config/signals.ts'));
 const fixtures = () => ({
@@ -783,10 +784,10 @@ test('DNS proxy verification is scoped to the app and refreshes all three native
 
 test('workspace score matches scoped card points and excludes unsupported-side observations',()=>{
   const {measurementPoints}=require(path.join(root,'src/detection/measurement-status.ts'));
-  const browser=[{id:'emojiStyle',value:'Windows Emoji',contribution:2},{id:'proxyCountry',value:'KR',contribution:99}];
+  const browser=[{id:'emojiStyle',value:'Windows Emoji',contribution:2},{id:'timezone',value:'Asia/Shanghai',contribution:26},{id:'proxyCountry',value:'KR',contribution:99}];
   const client=[{id:'chineseFonts',value:'Chinese fonts',contribution:13},{id:'emojiStyle',value:'Windows Emoji',contribution:2},{id:'legacy-removed',value:'old data',contribution:50}];
   const score=environmentScores(browser,client);
-  assert.deepEqual(score,{browser:2,claude:null,combined:2});
+  assert.deepEqual(score,{browser:26,claude:null,combined:26});
   const {detectionConfig}=require(path.join(root,'src/detection/config/index.ts'));
   const sum=Object.entries(detectionConfig.signals).filter(([,c])=>c.enabled).reduce((n,[id])=>n+measurementPoints(id,browser.find(s=>s.id===id),client.find(s=>s.id===id)),0);
   assert.equal(score.combined,Math.min(100,sum));
@@ -819,9 +820,9 @@ test('verification score separates full passing credit from provisional half cre
   for (const patch of [{testedAt:undefined},{testedAt:'invalid'},{value:null},{assessment:'unknown'},{observation:'review'},{observation:'inconclusive'},{state:'running'}]) assert.equal(verificationPoint({...good,...patch}),10);
   for (const patch of [{assessment:'error'},{assessment:'warning'},{contribution:5}]) assert.equal(verificationPoint({...good,...patch}),0);
   const passed = Object.keys(signalConfig).map(id=>({...good,id}));
-  assert.equal(verificationScores(passed,passed).combined,256);
+  assert.equal(verificationScores(passed,passed).combined,252);
   const absent = verificationScores(null,null);
-  assert.equal(absent.combined,128); assert.equal(absent.coverage.combined.provisional,128); assert.equal(absent.coverage.combined.passed,0);
+  assert.equal(absent.combined,126); assert.equal(absent.coverage.combined.provisional,126); assert.equal(absent.coverage.combined.passed,0);
   const partial = verificationScores([good],null);
   assert.equal(partial.coverage.browser.passed,1);
   assert.equal(partial.coverage.combined.passed,0,'a shared item needs both applicable sides');
@@ -830,9 +831,9 @@ test('verification score separates full passing credit from provisional half cre
   assert.equal(both.coverage.combined.passed,1);
   assert.ok(both.combined>0 && both.combined<both.coverage.combined.maximum);
   const failed = verificationScores(passed,passed.map(s=>s.id==='language'?{...s,contribution:5,assessment:'warning'}:s));
-  assert.equal(failed.coverage.combined.passed,48); assert.equal(failed.combined,236);
+  assert.equal(failed.coverage.combined.passed,47); assert.equal(failed.combined,232);
   const na = verificationScores(passed.map(s=>s.id==='language'?{...s,assessment:'not_applicable'}:s),passed.map(s=>s.id==='language'?{...s,assessment:'not_applicable'}:s));
-  assert.equal(na.coverage.combined.possible,48); assert.equal(na.coverage.combined.passed,48); assert.equal(na.combined,236);
+  assert.equal(na.coverage.combined.possible,47); assert.equal(na.coverage.combined.passed,47); assert.equal(na.combined,232);
   assert.equal(verificationPoint({...good,contribution:NaN}),10);
   assert.equal(verificationPoint({...good,assessment:'not_applicable'}),null);
 });
@@ -860,7 +861,7 @@ test('overview exposes recheck, monitoring choices and pass coverage without tes
 test('reference weights, pass credit and card state require the same evidence',()=>{
   const {verificationItem,verificationWeights,verificationPoint,verificationScores}=require(path.join(root,'src/detection/verification-score.ts'));
   const {cardEvidence}=require(path.join(root,'src/detection/card-evidence.ts'));
-  assert.deepEqual(verificationWeights,{timezone:26,language:20,languageVariant:12,chineseFonts:16,vendorFonts:10,domesticBrowser:8,domesticDevice:6,locale:6,timezoneOffset:4,emojiStyle:4,country:20});
+  assert.deepEqual(verificationWeights,{timezone:26,language:20,languageVariant:12,chineseFonts:16,vendorFonts:10,domesticBrowser:8,domesticDevice:6,locale:6,timezoneOffset:4,emojiStyle:0,country:20});
   const good={id:'language',value:'ko-KR',contribution:0,assessment:'ok',testedAt:'2026-10-24T00:00:00Z'};
   for(const patch of [{testedAt:undefined},{observation:'review'},{assessment:'warning'},{state:'running'}]){
     const sample={...good,...patch};
@@ -874,8 +875,8 @@ test('reference weights, pass credit and card state require the same evidence',(
   assert.equal(verificationPoint({...good,id:'requestHeaders'}),1,'extended items receive baseline credit');
   const font={...good,id:'chineseFonts'};
   const result=verificationScores([font,good],[good]);
-  assert.equal(result.browser,110.5); assert.equal(result.claude,88.5); assert.equal(result.combined,146,'shared language counted once and pending gets half credit');
-  assert.equal(verificationScores([{...good,id:'os'}],null).browser,93,'a measured extended item replaces half credit with full baseline credit');
+  assert.equal(result.browser,108.5); assert.equal(result.claude,88.5); assert.equal(result.combined,144,'shared language counted once and pending gets half credit');
+  assert.equal(verificationScores([{...good,id:'os'}],null).browser,91,'a measured extended item replaces half credit with full baseline credit');
 });
 
 test('double risk rings use the same weighted score deficit as the score meters',()=>{
@@ -885,11 +886,11 @@ test('double risk rings use the same weighted score deficit as the score meters'
   const unknown={...good,id:'timezone',testedAt:undefined};
   const flagged={...good,score:1,contribution:20,assessment:'warning'};
   const estimate=environmentRiskEstimates([flagged,unknown],[]).browser;
-  assert.equal(estimate.value,55,'failed language gets zero credit; unresolved items retain half credit');
-  assert.equal(estimate.observedWeight,20); assert.equal(estimate.totalWeight,185);
-  assert.equal(environmentRiskEstimates([{...flagged,assessment:'error'}],[]).browser.value,55,'failed diagnostics earn zero credit');
-  assert.equal(environmentRiskEstimates([good],[]).browser.value,45,'a passed language does not erase unresolved items');
-  assert.equal(environmentRiskEstimates([{...flagged,id:'emojiStyle'}],[]).browser.value,51,'emoji uses the same verification weight as the score meter');
+  assert.equal(estimate.value,56,'failed language gets zero credit; unresolved items retain half credit');
+  assert.equal(estimate.observedWeight,20); assert.equal(estimate.totalWeight,181);
+  assert.equal(environmentRiskEstimates([{...flagged,assessment:'error'}],[]).browser.value,56,'failed diagnostics earn zero credit');
+  assert.equal(environmentRiskEstimates([good],[]).browser.value,44,'a passed language does not erase unresolved items');
+  assert.equal(environmentRiskEstimates([{...flagged,id:'emojiStyle'}],[]).browser.value,null,'informational emoji results cannot establish risk coverage');
 });
 
 test('132 out of 157 client points yields 16 percent risk with 13 unresolved items',()=>{
@@ -945,7 +946,7 @@ test('failed enabled reachability lowers credit while removed API evidence is ex
   const passed=Object.entries(signalConfig).filter(([,config])=>config.enabled).map(([id])=>({id,value:'measured',score:0,weight:signalConfig[id].weight,contribution:0,assessment:'ok',testedAt:'2026-10-24T00:00:00Z'}));
   const full=verificationScores(passed,passed);
   assert.equal(full.claude,157); assert.equal(full.coverage.claude.maximum,157);
-  assert.equal(full.combined,256);
+  assert.equal(full.combined,252);
   assert.equal(verificationWeight('apiReachability'),0);
   const removed={id:'apiReachability',value:'old failed API check',assessment:'error',testedAt:'2026-10-24T00:00:00Z',contribution:0};
   assert.equal(verificationScores([...passed,removed],[...passed,removed]).combined,full.combined);
@@ -956,7 +957,7 @@ test('failed enabled reachability lowers credit while removed API evidence is ex
     const client=passed.map(sample=>sample.id==='anthropicReachability'?{...sample,assessment}:sample);
     const score=verificationScores(passed,client);
     assert.equal(score.claude,156); assert.equal(score.coverage.claude.failed,1);
-    assert.equal(score.combined,255,'the shared failed item is counted once');
+    assert.equal(score.combined,251,'the shared failed item is counted once');
     assert.equal(verificationPoint(client.find(sample=>sample.id==='anthropicReachability')),0);
     assert.ok(environmentRiskEstimates(passed,client).claude.value>0,'known failures cannot produce a clear indicator');
   }
@@ -965,7 +966,7 @@ test('failed enabled reachability lowers credit while removed API evidence is ex
   assert.equal(partial.claude,156.5); assert.equal(partial.coverage.claude.provisional,0.5);
   const na=passed.map(sample=>sample.id==='anthropicReachability'?{...sample,assessment:'not_applicable'}:sample);
   assert.equal(verificationScores(null,na).coverage.claude.maximum,156);
-  for(const sample of passed){
+  for(const sample of passed.filter(sample=>!signalConfig[sample.id].informational)){
     assert.ok(verificationWeight(sample.id)>0,sample.id);
     const failed=passed.map(item=>item.id===sample.id?{...item,assessment:'error'}:item);
     const score=verificationScores(failed,failed);
@@ -1003,7 +1004,7 @@ test('derived gateway values are measured, hosting orgs classify, and dialog sep
   assert.equal(exitNetworkType('Akari Networks Limited','zh').kind,'datacenter');
   const emoji={id:'emojiStyle',label:'Emoji 渲染风格',value:'Apple Emoji 风格',score:0.5,weight:2,contribution:1,assessment:'warning',testedAt:new Date().toISOString(),source:'browser'};
   const html=renderToStaticMarkup(React.createElement(RepairDialog,{signal:emoji,browser:emoji,signals:[emoji],locale:'zh',loading:false,onClose:()=>{},onRecheck:async()=>{},onApplyGateway:async()=>{}}));
-  assert.match(html,/风险 \+1/);
-  assert.match(html,/未达标/);
+  assert.doesNotMatch(html,/风险 \+1|未达标/);
+  assert.match(html,/不计分/);
 });
 

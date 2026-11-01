@@ -40,6 +40,6 @@ export function cardEvidence(id: string, browser?: SignalResult, client?: Signal
   const allPassed = verificationItem(id, browser, client) === "passed";
   const browserProtected = scope !== "claude" && browser?.cloaked === true && allPassed;
   const inapplicable = sides.length === expected && sides.every((side) => side.assessment === "not_applicable");
-  const state: "flagged" | "simulated" | "measured" | "inapplicable" | "pending" = flagged ? "flagged" : allPassed ? gatewayPassed || browserProtected ? "simulated" : "measured" : inapplicable ? "inapplicable" : "pending";
+  const state: "flagged" | "simulated" | "measured" | "inapplicable" | "pending" | "informational" = inapplicable ? 'inapplicable' : signalPolicy(id).informational ? 'informational' : flagged ? "flagged" : allPassed ? gatewayPassed || browserProtected ? "simulated" : "measured" : "pending";
   return { scope, state, gatewayPassed, browserProtected, allPassed };
 }

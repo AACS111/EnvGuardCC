@@ -11,6 +11,7 @@ import { activeRuntimePolicy } from "./environment-runtime";
 import { policyAffectsSignal } from "./environment-actions";
 import { collectBrowserSignals } from "./client-engine";
 import { readClaudeBrowser, claudeBrowserSignal } from "./claude-browser";
+import { emojiStylePlugin } from "./plugins/emoji-style";
 
 export type BrowserScan = {
   signals: SignalResult[];
@@ -25,11 +26,13 @@ const DATACENTER_PATTERN = /(cloud|amazon|aws|google|azure|digitalocean|ovh|hetz
 export async function runBrowserScan(region: RegionCode, locale: LocaleCode, text: DetectorLocaleText, signalId?: string): Promise<BrowserScan> {
   const snapshot = collectBrowserEnvironment(text);
   // 三项并行：WebRTC 候选、出口情报、可达性；任一失败都不阻塞其它信号。
-  const [webrtc, ipIntel, reachability, claudeBrowser] = await Promise.all([
+  const [webrtc, ipIntel, reachability, claudeBrowser, emoji] = await Promise.all([
     !signalId || signalId.startsWith("webrtc") ? probeWebrtc() : Promise.resolve({ supported: false, candidates: 0, publicIps: [], hostCount: 0, srflxCount: 0, mdnsCount: 0, error: null } as WebrtcProbe),
     !signalId || ["country", "ipv4", "browserIpLocation", "browserIpOrg", "claudeAccessRisk", "webrtcConsistency"].includes(signalId) || signalId.startsWith("webrtc") ? collectBrowserIpIntel(locale).catch(() => null) : Promise.resolve(null),
     !signalId || ["claudeReachability", "anthropicReachability", "claudeAccessRisk"].includes(signalId) ? collectBrowserReachability().catch(() => null) : Promise.resolve(null),
     !signalId || signalId === "claudeReachability" ? readClaudeBrowser().catch(() => null) : Promise.resolve(null),
+    (!signalId || signalId === 'emojiStyle') && getSignalConfig('emojiStyle')?.enabled !== false
+      ? emojiStylePlugin.run({ region, locale, text, config: detectionConfig, browser: snapshot }) : Promise.resolve([]),
   ]);
 
   const base = collectBrowserSignals(region, text, detectionConfig, snapshot, { webrtc, signalId }).signals;
@@ -45,6 +48,7 @@ export async function runBrowserScan(region: RegionCode, locale: LocaleCode, tex
     }
   }
   const byId = new Map(base.map((signal) => [signal.id, signal]));
+  for (const signal of emoji) byId.set(signal.id, signal);
   const label = text.signalLabels;
   const value = text.signalValues;
   const countries = ipIntel?.countries ?? [];

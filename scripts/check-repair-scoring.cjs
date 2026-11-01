@@ -48,10 +48,10 @@ global.document = {createElement:()=>({getContext:()=>({font:'',measureText(){co
 const browser = {languages:['zh-CN','en'],timezone:'Asia/Shanghai',locale:'zh-CN',userAgent:'Mozilla/5.0 Windows NT 10.0 Chrome/130',platform:'Win32',brands:'Chromium'};
 Object.defineProperty(global,'navigator',{configurable:true,value:{...browser, language:'zh-CN', userAgentData:{brands:[{brand:'Chromium',version:'130'}],platform:'Windows'}}});
 const sample = collectBrowserSignals('cn',text,undefined,browser).signals;
-// 50-signal报告权重：26+5+12+16+4+3+2=68（vendorFonts 在报告里权重为 0）。
-assert.equal(sample.reduce((sum,item)=>sum+item.contribution,0),68,'Browser-only fixture must match the 50-signal report weights');
+// 50-signal报告权重：26+5+12+16+4+3=66（vendorFonts 在报告里权重为 0；Emoji 实测仅供参考）。
+assert.equal(sample.reduce((sum,item)=>sum+item.contribution,0),66,'Browser-only fixture must match the 50-signal report weights');
 const contributions = Object.fromEntries(sample.map(item=>[item.id,item.contribution]));
-for(const id of ['timezone','language','languageVariant','chineseFonts','vendorFonts','domesticBrowser','domesticDevice','locale','timezoneOffset','emojiStyle']) {
+for(const id of ['timezone','language','languageVariant','chineseFonts','vendorFonts','domesticBrowser','domesticDevice','locale','timezoneOffset']) {
  const choices = repairChoices({id,value:'fixture',contribution:contributions[id]});
  assert.ok(choices.length>1,id+' has options');
  assert.ok(choices.every((option,index)=>index===0||choices[index-1].contribution<=option.contribution),id+' sorted ascending');
@@ -59,11 +59,11 @@ for(const id of ['timezone','language','languageVariant','chineseFonts','vendorF
 }
 const source = {id:'timezone',value:'Asia/Shanghai',contribution:26};
 const target = repairChoices(source).find(item=>item.value==='Asia/Tokyo');
-assert.equal(previewTotal(sample,target),39,'Timezone preview must update both timezone and UTC offset');
+assert.equal(previewTotal(sample,target),37,'Timezone preview must update both timezone and UTC offset');
 assert.equal(source.contribution,26,'Preview must not modify measured signal');
-assert.equal(previewTotal(sample,repairChoices({id:'language',value:'zh-CN, en',contribution:5}).find(item=>item.value==='en-US')),51,'Language preview includes languageVariant');
+assert.equal(previewTotal(sample,repairChoices({id:'language',value:'zh-CN, en',contribution:5}).find(item=>item.value==='en-US')),49,'Language preview includes languageVariant');
 assert.equal(repairChoices({id:'timezone',value:'Asia/Shanghai',contribution:26}).find(item=>item.value==='Asia/Hong_Kong').contribution,26,'HK Windows mapping cannot claim 16 if it applies China Standard Time');
-assert.ok(repairChoices({id:'emojiStyle',value:'Windows Emoji 风格',contribution:2}).every(item=>item.contribution>0),'Do not invent zero-point Windows emoji fixes');
+assert.deepEqual(repairChoices({id:'emojiStyle',value:'Windows Emoji 风格',contribution:2}),[],'Measured emoji evidence has no pretend OS repair options');
 assert.equal(previewTotal([{id:'a',contribution:80},{id:'b',contribution:80}],{impacts:{a:0}}),80,'Compute from unclamped contributions before capping');
 // Exit-region priority: a Seoul exit must offer Seoul first for every repairable signal.
 const seoulGeo = {ip:'1.2.3.4',countryCode:'KR',countryName:'韩国',city:'首尔',cityRaw:'Seoul',regionName:'Seoul',timezone:'Asia/Seoul',asn:'AS1234',org:'Example',source:'test'};

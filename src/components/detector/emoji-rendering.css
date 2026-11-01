@@ -1,0 +1,7 @@
+.emoji-rendering { margin: 16px 0; color: var(--repair-text, var(--foreground)); font-size: 14px; overflow-wrap: anywhere; }
+.emoji-rendering h3 { margin: 16px 0 8px; font-size: 14px; font-weight: 700; }
+.emoji-rendering p { margin: 8px 0; }
+.emoji-rendering__samples { display: grid; grid-template-columns: repeat(auto-fit, minmax(128px, 1fr)); gap: 12px; padding: 0; list-style: none; }
+.emoji-rendering__samples li { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.emoji-rendering__samples img { display: block; max-width: 100%; height: auto; }
+.emoji-rendering__samples small { color: var(--repair-muted); font-size: 14px; }

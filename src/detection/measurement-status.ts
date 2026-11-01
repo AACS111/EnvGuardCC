@@ -2,11 +2,11 @@ import { signalPolicy } from './signal-policy';
 import type { SignalResult } from './types';
 
 export function measurementContribution(sample?: SignalResult) {
-  return sample?.assessment !== 'not_applicable' && Number.isFinite(sample?.contribution) ? Math.max(0, sample!.contribution) : 0;
+  return sample && !sample.unscored && !signalPolicy(sample.id).informational && sample.assessment !== 'not_applicable' && Number.isFinite(sample.contribution) ? Math.max(0, sample.contribution) : 0;
 }
 
 export function measurementAbnormal(sample?: SignalResult) {
-  return Boolean(sample && sample.assessment !== 'not_applicable' && (measurementContribution(sample) > 0 || sample.assessment === 'error'));
+  return Boolean(sample && !signalPolicy(sample.id).informational && sample.assessment !== 'not_applicable' && (measurementContribution(sample) > 0 || sample.assessment === 'error'));
 }
 
 export function measurementPoints(id: string, browser?: SignalResult, claude?: SignalResult) {

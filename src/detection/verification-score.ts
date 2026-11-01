@@ -8,11 +8,11 @@ import type { SignalResult } from './types';
 export const verificationWeights: Readonly<Record<string, number>> = {
   timezone: 26, language: 20, languageVariant: 12, chineseFonts: 16,
   vendorFonts: 10, domesticBrowser: 8, domesticDevice: 6, locale: 6,
-  timezoneOffset: 4, emojiStyle: 4, country: 20,
+  timezoneOffset: 4, emojiStyle: 0, country: 20,
 };
 export function verificationWeight(id: string) {
   const config = detectionConfig.signals[id];
-  if (!config?.enabled) return 0;
+  if (!config?.enabled || config.informational) return 0;
   return verificationWeights[id] ?? (config.weight > 0 ? config.weight : 1);
 }
 
@@ -24,13 +24,14 @@ export function verificationSampleStatus(sample?: SignalResult & { state?: strin
 }
 export function verificationPassed(sample?: SignalResult) { return verificationSampleStatus(sample) === 'passed'; }
 export function verificationPoint(sample?: SignalResult, id = sample?.id): number | null {
-  if (sample?.unscored) return null;
+  if (sample?.unscored || id && signalPolicy(id).informational) return null;
   const status = verificationSampleStatus(sample);
   const weight = id ? verificationWeight(id) : 0;
   return status === 'passed' ? weight : status === 'failed' ? 0 : status === 'pending' && id ? weight / 2 : null;
 }
 export function verificationLabel(sample: (SignalResult & { state?: string }) | undefined, zh: boolean, id = sample?.id) {
   const status = verificationSampleStatus(sample);
+  if (id && signalPolicy(id).informational && status !== 'not_applicable') return !sample?.testedAt ? (zh ? '未测试 · 不计分' : 'Untested · not scored') : status === 'passed' ? (zh ? '已采样 · 仅供参考' : 'Sampled · informational') : (zh ? '无法判定 · 不计分' : 'Inconclusive · not scored');
   if (status === 'passed') {
     const points = verificationWeight(sample!.id);
     return points > 0 ? (zh ? '通过 +' + points : 'Passed +' + points) : (zh ? '通过 · 不计分' : 'Passed · informational');
@@ -51,6 +52,7 @@ export function verificationItem(id: string, browser?: SignalResult, claude?: Si
   const { scope } = signalPolicy(id);
   const samples = scope === 'browser' ? [browser] : scope === 'claude' ? [claude] : [browser, claude];
   if (samples.every(sample => sample?.assessment === 'not_applicable')) return 'not_applicable';
+  if (signalPolicy(id).informational) return 'informational';
   const states = samples.filter(sample => sample?.assessment !== 'not_applicable').map(verificationSampleStatus);
   if (states.some(status => status === 'failed')) return 'failed';
   if (states.some(status => status === 'pending')) return 'pending';
@@ -62,6 +64,7 @@ export function verificationScores(browser: SignalResult[] | null, claude: Signa
     let passed = 0, possible = 0, pending = 0, failed = 0, earned = 0, maximum = 0, provisional = 0;
     for (const [id] of entries) {
       const { scope } = signalPolicy(id);
+      if (signalPolicy(id).informational) continue;
       if (side !== 'combined' && scope !== 'both' && scope !== side) continue;
       const left = browser?.find(sample => sample.id === id), right = claude?.find(sample => sample.id === id);
       const samples = [

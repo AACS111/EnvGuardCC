@@ -10,7 +10,6 @@ export const variantScore = (values: string[]) => values.some((value) => /zh/i.t
 export const fontScore = (simplified: number, traditional: number) => simplified ? Math.min(1, 0.75 + 0.08 * simplified) : traditional ? 0.5 : 0;
 export const vendorFontScore = (count: number) => count >= 2 ? 1 : count === 1 ? 0.8 : 0;
 export const deviceScore = (value: string | null) => value === "harmonyos" ? 1 : value ? 0.7 : 0;
-export const emojiScore = (ua: string) => /android|harmonyos|windows/i.test(ua) ? 1 : /iphone|ipad|mac os/i.test(ua) ? 0.5 : 0;
 export const offsetScore = (offset: number) => offset === 8 ? 1 : 0;
 // WebRTC 泄漏：暴露任意公网候选地址即整项命中；HTTPS 下 mDNS 隐藏不会产生泄漏。
 export const webrtcLeakScore = (count: number) => count > 0 ? 1 : 0;
