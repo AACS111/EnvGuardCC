@@ -23,7 +23,6 @@ export function resolveNpmCli({
   const candidates = [];
   if (npmExecPath && /^npm(?:-cli)?(?:\.[cm]?js)?$/i.test(path.basename(npmExecPath))) candidates.push(npmExecPath);
   candidates.push(
-    path.join(nodeDir, "npm"),
     path.join(nodeDir, "node_modules", "npm", "bin", "npm-cli.js"),
     path.join(nodeDir, "..", "lib", "node_modules", "npm", "bin", "npm-cli.js"),
     path.join(nodeDir, "..", "libexec", "lib", "node_modules", "npm", "bin", "npm-cli.js"),
@@ -38,6 +37,7 @@ export function resolveNpmCli({
     if (parent === directory) break;
     directory = parent;
   }
+  candidates.push(path.join(nodeDir, "npm"));
   const found = candidates.find(candidate => candidate && exists(candidate));
   if (found) return found;
   throw new Error("未找到 npm，无法安装 Electron。请先安装 npm，或使用 npm run dev:electron 启动。");

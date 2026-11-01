@@ -46,7 +46,7 @@ test('Mac FlClash 读取系统偏好的精确配置 ID，控制端口必须本�
     return { stdout: `{"currentProfileId":${id}}` };
   } });
   assert.equal(profile, path.join(dir, 'profiles', `${id}.yaml`));
-  assert.equal(flclashDirectory({ platform: 'darwin', env: {}, home: '/test-user' }), '/test-user/Library/Application Support/com.follow.clash');
+  assert.equal(flclashDirectory({ platform: 'darwin', env: {}, home: '/test-user' }), path.join('/test-user', 'Library', 'Application Support', 'com.follow.clash'));
   await writeFile(path.join(dir, 'config.yaml'), 'external-controller: 0.0.0.0:9090\nsecret: local-test-only');
   await assert.rejects(flclashController(dir), /本机/);
   await writeFile(path.join(dir, 'config.yaml'), 'external-controller: 127.0.0.1:9090');
@@ -58,7 +58,7 @@ test('Mac 普通打开不修改用户资料或注入代理，也不声明托管�
   t.after(() => rm(state, { recursive: true, force: true }));
   let opened = false;
   const launcher = new DesktopLauncher({ stateDir: state, platform: 'darwin', findExecutable: async () => '/Applications/Claude.app/Contents/MacOS/Claude', openApplication: async (file, args) => {
-    assert.equal(file, '/usr/bin/open'); assert.deepEqual(args, ['-a', '/Applications/Claude.app']); opened = true;
+    assert.equal(file, '/usr/bin/open'); assert.deepEqual(args, ['-a', path.normalize('/Applications/Claude.app')]); opened = true;
   }, resolveProxy: () => { throw new Error('ordinary launch must not inject a proxy'); } });
   const result = await launcher.launch({ locale: 'ja-JP' });
   assert.equal(opened, true); assert.equal(result.state, 'opened'); assert.equal(result.mode, 'standard'); assert.equal(result.pid, null); assert.equal(result.gateway, null);

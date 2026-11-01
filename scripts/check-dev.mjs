@@ -74,7 +74,15 @@ test("Electron 安装优先使用 npm_execpath，缺少 npm 时给出可操作�
 
 
 test('pnpm 启动时安装 Electron 使用真正的 npm CLI', () => {
-  const npmCli = '/runtime/node_modules/npm/bin/npm-cli.js';
-  const pnpmCli = '/tools/pnpm/bin/pnpm.cjs';
-  assert.equal(resolveNpmCli({ execPath: '/runtime/node', npmExecPath: pnpmCli, env: {}, exists: file => [npmCli, pnpmCli].includes(file) }), npmCli);
+  const npmCli = path.join(path.parse(process.cwd()).root, 'runtime', 'node_modules', 'npm', 'bin', 'npm-cli.js');
+  const pnpmCli = path.join(path.parse(process.cwd()).root, 'tools', 'pnpm', 'bin', 'pnpm.cjs');
+  assert.equal(resolveNpmCli({ execPath: path.join(path.parse(process.cwd()).root, 'runtime', 'node'), npmExecPath: pnpmCli, env: {}, exists: file => [npmCli, pnpmCli].includes(file) }), npmCli);
+});
+
+
+test('优先使用 npm 的 JavaScript CLI，避免把 Windows shell 包装脚本交给 Node', () => {
+  const directory = path.join(path.parse(process.cwd()).root, 'runtime');
+  const cli = path.join(directory, 'node_modules', 'npm', 'bin', 'npm-cli.js');
+  const wrapper = path.join(directory, 'npm');
+  assert.equal(resolveNpmCli({ execPath: path.join(directory, 'node'), npmExecPath: '', env: {}, exists: file => [cli, wrapper].includes(file) }), cli);
 });
