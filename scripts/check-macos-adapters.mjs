@@ -4,7 +4,7 @@ import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { parseMacProxy, systemProxy, systemProxyStatus, validateProxySettings } from './gateway-proxy.mjs';
-import { readSystemTimezone, setSystemTimezone, validIanaTimezone } from './system-timezone.mjs';
+import { readSystemTimezone, readAutomaticTimezone, setSystemTimezone, validIanaTimezone } from './system-timezone.mjs';
 import { flclashDirectory, currentFlclashProfile, flclashController } from './flclash-runtime.mjs';
 import { DesktopLauncher } from './desktop-launcher.mjs';
 
@@ -28,7 +28,7 @@ test('Mac 时区读取无提权，写入仅执行固定命令；取消和复核�
   assert.equal(validIanaTimezone('Asia/Shanghai;touch /tmp/bad'), false);
   let calls = 0;
   const run = async (file, args) => { calls++; assert.equal(file, '/usr/bin/osascript'); assert.equal(args.at(-1), 'Asia/Tokyo'); assert.match(args[1], /quoted form of/); return { stdout: '' }; };
-  assert.equal(await setSystemTimezone('Asia/Tokyo', { platform: 'darwin', checkZone: async () => {}, run, read: async () => 'Asia/Tokyo' }), 'Asia/Tokyo');
+  assert.equal(await setSystemTimezone('Asia/Tokyo', { platform: 'darwin', checkZone: async () => {}, run, readAutomatic: async () => false, read: async () => 'Asia/Tokyo' }), 'Asia/Tokyo');
   await assert.rejects(setSystemTimezone('Asia/Tokyo', { platform: 'darwin', checkZone: async () => {}, run, read: async () => 'Asia/Shanghai' }), /复核/);
   await assert.rejects(setSystemTimezone('Asia/Tokyo', { platform: 'darwin', checkZone: async () => {}, run: async () => { throw new Error('User canceled (-128)'); } }), /取消/);
   await assert.rejects(setSystemTimezone('../bad', { platform: 'darwin', run }), /无效/);
@@ -72,4 +72,32 @@ test('macOS 切换时区时短暂缺失的文件会等待回读，不丢失原�
     return '/var/db/timezone/zoneinfo/Asia/Shanghai';
   } });
   assert.equal(zone, 'Asia/Shanghai'); assert.equal(reads, 2);
+});
+
+
+test('macOS 写入前关闭自动时区；恢复时重新启用原始开关且不关闭网络校时', async () => {
+  for (const automaticTimezone of [false, true]) {
+    let script;
+    await setSystemTimezone('Asia/Seoul', {
+      platform: 'darwin', automaticTimezone,
+      checkZone: async () => {},
+      run: async (_file, args) => { script = args[1]; return { stdout: '' }; },
+      read: async () => 'Asia/Seoul', readAutomatic: async () => automaticTimezone,
+    });
+    assert.match(script, /Active -bool false && \/usr\/sbin\/systemsetup -settimezone/);
+    assert.equal(script.includes('Active -bool true'), automaticTimezone);
+    assert.doesNotMatch(script, /setusingnetworktime|locationd|killall/);
+  }
+  await assert.rejects(setSystemTimezone('Asia/Seoul', {
+    platform: 'darwin', checkZone: async () => {}, run: async () => ({ stdout: '' }),
+    read: async () => 'Asia/Seoul', readAutomatic: async () => true,
+  }), /自动时区开关复核/);
+});
+
+test('自动时区开关读取失败时不猜测关闭状态', async () => {
+  for (const [stdout, expected] of [['1', true], ['0', false]]) {
+    assert.equal(await readAutomaticTimezone({ run: async () => ({ stdout }) }), expected);
+  }
+  await assert.rejects(readAutomaticTimezone({ run: async () => ({ stdout: '' }) }), /无法读取/);
+  await assert.rejects(readAutomaticTimezone({ run: async () => { throw new Error('permission denied'); } }), /permission/);
 });

@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 import { createProtectionService } from "./protection-service.mjs";
 import { EnvironmentRuntime } from "./environment-runtime.mjs";
 import { BrowserCloakController } from "./browser-cloak.mjs";
-import { readSystemTimezone, setSystemTimezone, validIanaTimezone, sameTimezone, timezoneSupported } from "./system-timezone.mjs";
+import { readSystemTimezone, readAutomaticTimezone, setSystemTimezone, validIanaTimezone, sameTimezone, timezoneSupported } from "./system-timezone.mjs";
 import { findBrowser, findDesktop } from "./application-paths.mjs";
 import { proxyStatus, proxySettingsFile, validateProxySettings } from "./gateway-proxy.mjs";
 import { DesktopLauncher } from "./desktop-launcher.mjs";
@@ -68,7 +68,14 @@ const environmentRuntime = new EnvironmentRuntime({ stateDir });
 const browserCloak = new BrowserCloakController(environmentRuntime, { gatewayUrl: process.env.CHECKCC_GATEWAY_URL || "http://127.0.0.1:3010", acquire: () => { if (changing || protectionChanging || closing) return false; changing = true; return true; }, release: () => { changing = false; } });
 
 const currentZone = () => readSystemTimezone();
-const setZone = zone => setSystemTimezone(zone);
+const setZone = async zone => {
+  if (process.platform === "darwin") {
+    const current = await currentZone();
+    if (sameTimezone(current, zone) && !await readAutomaticTimezone()) return current;
+    if (!await readBackup()) await saveBackup(current);
+  }
+  return setSystemTimezone(zone);
+};
 async function capabilities() {
   const exists = async find => { try { await find(); return true; } catch { return false; } };
   return {
@@ -85,18 +92,25 @@ async function readBackup() {
     const value = JSON.parse(await readFile(backupFile, "utf8"));
     if (value.platform && value.platform !== process.platform || !value.platform && process.platform !== "win32") throw new Error("时区备份来自其他平台，请保留原文件并手动核对。");
     if (typeof value.timezone !== "string" || !value.timezone || value.timezone.length >= 128) throw new Error("原始时区备份格式无效，已保留原文件。");
+    if (value.automaticTimezone !== undefined && typeof value.automaticTimezone !== "boolean") throw new Error("自动时区备份格式无效，已保留原文件。");
     return value;
   } catch (error) { if (error.code === "ENOENT") return null; throw error; }
 }
 async function restoreSavedTimezone() {
   const backup = await readBackup();
   if (!backup) return;
-  if (!sameTimezone(await currentZone(), backup.timezone)) await setZone(backup.timezone);
+  if (process.platform === "darwin") {
+    // Legacy backups contain no automatic setting: retain its current value.
+    const automaticTimezone = backup.automaticTimezone ?? await readAutomaticTimezone();
+    if (!sameTimezone(await currentZone(), backup.timezone) || await readAutomaticTimezone() !== automaticTimezone) {
+      await setSystemTimezone(backup.timezone, { automaticTimezone });
+    }
+  } else if (!sameTimezone(await currentZone(), backup.timezone)) await setZone(backup.timezone);
   await rm(backupFile, { force: true });
 }
 async function saveBackup(timezone) {
   await mkdir(stateDir, { recursive: true });
-  await writeFile(backupFile + ".tmp", JSON.stringify({ timezone, platform: process.platform, savedAt: new Date().toISOString() }), { mode: 0o600 });
+  await writeFile(backupFile + ".tmp", JSON.stringify({ timezone, platform: process.platform, ...(process.platform === "darwin" ? { automaticTimezone: await readAutomaticTimezone() } : {}), savedAt: new Date().toISOString() }), { mode: 0o600 });
   await rename(backupFile + ".tmp", backupFile);
 }
 function authenticated(value) {
@@ -350,7 +364,9 @@ const server = http.createServer(async (req, res) => {
     }
     // Pass timezone as data, never interpolate a browser value into PowerShell code.
     const before = await currentZone();
-    if (!sameTimezone(before, target)) {
+    if (restoring && process.platform === "darwin") {
+      await restoreSavedTimezone();
+    } else if (!sameTimezone(before, target) || !restoring && process.platform === "darwin" && await readAutomaticTimezone()) {
       if (!restoring && !await readBackup()) await saveBackup(before);
       await setZone(target);
     }

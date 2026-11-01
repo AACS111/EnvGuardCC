@@ -31,15 +31,26 @@ export async function readSystemTimezone({ platform = process.platform, run = ex
   return zone;
 }
 
-export async function setSystemTimezone(zone, { platform = process.platform, run = exec, read = readSystemTimezone, checkZone = zone => access('/var/db/timezone/zoneinfo/' + zone) } = {}) {
+export async function readAutomaticTimezone({ run = exec } = {}) {
+  const { stdout } = await run('/usr/bin/defaults', ['read', '/Library/Preferences/com.apple.timezone.auto', 'Active'], { timeout: 5000, maxBuffer: 4096 });
+  const value = stdout.trim().toLowerCase();
+  if (['1', 'true', 'yes'].includes(value)) return true;
+  if (['0', 'false', 'no'].includes(value)) return false;
+  throw new Error('无法读取 macOS 自动时区设置，未修改系统配置。');
+}
+
+export async function setSystemTimezone(zone, { automaticTimezone = false, readAutomatic = readAutomaticTimezone, platform = process.platform, run = exec, read = readSystemTimezone, checkZone = zone => access('/var/db/timezone/zoneinfo/' + zone) } = {}) {
   if (platform === 'win32') {
     if (typeof zone !== 'string' || zone.length > 128 || /[\r\n\0]/.test(zone)) throw new Error('无效的 Windows 时区。');
     await run(windowsSystemExecutable('tzutil.exe'), ['/s', zone], { windowsHide: true, timeout: 15000 });
   } else if (platform === 'darwin') {
     if (!validIanaTimezone(zone)) throw new Error('无效的 IANA 系统时区。');
     try { await checkZone(zone); } catch { throw new Error('本机未安装该系统时区，未执行修改。'); }
-    // Only a fixed command is privileged. The requested zone is passed as data and shell-quoted by AppleScript.
-    const script = 'on run argv\n do shell script "/usr/sbin/systemsetup -settimezone " & quoted form of (item 1 of argv) with administrator privileges\nend run';
+    if (typeof automaticTimezone !== 'boolean') throw new Error('无效的自动时区设置。');
+    // Disable location-based timezone selection, not network clock synchronization.
+    // Every privileged command is fixed; the IANA zone remains shell-quoted data.
+    const restoreAutomatic = automaticTimezone ? ' && /usr/bin/defaults write /Library/Preferences/com.apple.timezone.auto Active -bool true' : '';
+    const script = 'on run argv\n do shell script "/usr/bin/defaults write /Library/Preferences/com.apple.timezone.auto Active -bool false && /usr/sbin/systemsetup -settimezone " & quoted form of (item 1 of argv) & "' + restoreAutomatic + '" with administrator privileges\nend run';
     try { await run('/usr/bin/osascript', ['-e', script, zone], { timeout: 110000, maxBuffer: 4096 }); }
     catch (error) {
       if (/-128|canceled|cancelled|用户取消/i.test(error.stderr || error.message)) throw new Error('已取消系统授权，时区未确认修改；原始备份已保留。');
@@ -53,5 +64,6 @@ export async function setSystemTimezone(zone, { platform = process.platform, run
     if (platform === 'darwin') await delay(100);
   }
   if (platform === 'darwin' ? !sameTimezone(actual, zone) : actual !== zone) throw new Error('系统时区复核未通过，可能被自动时区覆盖；原始备份已保留。');
+  if (platform === 'darwin' && await readAutomatic({ run }) !== automaticTimezone) throw new Error('自动时区开关复核未通过，原始备份已保留。');
   return actual;
 }

@@ -1,5 +1,6 @@
 import { readFile, writeFile, mkdir, rm } from 'node:fs/promises';
 import path from 'node:path';
+import { sameTimezone, timezoneSupported } from './system-timezone.mjs';
 import { ProtectionSession } from './protection-session.mjs';
 import { collectNetworkDiagnostics } from './gateway-diagnostics.mjs';
 const regions = JSON.parse(await readFile(new URL('../src/detection/region-data.json', import.meta.url), 'utf8'));
@@ -27,7 +28,7 @@ export function targetFromExit(exit) {
   return { ip: geo.ip, countryCode: geo.countryCode, countryName: FALLBACK_COUNTRY_NAMES[geo.countryCode] ?? geo.countryCode, city: geo.city, timezone, windowsTimezone: WINDOWS_ZONES[timezone] ?? null, language, locale: language };
 }
 
-export function createProtectionService({ stateDir, runtime, browserCloak, currentZone, setZone, restoreTimezone, canTest, gatewayRequest = gateway }) {
+export function createProtectionService({ stateDir, runtime, browserCloak, currentZone, setZone, restoreTimezone, canTest, platform = process.platform, gatewayRequest = gateway }) {
   const profileFile = path.join(stateDir, 'region-profile.json');
   const timezoneBackup = path.join(stateDir, 'timezone-backup.json');
   const policyFile = path.join(stateDir, 'environment-policy.json');
@@ -40,16 +41,20 @@ export function createProtectionService({ stateDir, runtime, browserCloak, curre
     snapshot: async () => {
       await runtime.load();
       const status = await gateway('/__checkcc/status');
-      return { timezone: process.platform === 'win32' ? await currentZone() : null, timezoneBackup: await optionalFile(timezoneBackup), profile: await optionalFile(profileFile), policyFile: await optionalFile(policyFile), gatewayEnabled: status.cloak.enabled, policy: structuredClone(runtime.policy), runtimeEnabled: runtime.enabled };
+      return { timezone: timezoneSupported(platform) ? await currentZone() : null, timezoneBackup: await optionalFile(timezoneBackup), profile: await optionalFile(profileFile), policyFile: await optionalFile(policyFile), gatewayEnabled: status.cloak.enabled, policy: structuredClone(runtime.policy), runtimeEnabled: runtime.enabled };
     },
     apply: async (target, origin) => {
       const issues = [];
       await gateway('/__checkcc/cloak', { enabled: true, target }, origin);
-      if (process.platform === 'win32') {
-        if (!target.windowsTimezone) issues.push('当前地区暂无系统时区映射，需手动处理。');
-        else try { if (await currentZone() !== target.windowsTimezone) await setZone(target.windowsTimezone); }
-        catch (error) { issues.push('系统时区适配失败：' + error.message); }
-      } // macOS system timezone is changed only by the explicit timezone operation.
+      if (timezoneSupported(platform)) {
+        const zone = platform === 'win32' ? target.windowsTimezone : target.timezone;
+        if (!zone) issues.push('当前地区暂无系统时区映射，需手动处理。');
+        else try {
+          // macOS must also disable automatic timezone selection, even if its
+          // current zone already matches. setZone durably saves the original first.
+          if (platform === 'darwin' || await currentZone() !== zone) await setZone(zone);
+        } catch (error) { issues.push('系统时区适配失败：' + error.message); }
+      }
       const report = await browserCloak.sync(origin, { launch: false, force: true });
       browserIssues = browserErrors(report);
       issues.push(...browserIssues);
@@ -76,7 +81,7 @@ export function createProtectionService({ stateDir, runtime, browserCloak, curre
       await attempt('浏览器配置文件恢复', () => saveFile(policyFile, Object.hasOwn(baseline, 'policyFile') ? baseline.policyFile : JSON.stringify(baseline.policy)));
       await attempt('系统时区恢复', async () => {
         if (restoreTimezone) { await restoreTimezone(); return; }
-        if (baseline.timezone && await currentZone() !== baseline.timezone) await setZone(baseline.timezone);
+        if (baseline.timezone && !sameTimezone(await currentZone(), baseline.timezone)) await setZone(baseline.timezone);
         await saveFile(timezoneBackup, baseline.timezoneBackup);
       });
       await attempt('网关配置恢复', async () => {
