@@ -1,0 +1,4 @@
+[[permission]]
+identifier = "allow-desktop-call"
+description = "Fixed desktop operations for the main loopback window."
+commands.allow = ["desktop_call", "smoke_result"]

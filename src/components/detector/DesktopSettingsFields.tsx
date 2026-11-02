@@ -1,6 +1,7 @@
 "use client";
 import { useEffect, useState } from 'react';
 import type { LocaleCode } from '@/i18n/messages';
+import { observeDesktopSettings } from '@/detection/desktop-connection';
 
 type Settings = { openAtLogin: boolean; autoStartProtection: boolean; canOpenAtLogin: boolean; loginStatus: string | null };
 type ResetResult = { cancelled?: boolean; complete?: boolean; cleared?: string[]; message?: string; error?: string };
@@ -26,9 +27,10 @@ export function DesktopSettingsFields({ locale, protectionEnabled = false }: { l
     finally { setResetting(false); }
   };
   useEffect(() => {
-    let alive = true;
-    window.envGuardDesktop?.getSettings().then(value => { if (alive) setSettings(value); }).catch(failure => { if (alive) setError(failure.message); });
-    return () => { alive = false; };
+    return observeDesktopSettings<Settings>({ target: window,
+      onSettings: value => { setSettings(value); setError(''); },
+      onError: setError,
+    });
   }, []);
   const update = async (key: 'openAtLogin' | 'autoStartProtection', value: boolean) => {
     if (saving || !window.envGuardDesktop) return;

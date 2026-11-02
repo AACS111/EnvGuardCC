@@ -1,94 +1,44 @@
-import { access, mkdir, readFile, rm, cp, mkdtemp, symlink, writeFile, rename } from 'node:fs/promises';
-import { spawn } from 'node:child_process';
-import { createRequire } from 'node:module';
+import { access, mkdir, readFile, rm, cp, mkdtemp, symlink, writeFile, rename, readdir } from 'node:fs/promises';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
-import { resolveNpmCli } from './dev-electron.mjs';
+import { projectRoot as root, run, tauriCli, buildEnvironment } from './tauri-tools.mjs';
 
-const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const output = path.join(root, 'node_modules', '.checkcc-dist');
-const run = (command, args, options = {}) => new Promise((resolve, reject) => {
-  const child = spawn(command, args, { cwd: root, windowsHide: true, stdio: 'inherit', ...options });
-  child.once('error', reject); child.once('exit', code => code === 0 ? resolve() : reject(new Error(`Build step failed: ${code}`)));
-});
-
-if (process.platform === 'darwin' && process.arch === 'arm64') {
-  const app = path.join(output, 'EnvGuardCC-darwin-arm64', 'EnvGuardCC.app');
-  await access(path.join(app, 'Contents', 'Info.plist'));
-  const version = JSON.parse(await readFile(path.join(root, 'package.json'), 'utf8')).version;
-  const dmg = path.join(output, `EnvGuardCC-${version}-arm64.dmg`);
-  const staging = await mkdtemp(path.join(output, '.mac-installer-'));
-  const pending = path.join(staging, 'EnvGuardCC.pending.dmg');
+const output = path.join(root, 'node_modules/.checkcc-dist');
+const version = JSON.parse(await readFile(path.join(root, 'package.json'), 'utf8')).version;
+const isMac = process.platform === 'darwin' && process.arch === 'arm64';
+const platformName = isMac ? 'macOS-arm64' : 'Windows-x64';
+const build = JSON.parse(await readFile(path.join(output, `tauri-build-${platformName}.json`), 'utf8'));
+if (build.version !== version) throw new Error('应用版本已变化，请重新执行 desktop:package。');
+if (isMac) {
+  const app = path.join(output, 'EnvGuardCC-tauri-darwin-arm64/EnvGuardCC.app');
+  await access(path.join(app, 'Contents/Info.plist'));
+  const temporary = await mkdtemp(path.join(output, '.mac-installer-'));
+  const pending = path.join(temporary, 'EnvGuardCC.pending.dmg');
   try {
-    const contents = path.join(staging, 'contents');
+    const contents = path.join(temporary, 'contents');
     await mkdir(contents);
     await cp(app, path.join(contents, 'EnvGuardCC.app'), { recursive: true, verbatimSymlinks: true });
     await symlink('/Applications', path.join(contents, 'Applications'));
-    await writeFile(path.join(contents, '安装说明 - 拖入 Applications 安装.txt'), [
-      'EnvGuardCC 安装说明', '',
-      '1. 若旧版正在运行，请从托盘或应用菜单选择退出，等待配置恢复完成。',
-      '2. 将本窗口中的 EnvGuardCC 拖入旁边的 Applications（应用程序）文件夹。',
-      '3. 如提示替换旧版本，请选择替换。',
-      '4. 从“应用程序”打开 EnvGuardCC，然后推出此磁盘映像。', '',
-      '双击 DMG 只是打开磁盘映像；直接运行映像中的应用不会将其安装到应用程序。', '',
-      'Installation', '',
-      'Quit any running copy of EnvGuardCC and wait for configuration restoration.',
-      'Drag EnvGuardCC into the Applications folder beside it. Replace an older copy if prompted.',
-      'Launch EnvGuardCC from Applications, then eject this disk image.',
-      'Opening the DMG or running the app inside it does not install the app.', '',
-    ].join('\n'));
+    await writeFile(path.join(contents, '安装说明 - 拖入 Applications 安装.txt'), '请先从托盘退出旧版并等待配置恢复。\n将 EnvGuardCC 拖入 Applications，替换旧版后从应用程序启动。\nQuit the old app and wait for restoration. Drag EnvGuardCC into Applications, replace the old copy, then launch from Applications.\n');
     await run('hdiutil', ['create', '-volname', 'EnvGuardCC', '-srcfolder', contents, '-ov', '-format', 'UDZO', pending]);
     await run('hdiutil', ['verify', pending]);
-    // Keep the previous installer intact until the replacement is verified.
-    await rename(pending, dmg);
-  } finally { await rm(staging, { recursive: true, force: true }); }
-  console.log(`macOS disk image: ${dmg}`);
-  process.exit(0);
+    const destination = path.join(output, `EnvGuardCC-${version}-arm64.dmg`);
+    await rename(pending, destination);
+    console.log('macOS 安装包：' + destination);
+  } finally { if (path.dirname(temporary) === output) await rm(temporary, { recursive: true, force: true }); }
+} else {
+  if (process.platform !== 'win32' || process.arch !== 'x64') throw new Error('安装包需要 Windows x64 或 macOS arm64。');
+  // The NSIS bundler consumes the compiled executable, not the optional portable copy.
+  await access(path.join(root, 'src-tauri/target/release/EnvGuardCC.exe'));
+  const temporary = path.join(root, 'node_modules/.tauri-tools/tmp');
+  await mkdir(temporary, { recursive: true });
+  // Keep NSIS extraction and tool cache on the target drive (Windows rename is not cross-volume).
+  await run(process.execPath, [tauriCli(), 'bundle', '--bundles', 'nsis', '--config', JSON.stringify({ bundle: { useLocalToolsDir: true } })], { env: buildEnvironment({ TEMP: temporary, TMP: temporary }) });
+  const directory = path.join(root, 'src-tauri/target/release/bundle/nsis');
+  const names = (await readdir(directory)).filter(name => name.endsWith('.exe') && name.includes(version));
+  if (names.length !== 1) throw new Error('NSIS 安装包缺失或不唯一。');
+  const destination = path.join(output, `EnvGuardCC-Setup-${version}.exe`);
+  const pending = destination + '.pending';
+  await cp(path.join(directory, names[0]), pending);
+  await rename(pending, destination);
+  console.log('Windows 安装包：' + destination);
 }
-if (process.platform !== 'win32' || process.arch !== 'x64') throw new Error('安装包需要 macOS arm64 或 Windows x64 Node。');
-const application = path.join(output, 'EnvGuardCC-win32-x64');
-await access(path.join(application, 'EnvGuardCC.exe'));
-const toolsDir = path.join(root, 'node_modules', '.envguardcc-installer-build');
-await mkdir(toolsDir, { recursive: true });
-const require = createRequire(path.join(toolsDir, 'package.json'));
-try { require.resolve('electron-builder'); }
-catch (error) {
-  if (error.code !== 'MODULE_NOT_FOUND') throw error;
-  const npmCli = resolveNpmCli();
-  await new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, [npmCli, 'install', '--prefix', toolsDir, '--save-exact', '--no-audit', '--no-fund', 'electron-builder@26.0.12'], {
-      cwd: root, windowsHide: true, stdio: 'inherit',
-    });
-    child.once('error', reject);
-    child.once('exit', code => code === 0 ? resolve() : reject(new Error(`安装打包工具失败：${code}`)));
-  });
-}
-
-const { build, Platform, Arch } = require('electron-builder');
-const manifest = JSON.parse(await readFile(path.join(root, 'package.json'), 'utf8'));
-const electron = JSON.parse(await readFile(path.join(root, 'node_modules', '.checkcc-desktop-build', 'node_modules', 'electron', 'package.json'), 'utf8'));
-const artifacts = await build({
-  projectDir: root,
-  prepackaged: application,
-  targets: Platform.WINDOWS.createTarget(['nsis'], Arch.x64),
-  publish: 'never',
-  config: {
-    appId: 'io.github.aacs111.envguardcc',
-    productName: 'EnvGuardCC',
-    electronVersion: electron.version,
-    artifactName: 'EnvGuardCC-Setup-${version}.${ext}',
-    directories: { output },
-    extraMetadata: { version: manifest.version },
-    win: { icon: path.join(root, 'desktop', 'envguardcc.ico'), signAndEditExecutable: false },
-    nsis: {
-      oneClick: false,
-      perMachine: false,
-      allowToChangeInstallationDirectory: true,
-      createDesktopShortcut: true,
-      createStartMenuShortcut: true,
-      shortcutName: 'EnvGuardCC',
-      deleteAppDataOnUninstall: false,
-    },
-  },
-});
-for (const artifact of artifacts) console.log(`Windows installer: ${artifact}`);

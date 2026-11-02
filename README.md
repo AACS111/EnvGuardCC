@@ -12,7 +12,10 @@ Claude 运行环境检测与保护工作台，支持浏览器与客户端环境�
 - [Apple Silicon Mac 应用（.zip）](https://github.com/AACS111/EnvGuardCC/releases/download/v0.1.1/EnvGuardCC-macOS-arm64.zip)
 - [SHA-256 校验值](https://github.com/AACS111/EnvGuardCC/releases/download/v0.1.1/SHA256SUMS.txt) · [全部版本](https://github.com/AACS111/EnvGuardCC/releases)
 
-安装包下载后直接运行；便携包请完整解压后运行 EnvGuardCC.exe，保留同目录运行文件。均已包含运行环境，无需另行安装 Node.js。安装包尚未进行代码签名。
+安装包下载后直接运行；便携包请完整解压后运行 EnvGuardCC.exe，保留同目录运行文件。均已包含 Node.js 运行环境。Windows 还需系统 WebView2；安装器在缺失时联网安装，便携版需先安装 WebView2。安装包尚未进行代码签名。
+
+
+> 源码已迁移 Tauri 2；上方已发布下载仍属于迁移前版本，本次未发布新版。Tauri 客户端请使用文末打包命令生成，macOS 原生验证仍需在对应平台完成。
 
 ## 界面预览
 
@@ -59,10 +62,10 @@ Claude 运行环境检测与保护工作台，支持浏览器与客户端环境�
 
 ```bash
 pnpm install --frozen-lockfile
-pnpm dev:electron
+pnpm dev:tauri
 ```
 
-首次启动可能需要下载 Electron。桌面模式使用本机 3030 页面端口；`Cmd+Q` 或关闭窗口会退出应用，并在退出时尝试恢复配置、释放本次启动占用的端口。
+桌面开发需安装 Rust 与平台构建工具，首次编译会下载 Rust 依赖。桌面模式使用本机 3030 页面端口；`Cmd+Q` 或从托盘退出会结束应用，并在退出时尝试恢复配置、释放本次启动占用的端口。
 
 只运行本地网页：
 
@@ -80,7 +83,7 @@ pnpm dev
 git clone https://github.com/AACS111/EnvGuardCC.git
 cd EnvGuardCC
 pnpm install
-pnpm dev:electron
+pnpm dev:tauri
 ```
 
 只运行本地网页：
@@ -89,7 +92,7 @@ pnpm dev:electron
 pnpm dev
 ```
 
-启动后使用终端显示的本机地址。桌面模式使用本地 3030 页面端口；首次启动可能需要下载 Electron。
+启动后使用终端显示的本机地址。桌面模式使用本地 3030 页面端口；桌面开发需安装 Rust 与平台构建工具，首次编译会下载 Rust 依赖。
 
 ## 平台支持范围
 
@@ -112,7 +115,7 @@ pnpm desktop:installer
 
 ## 技术栈
 
-Next.js 16、React 19、TypeScript、Tailwind CSS 4、Electron。
+Next.js 16、React 19、TypeScript、Tailwind CSS 4、Tauri 2。
 
 ## 许可证
 

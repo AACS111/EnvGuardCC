@@ -45,14 +45,14 @@ export function createDesktopSettings({ app, userData, platform = process.platfo
         const previous = report();
         const updated = { ...settings, ...patch };
         try {
-          if (Object.hasOwn(patch, 'openAtLogin')) app.setLoginItemSettings({ ...options, openAtLogin: patch.openAtLogin });
+          if (Object.hasOwn(patch, 'openAtLogin')) await app.setLoginItemSettings({ ...options, openAtLogin: patch.openAtLogin });
           await mkdir(userData, { recursive: true });
           await writeFile(file + '.tmp', JSON.stringify(updated), { mode: 0o600 });
           await rename(file + '.tmp', file);
           settings = updated;
         } catch (error) {
           if (Object.hasOwn(patch, 'openAtLogin')) {
-            try { app.setLoginItemSettings({ ...options, openAtLogin: previous.openAtLogin }); } catch { /* Report the original failure. */ }
+            try { await app.setLoginItemSettings({ ...options, openAtLogin: previous.openAtLogin }); } catch { /* Report the original failure. */ }
           }
           throw error;
         }

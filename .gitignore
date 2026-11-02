@@ -20,6 +20,9 @@
 
 # production
 /build
+/src-tauri/target/
+/src-tauri/gen/
+/.checkcc-desktop-build-source/
 
 # misc
 .DS_Store

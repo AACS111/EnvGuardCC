@@ -24,7 +24,6 @@
   },
   "scripts": {
     "dev": "node scripts/dev.mjs",
-    "dev:electron": "node scripts/dev-electron.mjs",
     "repair:helper": "node scripts/local-repair.mjs",
     "gateway": "node scripts/claude-gateway.mjs",
     "test:dev": "node --test scripts/check-dev.mjs",
@@ -44,7 +43,11 @@
     "license:package": "node tools/license-generator/package.mjs",
     "test:license": "node --test tools/license-generator/check-license.mjs",
     "timezone:build": "node scripts/build-timezone-service.mjs",
-    "test:timezone": "node --test scripts/check-timezone-service.mjs"
+    "test:timezone": "node --test scripts/check-timezone-service.mjs",
+    "dev:tauri": "node scripts/dev-tauri.mjs",
+    "test:tauri": "node --test scripts/check-tauri.mjs",
+    "test:desktop:smoke": "node scripts/smoke-desktop.mjs",
+    "test:installer": "node scripts/test-installer-guard.mjs"
   },
   "dependencies": {
     "classic-level": "3.0.0",
@@ -54,6 +57,7 @@
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4",
+    "@tauri-apps/cli": "2.12.4",
     "@types/node": "^20",
     "@types/react": "^19",
     "@types/react-dom": "^19",
