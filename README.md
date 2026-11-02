@@ -6,16 +6,16 @@ Claude 运行环境检测与保护工作台，支持浏览器与客户端环境�
 
 ## 下载
 
-- [Windows x64 安装包（.exe）](https://github.com/AACS111/EnvGuardCC/releases/download/v0.1.1/EnvGuardCC-Setup-0.1.1.exe)
-- [Windows x64 便携包（.zip）](https://github.com/AACS111/EnvGuardCC/releases/download/v0.1.1/EnvGuardCC-Windows-x64.zip)
-- [Apple Silicon Mac 安装镜像（.dmg）](https://github.com/AACS111/EnvGuardCC/releases/download/v0.1.1/EnvGuardCC-0.1.1-arm64.dmg)
-- [Apple Silicon Mac 应用（.zip）](https://github.com/AACS111/EnvGuardCC/releases/download/v0.1.1/EnvGuardCC-macOS-arm64.zip)
-- [SHA-256 校验值](https://github.com/AACS111/EnvGuardCC/releases/download/v0.1.1/SHA256SUMS.txt) · [全部版本](https://github.com/AACS111/EnvGuardCC/releases)
+- [Windows x64 安装包（.exe）](https://github.com/AACS111/EnvGuardCC/releases/download/v0.1.3/EnvGuardCC-Setup-0.1.3.exe)
+- [Windows x64 便携包（.zip）](https://github.com/AACS111/EnvGuardCC/releases/download/v0.1.3/EnvGuardCC-Windows-x64.zip)
+- [Apple Silicon Mac 安装镜像（.dmg）](https://github.com/AACS111/EnvGuardCC/releases/download/v0.1.3/EnvGuardCC-0.1.3-arm64.dmg)
+- [Apple Silicon Mac 应用（.zip）](https://github.com/AACS111/EnvGuardCC/releases/download/v0.1.3/EnvGuardCC-macOS-arm64.zip)
+- [SHA-256 校验值](https://github.com/AACS111/EnvGuardCC/releases/download/v0.1.3/SHA256SUMS.txt) · [全部版本](https://github.com/AACS111/EnvGuardCC/releases)
 
 安装包下载后直接运行；便携包请完整解压后运行 EnvGuardCC.exe，保留同目录运行文件。均已包含 Node.js 运行环境。Windows 还需系统 WebView2；安装器在缺失时联网安装，便携版需先安装 WebView2。安装包尚未进行代码签名。
 
 
-> 源码已迁移 Tauri 2；上方已发布下载仍属于迁移前版本，本次未发布新版。Tauri 客户端请使用文末打包命令生成，macOS 原生验证仍需在对应平台完成。
+> 0.1.3 桌面客户端采用 Tauri 2，使用系统 WebView 并内置 Node.js，安装包体积更小。
 
 ## 界面预览
 
