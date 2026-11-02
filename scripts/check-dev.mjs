@@ -5,7 +5,7 @@ import http from "node:http";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { startGateway } from "./dev.mjs";
-import { resolveNpmCli } from "./dev-electron.mjs";
+import { resolveNpmCli } from "./npm-cli.mjs";
 
 const close = (server) => new Promise((resolve) => {
   server.closeAllConnections();

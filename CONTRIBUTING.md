@@ -21,9 +21,14 @@ pnpm install --frozen-lockfile
 pnpm lint
 pnpm build
 node --test --test-timeout=60000 scripts/check-*.mjs scripts/check-*.cjs tools/license-generator/check-license.mjs
+pnpm test:tauri
+# 先运行桌面开发或打包命令准备后台资源，再验证 Rust 宿主。
+cargo test --manifest-path src-tauri/Cargo.toml --locked
 ```
 
 真实浏览器测试要求本机已安装且可正常启动 Chrome 或 Edge，可用 `CHECKCC_BROWSER_PATH` 指定路径。macOS 和 Windows 的系统集成、桌面启动和安装包需分别在对应平台验证；提交 PR 时说明测试环境、结果及尚未验证的项目。
+
+桌面开发已使用 Tauri 2：运行 `pnpm dev:tauri`。需要 Rust stable；Windows 需要 Visual Studio C++ Build Tools、Windows SDK 与 WebView2，macOS 需要 Xcode Command Line Tools。架构、后台通信、打包和验证说明见 [Tauri 桌面开发](docs/TAURI-DESKTOP.md)。
 
 ## 发布
 

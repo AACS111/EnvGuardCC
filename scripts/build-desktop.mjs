@@ -1,149 +1,155 @@
-import { cp, mkdir, readFile, writeFile, access, rm, readdir, rename, chmod } from 'node:fs/promises';
+import { cp, mkdir, readFile, writeFile, access, rm, readdir, rename, chmod, stat } from 'node:fs/promises';
 import path from 'node:path';
-import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createHash } from 'node:crypto';
-import { spawn } from 'node:child_process';
 import { createRequire } from 'node:module';
-import { resolveNpmCli } from './dev-electron.mjs';
+import { projectRoot as root, run, tauriCli } from './tauri-tools.mjs';
 
-const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const toolsDir = path.join(root, 'node_modules', '.checkcc-desktop-build');
-const stage = path.join(root, 'node_modules', '.checkcc-desktop-app');
-const output = path.join(root, 'node_modules', '.checkcc-dist');
+const tools = path.join(root, 'node_modules/.tauri-tools');
+const stage = path.join(root, 'node_modules/.checkcc-tauri-backend');
+const output = path.join(root, 'node_modules/.checkcc-dist');
 const isMac = process.platform === 'darwin' && process.arch === 'arm64';
-const run = (command, args, options = {}) => new Promise((resolve, reject) => {
-  const child = spawn(command, args, { cwd: root, windowsHide: true, stdio: 'inherit', ...options });
-  child.once('error', reject); child.once('exit', code => code === 0 ? resolve() : reject(new Error(`Build step failed: ${code}`)));
-});
-if (!process.env.CHECKCC_EXPORT_DIR) throw new Error('请使用 npm run desktop:package 生成最新页面后打包。');
-const exportRoot = path.resolve(process.env.CHECKCC_EXPORT_DIR);
-await access(path.join(exportRoot, 'index.html'));
-const provenance = JSON.parse(await readFile(path.join(exportRoot, 'checkcc-build.json'), 'utf8'));
-for (const [file, expected] of Object.entries(provenance.sources)) {
-  const actual = createHash('sha256').update(await readFile(path.join(root, file))).digest('hex');
-  if (actual !== expected) throw new Error('构建后源码已变化，请重新构建：' + file);
+const nodeVersion = 'v22.23.2';
+const manifest = JSON.parse(await readFile(path.join(root, 'package.json'), 'utf8'));
+if (!isMac && (process.platform !== 'win32' || process.arch !== 'x64')) throw new Error('打包需要 Windows x64 或 macOS arm64。');
+if (!process.env.CHECKCC_EXPORT_DIR) throw new Error('请使用 pnpm desktop:package 构建最新页面后打包。');
+const exported = path.resolve(process.env.CHECKCC_EXPORT_DIR);
+await access(path.join(exported, 'index.html'));
+const provenance = JSON.parse(await readFile(path.join(exported, 'checkcc-build.json'), 'utf8'));
+for (const [file, hash] of Object.entries(provenance.sources)) {
+  if (createHash('sha256').update(await readFile(path.join(root, file))).digest('hex') !== hash) throw new Error('构建后源码已变化，请重新构建：' + file);
 }
-const chunks = path.join(exportRoot, '_next/static/chunks');
-let hasRuntimePorts = false;
-for (const name of await readdir(chunks)) if (name.endsWith('.js') && (await readFile(path.join(chunks, name), 'utf8')).includes('__CHECKCC_PORTS__')) hasRuntimePorts = true;
-if (!hasRuntimePorts) throw new Error('构建产物缺少桌面端口配置，拒绝打包旧页面。');
-await mkdir(toolsDir, { recursive: true });
-const packagerVersion = isMac ? '20.3.0' : '19.1.1';
-let installedPackager = null;
-try { installedPackager = JSON.parse(await readFile(path.join(toolsDir, 'node_modules', '@electron', 'packager', 'package.json'), 'utf8')).version; } catch { /* install below */ }
-if (installedPackager !== packagerVersion) {
-  const npmCli = resolveNpmCli();
-  // 19.1.1 leaves the zip extraction pending on Node 26; macOS uses 20.3.0.
-  await run(process.execPath, [npmCli, 'install', '--prefix', toolsDir, '--save-exact', 'electron@42.11.18', `@electron/packager@${packagerVersion}`], { env: { ...process.env, npm_config_cache: path.join(toolsDir, 'cache'), ELECTRON_CACHE: path.join(toolsDir, 'electron-cache') } });
+let hasPorts = false;
+for (const file of await readdir(path.join(exported, '_next/static/chunks'))) {
+  if (file.endsWith('.js') && (await readFile(path.join(exported, '_next/static/chunks', file), 'utf8')).includes('__CHECKCC_PORTS__')) hasPorts = true;
 }
-// The staging tree is disposable and must resolve inside this repository's node_modules.
-if (!stage.startsWith(path.join(root, 'node_modules') + path.sep)) throw new Error('Invalid packaging directory');
+if (!hasPorts) throw new Error('构建产物缺少桌面端口配置。');
+await mkdir(tools, { recursive: true });
+await mkdir(output, { recursive: true });
+
+async function bytes(directory) {
+  const info = await stat(directory);
+  if (!info.isDirectory()) return info.size;
+  return (await Promise.all((await readdir(directory)).map(name => bytes(path.join(directory, name))))).reduce((a, b) => a + b, 0);
+}
+const platformName = isMac ? 'macOS-arm64' : 'Windows-x64';
+const archive = path.join(output, `EnvGuardCC-${platformName}.zip`);
+// Keep migration outputs separate from an Electron build that may still be running.
+const legacyRoot = path.join(output, isMac ? 'EnvGuardCC-darwin-arm64' : 'EnvGuardCC-win32-x64');
+const appRoot = path.join(output, isMac ? 'EnvGuardCC-tauri-darwin-arm64' : 'EnvGuardCC-tauri-win32-x64');
+const reportFile = path.join(output, `tauri-size-${platformName}.json`);
+let previous = {};
+try { previous = JSON.parse(await readFile(reportFile, 'utf8')); } catch { /* First migration build. */ }
+try {
+  const reference = JSON.parse(await readFile(path.join(output, `electron-reference-${platformName}.json`), 'utf8'));
+  if (reference.version === manifest.version) previous.electron = reference;
+} catch { /* Optional same-version reference built independently from the old host. */ }
+if (!previous.electron) {
+  try {
+    const oldManifest = path.join(legacyRoot, isMac ? 'EnvGuardCC.app/Contents/Resources/app/package.json' : 'resources/app/package.json');
+    const oldVersion = JSON.parse(await readFile(oldManifest, 'utf8')).version;
+    previous.electron = { version: oldVersion, zipBytes: await bytes(archive), installedBytes: await bytes(isMac ? path.join(legacyRoot, 'EnvGuardCC.app') : legacyRoot) };
+    await writeFile(reportFile, JSON.stringify(previous, null, 2));
+  } catch { /* A clean CI runner has no Electron reference artifact. */ }
+}
+
+// Guard every recursive removal with a repository-owned absolute path.
+if (stage !== path.join(root, 'node_modules', '.checkcc-tauri-backend')) throw new Error('无效的后台暂存目录。');
 await rm(stage, { recursive: true, force: true });
 await mkdir(stage, { recursive: true });
-await cp(exportRoot, path.join(stage, 'out'), { recursive: true });
-await cp(path.join(root, 'LICENSE'), path.join(stage, 'LICENSE'));
-for (const dir of [ 'scripts', 'desktop', 'public', 'src/detection', 'src/i18n', 'src/regions']) await cp(path.join(root, dir), path.join(stage, dir), { recursive: true });
-await mkdir(path.join(stage, 'node_modules'), { recursive: true });
-if (!isMac && (process.platform !== 'win32' || process.arch !== 'x64')) throw new Error('打包需使用 macOS arm64 或 Windows x64 Node。');
-await mkdir(path.join(stage, 'runtime'), { recursive: true });
-if (isMac) {
-  // Homebrew node is a thin binary linked to libnode; use the official self-contained runtime.
-  const nodeVersion = process.version;
-  const nodeDir = path.join(toolsDir, `node-${nodeVersion}-darwin-arm64`);
-  const nodeBin = path.join(nodeDir, 'bin', 'node');
-  try { await access(nodeBin); }
-  catch {
-    const nodeArchive = `node-${nodeVersion}-darwin-arm64.tar.gz`;
-    const base = `https://nodejs.org/dist/${nodeVersion}`;
-    const expected = (await (await fetch(`${base}/SHASUMS256.txt`)).text()).split('\n').find(line => line.endsWith(`  ${nodeArchive}`))?.split(/\s+/)[0];
-    if (!expected) throw new Error('未找到 Node 运行时校验值');
-    const tarball = path.join(toolsDir, nodeArchive);
-    const response = await fetch(`${base}/${nodeArchive}`);
-    if (!response.ok) throw new Error(`下载 Node 运行时失败：HTTP ${response.status}`);
-    await writeFile(tarball, Buffer.from(await response.arrayBuffer()));
-    if (createHash('sha256').update(await readFile(tarball)).digest('hex') !== expected) throw new Error('Node 运行时校验失败');
-    await mkdir(nodeDir, { recursive: true });
-    await run('tar', ['-xzf', tarball, '-C', nodeDir, '--strip-components=1']);
-  }
-  await cp(nodeBin, path.join(stage, 'runtime', 'node'));
-  await chmod(path.join(stage, 'runtime', 'node'), 0o755);
-  await run(process.execPath, [path.join(root, 'scripts/build-timezone-service.mjs'), path.join(stage, 'runtime/timezone-service')]);
-  try { await cp(path.join(nodeDir, 'LICENSE'), path.join(stage, 'runtime', 'LICENSE')); } catch { /* optional */ }
-} else {
-  await cp(process.execPath, path.join(stage, 'runtime', 'node.exe'));
-  try { await cp(path.join(path.dirname(process.execPath), 'LICENSE'), path.join(stage, 'runtime', 'LICENSE')); } catch { /* NVM distributions may not have a separate license file. */ }
+await cp(exported, path.join(stage, 'out'), { recursive: true });
+for (const directory of ['scripts', 'desktop', 'public', 'src/detection', 'src/i18n', 'src/regions']) {
+  await cp(path.join(root, directory), path.join(stage, directory), { recursive: true });
 }
-await cp(path.join(root, 'node_modules', 'typescript'), path.join(stage, 'node_modules', 'typescript'), { recursive: true });
-// The locale transaction uses LevelDB's supported writer; include its native runtime and dependencies.
-const copiedRuntime = new Map();
+await cp(path.join(root, 'LICENSE'), path.join(stage, 'LICENSE'));
+await writeFile(path.join(stage, 'package.json'), JSON.stringify({ name: 'envguardcc-backend', version: manifest.version, type: 'module', license: 'MIT' }));
+await mkdir(path.join(stage, 'runtime'), { recursive: true });
+
+async function download(url, destination) {
+  const response = await fetch(url);
+  if (!response.ok) throw new Error(`下载失败：HTTP ${response.status} ${url}`);
+  await writeFile(destination, Buffer.from(await response.arrayBuffer()));
+}
+const nodeName = `node-${nodeVersion}-${isMac ? 'darwin-arm64' : 'win-x64'}`;
+const nodeArchive = nodeName + (isMac ? '.tar.gz' : '.zip');
+const nodeDirectory = path.join(tools, nodeName);
+const runtime = path.join(nodeDirectory, isMac ? 'bin/node' : 'node.exe');
+const base = `https://nodejs.org/dist/${nodeVersion}`;
+const checksumResponse = await fetch(`${base}/SHASUMS256.txt`);
+if (!checksumResponse.ok) throw new Error('无法下载 Node 运行时校验值。');
+const expected = (await checksumResponse.text()).split('\n').find(line => line.trim().endsWith(' ' + nodeArchive))?.trim().split(/\s+/)[0];
+if (!/^[a-f0-9]{64}$/.test(expected || '')) throw new Error('未找到 Node 运行时校验值。');
+const tarball = path.join(tools, nodeArchive);
+try { await access(tarball); } catch { await download(`${base}/${nodeArchive}`, tarball); }
+if (createHash('sha256').update(await readFile(tarball)).digest('hex') !== expected) throw new Error('Node 运行时校验失败，请删除工具目录中的下载包后重试。');
+if (isMac) {
+  await mkdir(nodeDirectory, { recursive: true });
+  await run('tar', ['-xzf', tarball, '-C', nodeDirectory, '--strip-components=1']);
+} else {
+  await run('pwsh', ['-NoProfile', '-NonInteractive', '-Command', 'Expand-Archive -LiteralPath $env:CHECKCC_NODE_ARCHIVE -DestinationPath $env:CHECKCC_NODE_DESTINATION -Force'], { env: { ...process.env, CHECKCC_NODE_ARCHIVE: tarball, CHECKCC_NODE_DESTINATION: tools } });
+}
+await cp(runtime, path.join(stage, 'runtime', isMac ? 'node' : 'node.exe'));
+await cp(path.join(nodeDirectory, 'LICENSE'), path.join(stage, 'runtime/LICENSE'));
+if (isMac) {
+  await chmod(path.join(stage, 'runtime/node'), 0o755);
+  await run(process.execPath, [path.join(root, 'scripts/build-timezone-service.mjs'), path.join(stage, 'runtime/timezone-service')]);
+}
+await mkdir(path.join(stage, 'node_modules'), { recursive: true });
+await cp(path.join(root, 'node_modules/typescript'), path.join(stage, 'node_modules/typescript'), { recursive: true, dereference: true });
+const copied = new Map();
 async function copyRuntime(name, resolver = createRequire(path.join(root, 'package.json'))) {
-  const packageFile = resolver.resolve(name + '/package.json');
-  const metadata = JSON.parse(await readFile(packageFile, 'utf8'));
-  if (copiedRuntime.has(name)) {
-    if (copiedRuntime.get(name) !== metadata.version) throw new Error('Conflicting desktop runtime dependency: ' + name);
-    return;
+  const metadataFile = resolver.resolve(name + '/package.json');
+  const metadata = JSON.parse(await readFile(metadataFile, 'utf8'));
+  if (copied.has(name)) { if (copied.get(name) !== metadata.version) throw new Error('后台依赖版本冲突：' + name); return; }
+  copied.set(name, metadata.version);
+  const destination = path.join(stage, 'node_modules', name);
+  await cp(path.dirname(metadataFile), destination, { recursive: true, dereference: true });
+  if (name === 'classic-level') {
+    for (const prebuild of await readdir(path.join(destination, 'prebuilds'))) {
+      const [platform, architectures = ''] = prebuild.split('-');
+      if (platform !== process.platform || !architectures.split('+').includes(process.arch)) await rm(path.join(destination, 'prebuilds', prebuild), { recursive: true, force: true });
+    }
   }
-  copiedRuntime.set(name, metadata.version);
-  await cp(path.dirname(packageFile), path.join(stage, 'node_modules', name), { recursive: true, dereference: true });
-  for (const dependency of Object.keys(metadata.dependencies ?? {})) await copyRuntime(dependency, createRequire(packageFile));
+  for (const dependency of Object.keys(metadata.dependencies || {})) await copyRuntime(dependency, createRequire(metadataFile));
 }
 await copyRuntime('classic-level');
-const manifest = JSON.parse(await readFile(path.join(root, 'package.json'), 'utf8'));
-await writeFile(path.join(stage, 'package.json'), JSON.stringify({ name: 'envguardcc-desktop', productName: 'EnvGuardCC', version: manifest.version, main: 'desktop/main.mjs', description: '环境检测与模拟保护工作台', author: 'EnvGuardCC', license: 'MIT' }, null, 2));
-const guide = isMac
-  ? '双击 EnvGuardCC.app 启动。应用使用本地 3030 页面端口，助手与网关使用独立端口，可与开发服务同时运行。\n启动模拟保护会备份配置并按当前 IP 适配；关闭保护或正常退出应用时自动恢复。\n系统时区变更需要 macOS 授权，失败会显示待处理状态。\n异常分越低越好，高于 50 分报警。强制结束进程或断电后，下次启动会尝试恢复未完成的配置。\n受控网页使用本机 Chrome 或 Edge；不会安装或更换浏览器。\n'
-  : '双击 EnvGuardCC.exe 启动。应用使用本地 3030 页面端口，助手与网关使用独立端口，可与开发服务同时运行。\r\n启动模拟保护会备份配置并按当前 IP 适配；关闭保护或正常退出应用时自动恢复。\r\n系统时区变更需要 Windows 授予相应权限，失败会显示待处理状态。\r\n异常分越低越好，高于 50 分报警。强制结束进程或断电后，下次启动会尝试恢复未完成的配置。\r\n受控网页使用本机 Edge 或 Chrome；不会安装或更换浏览器。\r\n';
-await writeFile(path.join(stage, '使用说明.txt'), guide);
-const require = createRequire(path.join(toolsDir, 'package.json'));
-const packagerModule = await import(pathToFileURL(require.resolve('@electron/packager')).href);
-const packager = packagerModule.default ?? packagerModule.packager;
-process.env.electron_config_cache ||= path.join(toolsDir, 'electron-cache');
-require('electron');
-const version = JSON.parse(await readFile(path.join(toolsDir, 'node_modules/electron/package.json'), 'utf8')).version;
-const { downloadArtifact } = createRequire(require.resolve('electron/package.json'))('@electron/get');
-const platform = isMac ? 'darwin' : 'win32';
-const arch = isMac ? 'arm64' : 'x64';
-const zip = await downloadArtifact({ version, platform, arch, artifactName: 'electron', cacheRoot: path.join(root, 'node_modules', '.checkcc-electron-cache'), checksums: JSON.parse(await readFile(path.join(toolsDir, 'node_modules/electron/checksums.json'), 'utf8')) });
-let icon = path.join(root, 'desktop', 'envguardcc.ico');
+await writeFile(path.join(stage, '使用说明.txt'), 'EnvGuardCC 使用系统 WebView，不再包含 Electron。\nWindows 需要 WebView2；安装器会在缺失时联网安装，便携版请先安装 WebView2。\n已包含 Node，无需另行安装。关闭窗口保留后台运行；请从托盘退出并等待原始配置恢复。\n');
+
+// Tauri embeds no duplicate frontend assets; the Node sidecar serves the exported site.
+await run(process.execPath, [tauriCli(), 'build', '--no-bundle', '--', '--locked']);
+const pendingRoot = path.join(output, `.tauri-${platformName}`);
+if (path.dirname(pendingRoot) !== output) throw new Error('无效的产物目录。');
+await rm(pendingRoot, { recursive: true, force: true });
+await mkdir(pendingRoot, { recursive: true });
+let application;
 if (isMac) {
-  const iconset = path.join(toolsDir, 'envguardcc.iconset');
-  const icns = path.join(toolsDir, 'envguardcc.icns');
-  await rm(iconset, { recursive: true, force: true }); await rm(icns, { force: true });
-  await mkdir(iconset, { recursive: true });
-  for (const [size, name] of [[16, 'icon_16x16'], [32, 'icon_16x16@2x'], [32, 'icon_32x32'], [64, 'icon_32x32@2x'], [128, 'icon_128x128'], [256, 'icon_128x128@2x'], [256, 'icon_256x256'], [512, 'icon_256x256@2x'], [512, 'icon_512x512'], [1024, 'icon_512x512@2x']]) {
-    await run('sips', ['-z', String(size), String(size), path.join(root, 'public', 'envguardcc-icon.png'), '--out', path.join(iconset, `${name}.png`)]);
-  }
-  await run('iconutil', ['-c', 'icns', iconset, '-o', icns]);
-  icon = icns;
+  await run(process.execPath, [tauriCli(), 'bundle', '--bundles', 'app', '--no-sign']);
+  application = path.join(pendingRoot, 'EnvGuardCC.app');
+  await cp(path.join(root, 'src-tauri/target/release/bundle/macos/EnvGuardCC.app'), application, { recursive: true, verbatimSymlinks: true });
+  // Sign enclosing code without --deep: the timezone daemon pins the bridge's exact cdhash.
+  await run('codesign', ['--force', '--sign', '-', path.join(application, 'Contents/Resources/backend/runtime/node')]);
+  await run('codesign', ['--force', '--sign', '-', application]);
+  await run('codesign', ['--verify', '--deep', '--strict', application]);
+  const service = path.join(application, 'Contents/Resources/backend/runtime/timezone-service');
+  await run(process.execPath, [path.join(root, 'scripts/verify-timezone-signature.mjs'), service]);
+} else {
+  application = path.join(pendingRoot, 'EnvGuardCC-win32-x64');
+  await mkdir(application);
+  await cp(path.join(root, 'src-tauri/target/release/envguardcc.exe'), path.join(application, 'EnvGuardCC.exe'));
+  await cp(stage, path.join(application, 'backend'), { recursive: true });
 }
-const artifacts = await packager({ dir: stage, out: output, name: 'EnvGuardCC', executableName: 'EnvGuardCC', appBundleId: 'io.github.aacs111.envguardcc', icon, platform, arch, electronVersion: version, electronZipDir: path.dirname(zip), overwrite: true, asar: false, prune: false, appVersion: manifest.version, osxSign: false, ...(isMac ? {} : { win32metadata: { CompanyName: 'EnvGuardCC', FileDescription: 'EnvGuardCC 环境检测与模拟保护', ProductName: 'EnvGuardCC' } }) });
-const appPath = isMac ? path.join(artifacts[0], 'EnvGuardCC.app') : artifacts[0];
-if (isMac) {
-  // No Developer ID; ad-hoc signature keeps the local trial runnable.
-  // Native service cdhashes are pinned to the bridge built before packaging.
-  // The bridge and daemon are signed standalone; preserve those exact signatures.
-  await run('codesign', ['--force', '--deep', '--sign', '-', appPath]);
-  await run('codesign', ['--verify', '--deep', '--strict', '--verbose=2', appPath]);
-  const nativeDir = path.join(appPath, 'Contents/Resources/app/runtime/timezone-service');
-  const bridgeInfo = await new Promise((resolve, reject) => {
-    const child = spawn('/usr/bin/codesign', ['-d', '--verbose=4', path.join(nativeDir, 'bridge')], { stdio: ['ignore', 'ignore', 'pipe'] });
-    let info = ''; child.stderr.on('data', data => { info += data; });
-    child.once('error', reject); child.once('exit', code => code === 0 ? resolve(info) : reject(new Error('时区服务签名核验失败')));
-  });
-  if (bridgeInfo.match(/^CDHash=([a-f0-9]+)$/m)?.[1] !== (await readFile(path.join(nativeDir, 'client-cdhash'), 'utf8')).trim()) throw new Error('打包改变了时区服务客户端签名，已拒绝交付。');
-}
-// Replace the release ZIP only after compression has completed successfully.
-const archive = path.join(output, isMac ? 'EnvGuardCC-macOS-arm64.zip' : 'EnvGuardCC-Windows-x64.zip');
 const pendingArchive = archive.replace(/\.zip$/, '.pending.zip');
 await rm(pendingArchive, { force: true });
-try {
-  if (isMac) await run('ditto', ['-c', '-k', '--sequesterRsrc', '--keepParent', appPath, pendingArchive]);
-  else await run('pwsh', ['-NoProfile', '-NonInteractive', '-Command', '$ErrorActionPreference = "Stop"; Add-Type -AssemblyName System.IO.Compression.FileSystem; [IO.Compression.ZipFile]::CreateFromDirectory($env:CHECKCC_ARCHIVE_SOURCE, $env:CHECKCC_ARCHIVE_DESTINATION, [IO.Compression.CompressionLevel]::Optimal, $true)'], {
-    env: { ...process.env, CHECKCC_ARCHIVE_SOURCE: appPath, CHECKCC_ARCHIVE_DESTINATION: pendingArchive },
-  });
-  await rename(pendingArchive, archive);
-} finally {
-  await rm(pendingArchive, { force: true });
-}
-console.log((isMac ? 'macOS' : 'Windows') + ' application: ' + appPath);
-console.log((isMac ? 'macOS' : 'Windows') + ' archive: ' + archive);
+if (isMac) await run('ditto', ['-c', '-k', '--sequesterRsrc', '--keepParent', application, pendingArchive]);
+else await run('pwsh', ['-NoProfile', '-NonInteractive', '-Command', 'Add-Type -AssemblyName System.IO.Compression.FileSystem; [IO.Compression.ZipFile]::CreateFromDirectory($env:CHECKCC_ARCHIVE_SOURCE, $env:CHECKCC_ARCHIVE_DESTINATION, [IO.Compression.CompressionLevel]::Optimal, $true)'], { env: { ...process.env, CHECKCC_ARCHIVE_SOURCE: application, CHECKCC_ARCHIVE_DESTINATION: pendingArchive } });
+if (path.dirname(appRoot) !== output) throw new Error('无效的交付目录。');
+await rm(appRoot, { recursive: true, force: true });
+if (isMac) { await mkdir(appRoot); await rename(application, path.join(appRoot, 'EnvGuardCC.app')); }
+else await rename(application, appRoot);
+await rename(pendingArchive, archive);
+const installedBytes = await bytes(isMac ? path.join(appRoot, 'EnvGuardCC.app') : appRoot);
+const zipBytes = await bytes(archive);
+await writeFile(reportFile, JSON.stringify({ ...previous, version: manifest.version, nodeVersion, platform: platformName, tauri: { installedBytes, zipBytes }, referenceIsSameVersion: previous.electron?.version === manifest.version,
+  ...(previous.electron ? { reduction: { zipPercent: 100 * (1 - zipBytes / previous.electron.zipBytes), installedPercent: 100 * (1 - installedBytes / previous.electron.installedBytes) } } : {}), builtAt: new Date().toISOString() }, null, 2));
+await writeFile(path.join(output, `tauri-build-${platformName}.json`), JSON.stringify({ version: manifest.version, sources: provenance.sources }));
+console.log(`Tauri ${platformName}: ZIP ${(zipBytes / 1048576).toFixed(1)} MiB / 安装体积 ${(installedBytes / 1048576).toFixed(1)} MiB`);
+console.log('应用：' + appRoot + '\n压缩包：' + archive);

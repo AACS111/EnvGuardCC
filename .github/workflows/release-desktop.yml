@@ -44,13 +44,34 @@ jobs:
           node -e 'if (process.platform !== "${{ matrix.platform }}" || process.arch !== "${{ matrix.arch }}") throw new Error("Unexpected build platform: " + process.platform + "/" + process.arch)'
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - name: Verify native build tools
+        shell: bash
+        run: |
+          rustc --version
+          cargo --version
+          if [ "${{ matrix.platform }}" = "darwin" ]; then xcrun --find swiftc; fi
       - name: Lint and regression tests
         shell: bash
         run: |
           pnpm lint
+          pnpm test:tauri
+          mkdir -p node_modules/.checkcc-tauri-backend
+          cargo test --manifest-path src-tauri/Cargo.toml --locked
           node --test --test-timeout=60000 scripts/check-dev.mjs scripts/check-desktop-launcher.mjs scripts/check-shutdown-restore.mjs scripts/check-protection-session.mjs scripts/check-protection-controls.cjs scripts/check-protection-reconnect.mjs scripts/check-application-paths.mjs scripts/check-macos-adapters.mjs scripts/check-windows-timezone.mjs scripts/check-timezone-service.mjs scripts/check-desktop-settings.mjs scripts/check-claude-reset.mjs
       - name: Build app and installer
         run: pnpm desktop:installer
+      - name: Verify Windows installer process guard
+        if: matrix.platform == 'win32'
+        run: pnpm test:installer
+      - name: Verify Windows desktop local and remote ACL
+        if: matrix.platform == 'win32'
+        run: |
+          pnpm test:desktop:smoke
+          node scripts/smoke-desktop.mjs --remote-acl
       - uses: actions/upload-artifact@v4
         with:
           name: desktop-${{ matrix.platform }}-${{ matrix.arch }}
@@ -62,6 +83,7 @@ jobs:
             node_modules/.checkcc-dist/EnvGuardCC-Windows-x64.zip
             node_modules/.checkcc-dist/EnvGuardCC-*-arm64.dmg
             node_modules/.checkcc-dist/EnvGuardCC-macOS-arm64.zip
+            node_modules/.checkcc-dist/tauri-size-*.json
 
   publish:
     needs: build

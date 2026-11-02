@@ -6,13 +6,16 @@ A Claude runtime environment inspection and protection workspace with browser an
 
 ## Download
 
-- [Apple Silicon Mac DMG](https://github.com/AACS111/EnvGuardCC/releases/download/v0.1.1/EnvGuardCC-0.1.1-arm64.dmg)
-- [Apple Silicon Mac ZIP](https://github.com/AACS111/EnvGuardCC/releases/download/v0.1.1/EnvGuardCC-macOS-arm64.zip)
-- [Windows x64 installer (.exe)](https://github.com/AACS111/EnvGuardCC/releases/download/v0.1.1/EnvGuardCC-Setup-0.1.1.exe)
-- [Windows x64 portable package (.zip)](https://github.com/AACS111/EnvGuardCC/releases/download/v0.1.1/EnvGuardCC-Windows-x64.zip)
-- [SHA-256 checksums](https://github.com/AACS111/EnvGuardCC/releases/download/v0.1.1/SHA256SUMS.txt) · [All releases](https://github.com/AACS111/EnvGuardCC/releases)
+- [Apple Silicon Mac DMG](https://github.com/AACS111/EnvGuardCC/releases/download/v0.1.3/EnvGuardCC-0.1.3-arm64.dmg)
+- [Apple Silicon Mac ZIP](https://github.com/AACS111/EnvGuardCC/releases/download/v0.1.3/EnvGuardCC-macOS-arm64.zip)
+- [Windows x64 installer (.exe)](https://github.com/AACS111/EnvGuardCC/releases/download/v0.1.3/EnvGuardCC-Setup-0.1.3.exe)
+- [Windows x64 portable package (.zip)](https://github.com/AACS111/EnvGuardCC/releases/download/v0.1.3/EnvGuardCC-Windows-x64.zip)
+- [SHA-256 checksums](https://github.com/AACS111/EnvGuardCC/releases/download/v0.1.3/SHA256SUMS.txt) · [All releases](https://github.com/AACS111/EnvGuardCC/releases)
 
-Run the installer directly, or extract the entire portable package and launch EnvGuardCC.exe with its accompanying files. Both packages include the runtime; Node.js is not required. The installer is not code-signed.
+Run the installer directly, or extract the entire portable package and launch EnvGuardCC.exe with its accompanying files. Both packages include Node.js. Windows also needs system WebView2; the installer downloads it when missing, while portable users must install it first. The installer is not code-signed.
+
+
+> Version 0.1.3 uses Tauri 2 with the system WebView and bundled Node.js for smaller desktop packages.
 
 ## Screenshots
 
@@ -57,10 +60,10 @@ Run these commands in the local checkout that contains this Mac adaptation. Upst
 
 ```bash
 pnpm install --frozen-lockfile
-pnpm dev:electron
+pnpm dev:tauri
 ```
 
-The first desktop launch may download Electron. Desktop mode uses local port 3030 for its interface. `Cmd+Q` or closing the window exits the app and attempts to restore configuration and release ports opened by that launch.
+Desktop development requires Rust and native build tools; the first compilation downloads Rust dependencies. Desktop mode uses local port 3030 for its interface. Quitting from the tray or with `Cmd+Q` exits the app and attempts to restore configuration and release ports opened by that launch.
 
 For the local web interface only:
 
@@ -78,7 +81,7 @@ Apple Silicon Mac packages are available above. The commands below are for Windo
 git clone https://github.com/AACS111/EnvGuardCC.git
 cd EnvGuardCC
 pnpm install
-pnpm dev:electron
+pnpm dev:tauri
 ```
 
 For the local web interface only:
@@ -87,7 +90,7 @@ For the local web interface only:
 pnpm dev
 ```
 
-Open the local URL printed by the terminal. Desktop mode uses port 3030 for its interface. The first desktop launch may download Electron.
+Open the local URL printed by the terminal. Desktop mode uses port 3030 for its interface. Desktop development requires Rust and native build tools; the first compilation downloads Rust dependencies.
 
 ## Supported scope
 
@@ -110,7 +113,7 @@ pnpm desktop:installer
 
 ## Stack
 
-Next.js 16, React 19, TypeScript, Tailwind CSS 4, and Electron.
+Next.js 16, React 19, TypeScript, Tailwind CSS 4, and Tauri 2.
 
 ## License
 
@@ -129,3 +132,5 @@ Installed Windows and macOS apps offer launch-at-login and automatic protection 
 The Protection configuration action resets supported local Claude Desktop data locations after protection is stopped and Claude and its background tasks are closed. Review the native confirmation first: sign-in state, caches, preferences, MCP configuration and local Cowork/Desktop session data are moved to the system Trash/Recycle Bin and remain recoverable until it is emptied. Unknown locations, redirected paths, locks and permission errors are reported instead of claiming a complete reset. The app, browser profiles, Claude Code, projects, cloud records and unrelated credential-manager entries are preserved. This does not change device identity or guarantee removal of server-side account associations. Check onboarding and sign-in after reopening Claude; use Claude’s built-in Reset Application Data for unsupported storage layouts.
 
 Monitoring and its interval are saved locally before a change is acknowledged and survive app restarts and protection stop/start cycles. Save failures are reported without changing the active settings. Launch-at-login and automatic protection preferences are also retained.
+
+Tauri 2 desktop development requires Rust stable, Windows C++ Build Tools and Windows SDK, or Xcode Command Line Tools on macOS. See [desktop architecture and validation](docs/TAURI-DESKTOP.md).
