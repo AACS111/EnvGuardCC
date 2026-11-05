@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import { createProtectionService } from "./protection-service.mjs";
 import { EnvironmentRuntime } from "./environment-runtime.mjs";
 import { BrowserCloakController } from "./browser-cloak.mjs";
+import { detectInstalledBrowsers, loadBrowserPreference, pickBrowser, saveBrowserPreference } from "./browser-catalog.mjs";
 import { readSystemTimezone, readAutomaticTimezone, setSystemTimezone, validIanaTimezone, sameTimezone, timezoneSupported } from "./system-timezone.mjs";
 import { resetTimezoneServiceAuthorization } from "./timezone-service.mjs";
 import { findBrowser, findDesktop } from "./application-paths.mjs";
@@ -46,7 +47,13 @@ let protectionChanging = false;
 let closing = false;
 let closePending = null;
 let initializing = true;
-const environmentRuntime = new EnvironmentRuntime({ stateDir });
+// 受管浏览器按偏好挑选：列表里被排除的浏览器不会被拉起。
+const browserChoice = async () => pickBrowser(await detectInstalledBrowsers(), await loadBrowserPreference(stateDir));
+const environmentRuntime = new EnvironmentRuntime({ stateDir, browserPathProvider: async () => {
+  const choice = await browserChoice();
+  if (!choice?.path) throw new Error("没有可接入的浏览器：请至少在列表里保留一个 Chromium 内核浏览器（Chrome / Edge / Brave / Vivaldi / Chromium）。");
+  return { id: choice.id, path: choice.path };
+} });
 const browserCloak = new BrowserCloakController(environmentRuntime, { gatewayUrl: process.env.CHECKCC_GATEWAY_URL || "http://127.0.0.1:3010", acquire: () => { if (changing || protectionChanging || closing) return false; changing = true; return true; }, release: () => { changing = false; } });
 
 const currentZone = () => readSystemTimezone();
@@ -228,6 +235,10 @@ const server = http.createServer(async (req, res) => {
       if (body.action === "observe") return send(200, protection.observe(body));
       if (body.action === "monitor") return send(200, await protection.monitor(body.enabled, body.intervalMs));
       if (body.action === 'startup') return send(200, await protection.startupPreference(body.enabled));
+      if (body.action === 'test') {
+        if (changing || protectionChanging) return send(409, { error: "配置正在执行，请稍后检测。" });
+        return send(200, await protection.retest());
+      }
       if (!["start", "stop", "test", "resume"].includes(body.action)) return send(400, { error: "无效操作。" });
       if (protectionChanging) return send(409, { error: "配置正在执行，请稍后重试。" });
       if (body.action === 'start' || body.action === 'stop') resetTimezoneServiceAuthorization();
@@ -236,11 +247,33 @@ const server = http.createServer(async (req, res) => {
         // Reserve explicit protection actions so background sync cannot starve them.
         while (changing) await new Promise(resolve => setTimeout(resolve, 50));
         changing = true;
-        try { return send(200, await (body.action === "test" ? protection.retest() : protection[body.action](origin))); } finally { changing = false; }
+        try { return send(200, await protection[body.action](origin, { background: body.background === true })); } finally { changing = false; }
       } finally { protectionChanging = false; }
     } catch (error) { return send(400, { error: error.message }); }
   }
   if (req.method === "GET" && req.url === "/session?tokenOnly=1") return send(200, { token: secret });
+  // 本地浏览器清单与接入偏好：只做存在性探测，不启动任何浏览器。
+  if (req.method === "GET" && req.url === "/browsers") {
+    if (!authenticated(req.headers["x-checkcc-token"])) return send(403, { error: "会话已失效，请重新打开详情。" });
+    try {
+      const preference = await loadBrowserPreference(stateDir);
+      const browsers = await detectInstalledBrowsers();
+      const active = pickBrowser(browsers, preference);
+      return send(200, { browsers, ...preference, active: active ? { id: active.id, name: active.name, path: active.path } : null });
+    } catch (error) { return send(500, { error: error.message }); }
+  }
+  if (req.method === "POST" && req.url === "/browsers") {
+    if (!authenticated(req.headers["x-checkcc-token"])) return send(403, { error: "会话已失效，请重新打开详情。" });
+    if (!req.headers["content-type"]?.startsWith("application/json")) return send(415, { error: "必须使用 JSON。" });
+    try {
+      const body = await parseBody(req);
+      const preference = await saveBrowserPreference(stateDir, body);
+      browserCloak.invalidate();
+      const browsers = await detectInstalledBrowsers();
+      const active = pickBrowser(browsers, preference);
+      return send(200, { browsers, ...preference, active: active ? { id: active.id, name: active.name, path: active.path } : null });
+    } catch (error) { return send(400, { error: error.message }); }
+  }
   if (req.method === "GET" && req.url === "/session") {
     try { return send(200, { token: secret, helperProtocol: HELPER_PROTOCOL, shutdown: 1, desktopLauncher: 1, environmentScripts: 1, browserCloak: 1, platform: process.platform, capabilities: await capabilities(), timezone: timezoneSupported(process.platform) ? await currentZone() : "", canRestore: Boolean(await readBackup()), profile: await readProfile() }); }
     catch (error) {

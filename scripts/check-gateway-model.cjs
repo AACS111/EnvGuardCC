@@ -45,7 +45,8 @@ test('previews, HTTP 401/403 and DNS resolution do not manufacture successful Cl
   assert.equal(signals.requestHeaders.assessment,'unknown');
   assert.equal(signals.apiReachability,undefined);
   assert.equal(signals.dnsReview.assessment,'unknown');
-  assert.equal(signals.proxyCountry.assessment,'unknown');
+  // 只有一家情报源时无法交叉核对：显式标为「不适用」，而不是长期挂在「待处理」。
+  assert.equal(signals.proxyCountry.assessment,'not_applicable');
   assert.equal(signals.ipv4.assessment,'ok');
   assert.equal(result.verifiedRequest,false);
   assert.equal(result.geo.countryCode,'KR');
@@ -835,7 +836,9 @@ test('overview exposes recheck, monitoring choices and pass coverage without tes
   const {verificationScores} = require(path.join(root,'src/detection/verification-score.ts'));
   const props = {locale:'zh',report:{phase:'idle',enabled:false,issues:[],history:[],monitoring:true,intervalMs:300000},connected:true,busy:false,scores:verificationScores(null,null),geo:null,target:null,baseline:null,browser:[],claude:[],signals:[],cards:null,filter:'all',search:'',onFilter:()=>{},onSearch:()=>{},onToggle:()=>{},onMonitor:()=>{},onRefresh:()=>{},onSelect:()=>{}};
   const html = renderToStaticMarkup(React.createElement(ProtectionWorkspace,props));
-  assert.ok(html.includes('>重新检测</button>'));
+  // 复检入口现在落在顶部「检测」与出口环境「刷新」两处；文案变更后仍必须可见。
+  assert.ok(html.includes('>检测</button>'));
+  assert.ok(html.includes('>刷新</button>'));
   assert.match(html,/aria-label="自动检测间隔"/);
   assert.match(html,/value="300000" selected=""/);
   assert.match(html,/每30秒/); assert.match(html,/每10分钟/);
@@ -1000,3 +1003,158 @@ test('derived gateway values are measured, hosting orgs classify, and dialog sep
   assert.match(html,/未达标/);
 });
 
+
+test('网络内核面板：只给证据，不给未经证实的通过结论',()=>{
+  const {NetCorePanel}=require(path.join(root,'src/components/detector/NetCorePanel.tsx'));
+  const render=(report,locale='zh')=>renderToStaticMarkup(React.createElement(NetCorePanel,{locale,report,busy:false,onRefresh:()=>{},onRestart:()=>{},onSelectNode:()=>{}}));
+  const running={enabled:true,state:'running',tunEnabled:true,demo:false,version:'v1.19.33',restarts:0,nodes:['住宅-东京-01','住宅-新加坡-01'],selected:'住宅-东京-01',
+    routing:{state:'verified',claude:12,pinned:12,direct:0,total:20,violations:[],sampledAt:'2026-11-04T01:27:42.036Z'},detail:'12 条 Claude 连接全部命中 CLAUDE-PIN，无直连。'};
+
+  const ok=render(running);
+  assert.match(ok,/出口结论/);
+  assert.match(ok,/全部走专用出口/);
+  assert.match(ok,/Claude 连接/);
+  assert.match(ok,/data-tone="ok"/);
+  assert.doesNotMatch(ok,/netcore-violations/);
+  assert.match(ok,/aria-pressed="true"/);
+
+  // 无流量：不得出现通过态。
+  const unknown=render({...running,routing:{state:'unknown',claude:0,pinned:0,direct:0,total:0,violations:[]}});
+  assert.match(unknown,/未观察到 Claude 连接/);
+  assert.doesNotMatch(unknown,/data-tone="ok"/);
+
+  // 违规：列出主机与代理链。
+  const violation=render({...running,routing:{state:'violation',claude:2,pinned:1,direct:1,total:3,violations:[{host:'api.anthropic.com',chains:['DIRECT']}]}});
+  assert.match(violation,/netcore-violations/);
+  assert.match(violation,/api\.anthropic\.com/);
+  assert.match(violation,/DIRECT/);
+  assert.match(violation,/data-tone="danger"/);
+
+  // 演示模式必须标注，且不能是 ok。
+  const demo=render({...running,demo:true});
+  assert.match(demo,/演示节点/);
+  assert.doesNotMatch(demo,/data-tone="ok"/);
+
+  // 未配置：空态与原因，不出现任何出口结论指标。
+  const disabled=render({enabled:false,state:'disabled',reason:'尚未配置出口节点'});
+  assert.match(disabled,/尚未配置出口节点/);
+  assert.match(disabled,/先配置出口节点/);
+  assert.doesNotMatch(disabled,/netcore-strip/);
+
+  // 英文文案。
+  const en=render(running,'en');
+  assert.match(en,/Exit conclusion/);
+  assert.match(en,/All Claude traffic uses the dedicated exit/);
+});
+
+test('添加配置对话框：三种来源都可见，链接与自定义表单可渲染',()=>{
+  const {AddConfigDialog}=require(path.join(root,'src/components/detector/AddConfigDialog.tsx'));
+  const html=renderToStaticMarkup(React.createElement(AddConfigDialog,{locale:'zh',busy:false,onClose:()=>{},onImport:async()=>({ok:true,imported:1,selected:'x'})}));
+  assert.match(html,/添加配置/);
+  assert.match(html,/订阅 \/ 分享链接/);
+  assert.match(html,/>链接</);
+  assert.match(html,/>文件</);
+  assert.match(html,/>自定义</);
+  assert.match(html,/placeholder="https:\/\/example\.com\/sub\.yaml"/);
+  assert.match(html,/导入会替换当前节点列表/);
+  const en=renderToStaticMarkup(React.createElement(AddConfigDialog,{locale:'en',busy:false,onClose:()=>{},onImport:async()=>({ok:true,imported:1})}));
+  assert.match(en,/Add configuration/);
+  assert.match(en,/Subscription or share link/);
+});
+
+test('内网直连弹窗：字段分组、保存与重启入口、双语标题均可渲染',()=>{
+  const {NetworkExemptDialog}=require(path.join(root,'src/components/detector/NetworkExemptDialog.tsx'));
+  const html=renderToStaticMarkup(React.createElement(NetworkExemptDialog,{locale:'zh',busy:false,onClose:()=>{},onSaved:()=>{}}));
+  assert.match(html,/内网直连（VPN \/ 公司网络）/);
+  assert.match(html,/域名后缀/); assert.match(html,/IP \/ CIDR/); assert.match(html,/DNS 解析/);
+  assert.match(html,/严格路由（推荐）/);
+  assert.match(html,/>保存并重启内核</);
+  assert.match(html,/>关闭</);
+  const en=renderToStaticMarkup(React.createElement(NetworkExemptDialog,{locale:'en',busy:false,onClose:()=>{},onSaved:()=>{}}));
+  assert.match(en,/Local network direct \(VPN \/ corporate\)/);
+  assert.match(en,/Save &amp; restart kernel/);
+});
+
+test('内网直连摘要：只说人话，不泄露内核规则语法',()=>{
+  const {exemptSummary}=require(path.join(root,'src/components/detector/NetworkExemptDialog.tsx'));
+  const full=exemptSummary(true,{domains:['onmicro.ic'],addresses:['203.0.113.7'],dnsServers:['10.10.10.5#ENVGUARD-LOCAL-DNS'],directInterface:'以太网 2'});
+  assert.equal(full,'内网域名 onmicro.ic · 豁免 IP 1 个 · 内网 DNS 10.10.10.5 · 走网卡 以太网 2');
+  assert.doesNotMatch(full,/DOMAIN-SUFFIX|IP-CIDR|ENVGUARD-LOCAL/);
+  // 没有配置时给结论与下一步，而不是一排 0。
+  const empty=exemptSummary(true,{domains:[],addresses:[],dnsServers:[],directInterface:''});
+  assert.match(empty,/会被当成公网/);
+  assert.doesNotMatch(empty,/0 个/);
+  const many=exemptSummary(false,{domains:['a.example','b.example','c.example'],addresses:[],dnsServers:[],directInterface:''});
+  assert.match(many,/Internal domains a\.example, b\.example \+1/);
+  assert.match(many,/DNS follows system/);
+});
+
+test('内网直连弹窗：域名区有「测试解析」入口，且默认不暴露规则语法',()=>{
+  const {NetworkExemptDialog}=require(path.join(root,'src/components/detector/NetworkExemptDialog.tsx'));
+  const html=renderToStaticMarkup(React.createElement(NetworkExemptDialog,{locale:'zh',busy:false,onClose:()=>{},onSaved:()=>{}}));
+  assert.match(html,/>测试解析</);
+  assert.doesNotMatch(html,/DOMAIN-SUFFIX|IP-CIDR,/);
+  const en=renderToStaticMarkup(React.createElement(NetworkExemptDialog,{locale:'en',busy:false,onClose:()=>{},onSaved:()=>{}}));
+  assert.match(en,/Test resolution/);
+});
+
+test('检测项分层：环境固有与链路项不计入「异常项目」，但仍在保护范围外边列出',()=>{
+  const { signalRequirement, partitionIssues, requirementLabel } = require(path.join(root,'src/detection/signal-requirement.ts'));
+  assert.equal(signalRequirement('chineseFonts'),'environment');
+  assert.equal(signalRequirement('emojiStyle'),'environment');
+  assert.equal(signalRequirement('claudeReachability'),'link');
+  assert.equal(signalRequirement('country'),'link');
+  assert.equal(signalRequirement('language'),'rewritable');
+  assert.equal(signalRequirement('timezone'),'rewritable');
+  const parts = partitionIssues([{id:'language'},{id:'chineseFonts'},{id:'emojiStyle'},{id:'claudeReachability'}]);
+  assert.deepEqual(parts.actionable.map((item)=>item.id),['language']);
+  assert.deepEqual(parts.environment.map((item)=>item.id),['chineseFonts','emojiStyle']);
+  assert.deepEqual(parts.link.map((item)=>item.id),['claudeReachability']);
+  assert.equal(requirementLabel(true,'environment'),'环境固有限制');
+
+  const {ProtectionWorkspace} = require(path.join(root,'src/components/detector/ProtectionWorkspace.tsx'));
+  const {verificationScores} = require(path.join(root,'src/detection/verification-score.ts'));
+  const flagged = (id,label)=>({id,label,value:'命中',score:1,weight:16,contribution:16,assessment:'warning',source:'browser',testedAt:new Date().toISOString()});
+  const browserSignals=[flagged('chineseFonts','字体地区特征'),flagged('emojiStyle','Emoji 渲染风格')];
+  const html = renderToStaticMarkup(React.createElement(ProtectionWorkspace,{
+    locale:'zh',report:{phase:'idle',enabled:false,issues:[],history:[],monitoring:true,intervalMs:300000},connected:true,busy:false,
+    scores:verificationScores(null,null),geo:null,target:null,baseline:null,browser:browserSignals,claude:[],signals:browserSignals,cards:null,
+    filter:'all',search:'',onFilter:()=>{},onSearch:()=>{},onToggle:()=>{},onMonitor:()=>{},onRefresh:()=>{},onSelect:()=>{},
+  }));
+  // 两项都属于环境固有：异常项目计数为 0，但它们仍会在「保护范围外」出现。
+  assert.match(html,/workspace-heading-count">0</);
+  assert.match(html,/保护范围外 · 2/);
+  assert.match(html,/环境固有限制/);
+});
+
+test('检测项分层：出口类型与 IP 情报交叉核对属于链路项',()=>{
+  const { signalRequirement } = require(path.join(root,'src/detection/signal-requirement.ts'));
+  for (const id of ['exitType','multiSourceConsistency','asn','gatewayAsn','webrtcRegion','proxyCountry']) assert.equal(signalRequirement(id),'link',id);
+  for (const id of ['language','languageVariant','locale','timezone','timezoneOffset','webrtcLeak','dnsConsistency']) assert.equal(signalRequirement(id),'rewritable',id);
+  for (const id of ['chineseFonts','emojiStyle','vendorFonts','domesticDevice']) assert.equal(signalRequirement(id),'environment',id);
+});
+
+test('浏览器迷惑层：概览里能看见状态与「接入并验证浏览器」入口',()=>{
+  const {ProtectionWorkspace} = require(path.join(root,'src/components/detector/ProtectionWorkspace.tsx'));
+  const {verificationScores} = require(path.join(root,'src/detection/verification-score.ts'));
+  const props = {locale:'zh',report:{phase:'idle',enabled:false,issues:[],history:[],monitoring:true,intervalMs:300000},connected:true,busy:false,scores:verificationScores(null,null),geo:null,target:null,baseline:null,browser:[],claude:[],signals:[],cards:null,filter:'all',search:'',onFilter:()=>{},onSearch:()=>{},onToggle:()=>{},onMonitor:()=>{},onRefresh:()=>{},onSelect:()=>{}};
+  const html = renderToStaticMarkup(React.createElement(ProtectionWorkspace,props));
+  assert.match(html,/浏览器模拟保护/);
+  assert.match(html,/接入并验证浏览器/);
+  // 未接入时不冒充已验证。
+  assert.match(html,/未跟随网关/);
+  const en = renderToStaticMarkup(React.createElement(ProtectionWorkspace,{...props,locale:'en'}));
+  assert.match(en,/Link &amp; verify browser/);
+});
+
+test('本地浏览器弹窗：说明边界、列出选项、双语可渲染',()=>{
+  const {BrowserPickerDialog}=require(path.join(root,'src/components/detector/BrowserPickerDialog.tsx'));
+  const html=renderToStaticMarkup(React.createElement(BrowserPickerDialog,{locale:'zh',busy:false,onClose:()=>{},onSaved:()=>{},onLink:()=>{}}));
+  assert.match(html,/本地浏览器/);
+  // 边界必须写明：接管的是受管实例，不动正在用的窗口。
+  assert.match(html,/不会被接管，也不会被改动/);
+  assert.match(html,/正在识别本机浏览器/);
+  const en=renderToStaticMarkup(React.createElement(BrowserPickerDialog,{locale:'en',busy:false,onClose:()=>{},onSaved:()=>{},onLink:()=>{}}));
+  assert.match(en,/Local browsers/);
+  assert.match(en,/neither taken over nor modified/);
+});

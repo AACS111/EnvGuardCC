@@ -7,6 +7,7 @@ export type ProtectionReport = {
   desiredEnabled?: boolean;
   history: { at: string; message: string }[]; lastTestAt: string | null; nextTestAt: string | null;
   runId: string | null; score: number | null; alarm: boolean; monitoring: boolean;
+  verificationScore?: number; scoreReference?: number | null; scoreDropPercent?: number;
   intervalMs: number;
   testing?: boolean; testState?: string; testError?: string | null;
 };

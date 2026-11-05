@@ -11,16 +11,16 @@ const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 async function fixture(t, overrides = {}) {
   const stateDir = await mkdtemp(path.join(os.tmpdir(), 'checkcc-protection-'));
   let settings = { timezone: 'Original', language: 'original' };
-  let target = { ip: '1.2.3.4', language: 'ko-KR', locale: 'ko-KR' };
-  let sequence = 0, failure = false;
+  let target = { ip: '203.0.113.44', language: 'ko-KR', locale: 'ko-KR' };
+  let sequence = 0, failure = false, applyFailure = false;
   const calls = [];
   const options = { stateDir, intervalMs: 60000, snapshot: async () => structuredClone(settings), detect: async () => target,
-    apply: async next => { calls.push(next.ip); settings = { timezone: 'Adapted', language: next.language }; return []; },
+    apply: async next => { calls.push(next.ip); if (applyFailure) throw new Error('apply failed'); settings = { timezone: 'Adapted', language: next.language }; return []; },
     restore: async baseline => { if (failure) return ['temporary restore failure']; settings = structuredClone(baseline); return []; },
     test: async () => ({ runId: String(++sequence), state: 'passed' }), ...overrides };
   const session = new ProtectionSession(options);
-  t.after(async () => { failure = false; await session.stop(); await rm(stateDir, { recursive: true, force: true }); });
-  return { session, options, calls, original: structuredClone(settings), settings: () => settings, target: value => target = value, failRestore: value => failure = value };
+  t.after(async () => { failure = false; applyFailure = false; await session.stop(); await rm(stateDir, { recursive: true, force: true }); });
+  return { session, options, calls, original: structuredClone(settings), settings: () => settings, target: value => target = value, failRestore: value => failure = value, failApply: value => applyFailure = value };
 }
 test('启动完成后才由复检执行首轮检测，关闭完成后不再执行保护测试', async t => {
   let tests = 0;
@@ -37,59 +37,139 @@ test('启动完成后才由复检执行首轮检测，关闭完成后不再执�
   await assert.rejects(f.session.retest(), /先启动/);
 });
 
-test('节点变化仅提示重启，点击后重新识别最新出口且保留首次恢复备份', async t => {
+test('慢检测不阻塞设置或关闭，取消后迟到结果不能覆盖已停止状态', async t => {
+  let release, entered, signal;
+  const ready = new Promise(resolve => { entered = resolve; });
+  const slow = new Promise(resolve => { release = resolve; });
+  t.after(() => release({ runId: 'late', state: 'passed' }));
+  const f = await fixture(t, { test: async options => { signal = options.signal; entered(); return slow; } });
+  await f.session.start('http://localhost:3000');
+  const checking = f.session.retest();
+  await ready;
+  assert.equal(f.session.report().testing, true);
+  await f.session.monitor(false, 300000);
+  const stopped = await Promise.race([f.session.stop(), delay(500).then(() => { throw new Error('关闭仍被慢检测阻塞'); })]);
+  assert.equal(signal.aborted, true);
+  assert.equal(stopped.phase, 'idle');
+  assert.equal(stopped.testing, false);
+  release({ runId: 'late', state: 'passed' });
+  await checking;
+  assert.equal(f.session.report().phase, 'idle');
+  assert.equal(f.session.report().runId, null);
+});
+
+test('自动重连检测可取消，关闭不用等待模拟任务完成', async t => {
+  let entered, release;
+  const ready = new Promise(resolve => { entered = resolve; });
+  const slow = new Promise(resolve => { release = resolve; });
+  t.after(() => release({ runId: 'late-resume', state: 'passed' }));
+  const f = await fixture(t, { test: async () => { entered(); return slow; } });
+  await f.session.start('http://localhost:3000');
+  const reconnecting = f.session.resume('http://localhost:3000');
+  await ready;
+  const stopped = await Promise.race([f.session.stop(), delay(500).then(() => { throw new Error('关闭仍被重连检测阻塞'); })]);
+  assert.equal(stopped.phase, 'idle');
+  release({ runId: 'late-resume', state: 'passed' });
+  await reconnecting;
+  assert.equal(f.session.report().phase, 'idle');
+});
+
+test('节点变化后自动按最新出口重新适配并继续检测，保留首次恢复备份', async t => {
   const f = await fixture(t); await f.session.start('http://localhost:3000'); await f.session.retest();
   const backup = await readFile(f.session.file, 'utf8');
   const oldRun = f.session.report().runId;
   f.session.observe({ runId: oldRun, score: 70 });
-  f.target({ ip: '5.6.7.8', language: 'ja-JP', locale: 'ja-JP' });
-  await f.session.retest();
-  const stale = f.session.report();
-  assert.equal(stale.phase, 'restart_required'); assert.equal(stale.target.ip, '1.2.3.4');
-  assert.equal(stale.runId, null); assert.equal(stale.score, null); assert.equal(stale.alarm, false);
-  assert.equal(stale.nextTestAt, null); assert.equal(stale.testState, 'stale');
-  assert.match(stale.testError, /重新启动保护/);
-  assert.deepEqual(f.calls, ['1.2.3.4']);
+  f.target({ ip: '203.0.113.40', language: 'ja-JP', locale: 'ja-JP' });
+  const adapted = await f.session.retest();
+  assert.equal(adapted.phase, 'active'); assert.equal(adapted.target.ip, '203.0.113.40');
+  assert.equal(adapted.testState, 'passed'); assert.notEqual(adapted.runId, oldRun);
+  assert.deepEqual(f.calls, ['203.0.113.44', '203.0.113.40']);
+  assert.deepEqual(f.settings(), { timezone: 'Adapted', language: 'ja-JP' });
+  assert.ok(adapted.history.some(item => /自动按最新出口重新适配/.test(item.message)));
+  // 旧目标的观测不能落到新目标上。
   f.session.observe({ runId: oldRun, score: 0 }); assert.equal(f.session.report().score, null);
-  await f.session.retest(); assert.deepEqual(f.calls, ['1.2.3.4']);
-  // The node changes again while the prompt is visible: never reuse that observation.
-  f.target({ ip: '9.10.11.12', language: 'en-US', locale: 'en-US' });
-  await f.session.start('http://localhost:3000');
-  const active = await f.session.retest();
-  assert.deepEqual(f.calls, ['1.2.3.4', '9.10.11.12']);
-  assert.equal(active.phase, 'active'); assert.equal(active.testError, null);
-  assert.equal(active.target.ip, '9.10.11.12'); assert.equal(active.testState, 'passed');
   assert.equal(await readFile(f.session.file, 'utf8'), backup);
   await f.session.stop(); assert.deepEqual(f.settings(), f.original); assert.equal(f.session.report().phase, 'idle');
 });
 
-test('地理标签波动不触发重启，同国家切换 IP 仍需用户重新启动', async t => {
+test('地理标签波动不触发重适配，同国家切换 IP 自动重新适配', async t => {
   const f = await fixture(t); await f.session.start('http://localhost:3000');
-  f.target({ ip: '1.2.3.4', language: 'ko-KR', locale: 'ko-KR', city: 'Seoul' });
+  f.target({ ip: '203.0.113.44', language: 'ko-KR', locale: 'ko-KR', city: 'Seoul' });
   assert.equal((await f.session.retest()).phase, 'active');
-  f.target({ ip: '1.2.3.5', language: 'ko-KR', locale: 'ko-KR', city: 'Seoul' });
-  assert.equal((await f.session.retest()).phase, 'restart_required');
-  assert.deepEqual(f.calls, ['1.2.3.4']);
+  f.target({ ip: '203.0.113.41', language: 'ko-KR', locale: 'ko-KR', city: 'Seoul' });
+  assert.equal((await f.session.retest()).phase, 'active');
+  assert.deepEqual(f.calls, ['203.0.113.44', '203.0.113.41']);
   await f.session.stop(); assert.deepEqual(f.settings(), f.original);
 });
 
-test('重新启动无法识别新出口时恢复原配置，不沿用旧目标', async t => {
-  const f = await fixture(t); await f.session.start('http://localhost:3000');
-  f.target({ ip: '5.6.7.8', language: 'ja-JP', locale: 'ja-JP' });
-  await f.session.retest(); f.target(null);
+test('自动重适配失败退回人工重启，且无法识别新出口时恢复原配置', async t => {
+  const f = await fixture(t); await f.session.start('http://localhost:3000'); await f.session.retest();
+  f.target({ ip: '203.0.113.40', language: 'ja-JP', locale: 'ja-JP' });
+  f.failApply(true);
+  const stale = await f.session.retest();
+  assert.equal(stale.phase, 'restart_required'); assert.equal(stale.enabled, true);
+  assert.match(stale.testError, /自动重新适配失败/);
+  assert.equal(stale.nextTestAt, null); assert.equal(stale.target.ip, '203.0.113.44');
+  f.failApply(false); f.target(null);
   await assert.rejects(f.session.start('http://localhost:3000'), /无法识别/);
-  assert.deepEqual(f.calls, ['1.2.3.4']); assert.deepEqual(f.settings(), f.original);
-  assert.equal(f.session.report().enabled, false);
+  assert.deepEqual(f.settings(), f.original); assert.equal(f.session.report().enabled, false);
 });
-test('49 和 50 不报警，51 报警；持续异常不重复报警，旧采样不能覆盖当前结果', async t => {
+
+test('出口反复抖动时自动重适配有节流，超限后要求人工重启', async t => {
+  const f = await fixture(t); await f.session.start('http://localhost:3000');
+  for (let i = 0; i < 5; i++) {
+    f.target({ ip: `1.2.3.${10 + i}`, language: 'ko-KR', locale: 'ko-KR' });
+    assert.equal((await f.session.retest()).phase, 'active');
+  }
+  f.target({ ip: '203.0.113.40', language: 'ko-KR', locale: 'ko-KR' });
+  const limited = await f.session.retest();
+  assert.equal(limited.phase, 'restart_required');
+  assert.match(limited.testError, /反复变化/);
+  await f.session.stop(); assert.deepEqual(f.settings(), f.original);
+});
+test('验证得分下降40%才提醒；首次、空采样不误报，持续低分不重复提醒', async t => {
   const { session } = await fixture(t); await session.start('http://localhost:3000');
   await session.retest();
-  for (const score of [49, 50, 51]) { session.observe({ runId: '1', score }); assert.equal(session.report().alarm, score > 50); }
+  const observe = (value, runId = '1') => session.observe({ runId, score: 100 - value / 2, verificationScore: value, verificationMaximum: 200 });
+  observe(200); assert.equal(session.report().alarm, false);
+  observe(121); assert.equal(session.report().alarm, false, '下降39.5%不提醒');
+  observe(200); observe(120);
+  assert.equal(session.report().alarm, true);
+  assert.equal(session.report().scoreDropPercent, 40);
   const events = session.report().history.length;
-  await session.performTest(); session.observe({ runId: '2', score: 51 });
+  observe(110); assert.equal(session.report().history.length, events);
+  await session.performTest(); observe(100, '2');
   assert.equal(session.report().history.length, events + 1);
-  session.observe({ runId: '1', score: 0 }); assert.equal(session.report().score, 51);
-  session.observe({ runId: '2', score: 50 }); assert.equal(session.report().alarm, false);
+  observe(200, '1'); assert.equal(session.report().score, 50);
+  session.observe({ runId: '2', score: null }); assert.equal(session.report().alarm, true);
+  observe(130, '2'); assert.equal(session.report().alarm, false);
+  assert.throws(() => session.observe({ runId: '2', score: 50, verificationScore: 201, verificationMaximum: 200 }), /无效验证得分/);
+});
+
+test('后台重连配置完成即返回，模拟检测不会持续占用配置队列', async t => {
+  let release;
+  const slow = new Promise(resolve => { release = resolve; });
+  t.after(() => release({ state: 'passed', runId: 'late' }));
+  const f = await fixture(t, { test: async () => slow });
+  await f.session.start('http://localhost:3000');
+  const resumed = await f.session.resume('http://localhost:3000', { background: true });
+  assert.equal(resumed.testing, true);
+  assert.equal(resumed.phase, 'active');
+  await f.session.monitor(false);
+  assert.equal(f.session.report().monitoring, false);
+  await f.session.stop();
+  assert.equal(f.session.report().phase, 'idle');
+});
+
+test('完整采样标识幂等，同一采样重传或中间结果不得推进比较基准', async t => {
+  const { session } = await fixture(t);
+  await session.start('http://localhost:3000'); await session.retest();
+  const sample = (sampleId, value) => session.observe({ runId: '1', sampleId, score: 100 - value, verificationScore: value, verificationMaximum: 100 });
+  sample('sample-a', 100);
+  sample('sample-a', 50); assert.equal(session.report().verificationScore, 100);
+  sample('sample-b', 60); assert.equal(session.report().alarm, true);
+  sample('sample-b', 100); assert.equal(session.report().alarm, true);
+  sample('sample-c', 80); assert.equal(session.report().alarm, false);
 });
 test('恢复失败保留原始快照，重试成功后清除备份', async t => {
   const f = await fixture(t); await f.session.start('http://localhost:3000'); f.failRestore(true);
@@ -111,13 +191,14 @@ test('唤醒后重新适配变化的出口并检测，始终保留首次恢复�
   const f = await fixture(t);
   await f.session.start('http://localhost:3000'); await f.session.retest();
   const backup = await readFile(f.session.file, 'utf8');
-  f.target({ ip: '5.6.7.8', language: 'ja-JP', locale: 'ja-JP' });
-  await f.session.retest();
-  assert.equal(f.session.report().phase, 'restart_required');
+  f.target({ ip: '203.0.113.40', language: 'ja-JP', locale: 'ja-JP' });
+  f.failApply(true);
+  assert.equal((await f.session.retest()).phase, 'restart_required');
+  f.failApply(false);
   const report = await f.session.resume('http://localhost:3000');
   assert.equal(report.phase, 'active'); assert.equal(report.testState, 'passed');
-  assert.equal(report.target.ip, '5.6.7.8'); assert.equal(report.score, null);
-  assert.deepEqual(f.calls, ['1.2.3.4', '5.6.7.8']);
+  assert.equal(report.target.ip, '203.0.113.40'); assert.equal(report.score, null);
+  assert.deepEqual(f.calls, ['203.0.113.44', '203.0.113.40', '203.0.113.40']);
   assert.equal(await readFile(f.session.file, 'utf8'), backup);
   await f.session.stop(); assert.deepEqual(f.settings(), f.original);
 });
@@ -126,7 +207,7 @@ test('唤醒网络未就绪时保留保护意愿，下次重连成功清除错�
   let offline = false;
   const f = await fixture(t, { detect: async () => {
     if (offline) throw new Error('network offline');
-    return { ip: '1.2.3.4', language: 'ko-KR', locale: 'ko-KR' };
+    return { ip: '203.0.113.44', language: 'ko-KR', locale: 'ko-KR' };
   } });
   await f.session.start('http://localhost:3000');
   offline = true;
@@ -178,7 +259,7 @@ test('启动期间排队的唤醒不能越过后续关闭，重新打开网络�
   const f = await fixture(t, {
     detect: async () => {
       if (offline) throw new Error('network not ready');
-      return { ip: '1.2.3.4', language: 'ko-KR', locale: 'ko-KR' };
+      return { ip: '203.0.113.44', language: 'ko-KR', locale: 'ko-KR' };
     },
     apply: async () => { applies++; await applying; return []; },
   });
@@ -205,7 +286,8 @@ test('关闭等待进行中的启动结束，再恢复；重复关闭幂等', as
 test('周期任务真实发起测试，不并发；关闭监测后停止调度', async t => {
   let concurrent = 0, peak = 0, count = 0;
   const f = await fixture(t, { intervalMs: 15, test: async () => { peak = Math.max(peak, ++concurrent); await delay(25); concurrent--; return { runId: String(++count), state: 'passed' }; } });
-  await f.session.start('http://localhost:3000'); await delay(85); await f.session.monitor(false, 60000); await f.session.queue;
+  await f.session.start('http://localhost:3000'); await delay(85); await f.session.monitor(false, 60000);
+  while (f.session.report().testing) await delay(5);
   assert.ok(count >= 2); assert.equal(peak, 1); assert.equal(f.session.report().nextTestAt, null);
   const stoppedAt = count; await delay(45); assert.equal(count, stoppedAt);
 });
@@ -314,15 +396,15 @@ test('检测失败保留真实原因，关闭成功清除旧检测错误和轮�
 });
 
 test('IP 情报冲突时拒绝适配，韩国出口映射到韩国时区和语言', () => {
-  assert.throws(() => targetFromExit({ primary: { ip: '1.2.3.4', countryCode: 'KR' }, consistentCountry: false }), /冲突/);
-  const target = targetFromExit({ primary: { ip: '1.2.3.4', countryCode: 'KR', timezone: 'Asia/Seoul', city: 'Seoul' } });
+  assert.throws(() => targetFromExit({ primary: { ip: '203.0.113.44', countryCode: 'KR' }, consistentCountry: false }), /冲突/);
+  const target = targetFromExit({ primary: { ip: '203.0.113.44', countryCode: 'KR', timezone: 'Asia/Seoul', city: 'Seoul' } });
   assert.equal(target.windowsTimezone, 'Korea Standard Time'); assert.equal(target.language, 'ko-KR');
 });
 
 test('启动保护不打开浏览器，已有连接继续验证，未连接或验证失败仍报告部分生效', async t => {
   for (const scenario of ['disconnected', 'verified', 'apply', 'headers']) await t.test(scenario, async t => {
     const stateDir = await mkdtemp(path.join(os.tmpdir(), 'checkcc-protection-browser-'));
-    const target = targetFromExit({ primary: { ip: '1.2.3.4', countryCode: 'KR', timezone: 'Asia/Seoul' } });
+    const target = targetFromExit({ primary: { ip: '203.0.113.44', countryCode: 'KR', timezone: 'Asia/Seoul' } });
     let appliedTargets = [];
     const runtime = {
       clients: new Map(scenario === 'disconnected' ? [] : [['web', {}]]), policy: {}, enabled: false, load: async () => {},
@@ -386,7 +468,7 @@ test('macOS 开启保护适配 IANA 时区，复检不覆盖手动设置，关�
       setZone: async target => { calls.push(target); if (denied) throw new Error('已取消系统授权'); zone = target; },
       gatewayRequest: async () => ({ cloak: { enabled: false } }),
     });
-    session.detect = async () => targetFromExit({ primary: { ip: '1.2.3.4', countryCode: 'KR', timezone: 'Asia/Seoul' } });
+    session.detect = async () => targetFromExit({ primary: { ip: '203.0.113.44', countryCode: 'KR', timezone: 'Asia/Seoul' } });
     session.test = async () => ({ state: 'passed' });
     const started = await session.start('http://localhost:3000');
     assert.deepEqual(calls, ['Asia/Seoul']);
@@ -411,7 +493,7 @@ test('macOS 开启保护适配 IANA 时区，复检不覆盖手动设置，关�
 test('启动保护开关独立控制下一次启动，不依赖上次手动开关结果且不覆盖活跃会话', async t => {
   const stateDir = await mkdtemp(path.join(os.tmpdir(), 'checkcc-startup-preference-'));
   t.after(() => rm(stateDir, { recursive: true, force: true }));
-  const session = new ProtectionSession({ stateDir, snapshot: async () => ({}), apply: async () => [], restore: async () => [], detect: async () => ({ ip: '1.2.3.4', language: 'en', locale: 'en-US' }), test: async () => ({ state: 'passed' }) });
+  const session = new ProtectionSession({ stateDir, snapshot: async () => ({}), apply: async () => [], restore: async () => [], detect: async () => ({ ip: '203.0.113.44', language: 'en', locale: 'en-US' }), test: async () => ({ state: 'passed' }) });
   assert.equal((await session.startupPreference(true)).desiredEnabled, true);
   assert.equal(session.report().enabled, false, '启动配置只设定意愿，由正常恢复流程开启保护');
   assert.equal((await session.startupPreference(false)).desiredEnabled, false);

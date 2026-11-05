@@ -37,19 +37,19 @@ test('关闭请求期间保持加载、禁用；结束后才允许再次操作',
     const html = button(phase, { powerAction: 'stop' });
     assert.match(html, /disabled=""/);
     assert.match(html, /aria-busy="true"/);
-    assert.match(html, />关闭保护<\/button>/);
+    assert.match(html, />关闭环境防护<\/button>/);
   }
   assert.doesNotMatch(button('idle'), /disabled=""/);
-  assert.match(button('idle'), />启动保护<\/button>/);
+  assert.match(button('idle'), />启动环境防护<\/button>/);
   assert.doesNotMatch(button('active'), /disabled=""/);
-  assert.match(button('active'), />关闭保护<\/button>/);
+  assert.match(button('active'), />关闭环境防护<\/button>/);
 });
 
 test('启停和检测分阶段显示；启停完成后自动复检期间仍禁止重复操作', () => {
   for (const powerAction of ['start', 'stop']) {
     const html = workspace('active', { powerAction, busy: true, checking: true });
     assert.doesNotMatch(html, /检测中…/);
-    assert.match(html, />重新检测<\/button>/);
+    assert.match(html, />检测<\/button>/);
   }
   for (const phase of ['starting', 'stopping']) {
     assert.doesNotMatch(workspace(phase, { checking: true }), /检测中…/);
@@ -60,20 +60,39 @@ test('启停和检测分阶段显示；启停完成后自动复检期间仍禁�
     const power = button(phase, props);
     assert.match(power, /disabled=""/);
     assert.match(power, /aria-busy="false"/);
-    assert.ok(power.includes(phase === 'active' ? '>关闭保护</button>' : '>启动保护</button>'));
+    assert.ok(power.includes(phase === 'active' ? '>关闭环境防护</button>' : '>启动环境防护</button>'));
   }
+});
+
+test('后台检测不改变检测按钮文案，不禁用保护和网络模式；主动检测仅锁本按钮', () => {
+  const report = { phase: 'active', enabled: true, testing: true, issues: [], history: [] };
+  for (const checking of [false, true]) {
+    const html = workspace('active', { report, checking, busy: false });
+    assert.doesNotMatch(button('active', { report, checking, busy: false }), /disabled=""/);
+    const modes = html.match(/<button[^>]*class="netcore-mode"[^>]*>/g) ?? [];
+    assert.equal(modes.length, 4);
+    for (const mode of modes) assert.doesNotMatch(mode, /disabled=""/);
+    if (checking) assert.match(html, /disabled="" aria-busy="true"[^>]*>检测中…<\/button>/);
+    else { assert.match(html, />检测<\/button>/); assert.doesNotMatch(html, /检测中…/); }
+  }
+});
+
+test('下降提醒使用固定文案，持续低分不因百分比变化反复播报', () => {
+  const report = { phase: 'active', enabled: true, issues: [], history: [], alarm: true };
+  assert.equal(workspace('active', { report: { ...report, scoreDropPercent: 40 } }), workspace('active', { report: { ...report, scoreDropPercent: 60 } }));
+  assert.match(workspace('active', { report }), /下降至少40%/);
 });
 
 test('节点变化后仍显示关闭保护，先关闭再启动以重新适配', () => {
   const report = { phase: 'restart_required', enabled: true, issues: [], history: [], testState: 'stale' };
-  assert.match(button('restart_required', { report }), />关闭保护<\/button>/);
+  assert.match(button('restart_required', { report }), />关闭环境防护<\/button>/);
   assert.doesNotMatch(button('restart_required', { report }), /disabled=""/);
-  assert.match(button('restart_required', { report, powerAction: 'start' }), />启动保护<\/button>/);
+  assert.match(button('restart_required', { report, powerAction: 'start' }), />启动环境防护<\/button>/);
   assert.match(button('restart_required', { report, powerAction: 'start' }), /disabled=""/);
 });
 
 test('页面从服务端读到启动或关闭阶段时仍禁用按钮并提供可访问的加载状态', () => {
-  for (const [phase, label] of [['starting', '启动保护'], ['stopping', '关闭保护']]) {
+  for (const [phase, label] of [['starting', '启动环境防护'], ['stopping', '关闭环境防护']]) {
     const html = button(phase);
     assert.match(html, /disabled=""/);
     assert.match(html, /aria-busy="true"/);
@@ -87,13 +106,13 @@ test('保护控制只有一个按钮和两种文案，部分验证不新增状�
     const html = workspace('partial', { report });
     assert.doesNotMatch(html, /部分生效|Partially verified|workspace-state/);
     assert.match(button('partial', { report }), new RegExp(`data-enabled="${enabled}"`));
-    assert.ok(button('partial', { report }).includes(enabled ? '>关闭保护</button>' : '>启动保护</button>'));
+    assert.ok(button('partial', { report }).includes(enabled ? '>关闭环境防护</button>' : '>启动环境防护</button>'));
     assert.match(html, /浏览器未验证/);
     assert.equal((html.match(/class="repair-button workspace-power"/g) ?? []).length, 1);
   }
   const report = { phase: 'restore_failed', enabled: false, issues: ['恢复失败'], history: [] };
   assert.doesNotMatch(button('restore_failed', { report }), /disabled=""/);
-  assert.match(button('restore_failed', { report }), />关闭保护<\/button>/);
+  assert.match(button('restore_failed', { report }), />关闭环境防护<\/button>/);
   assert.match(workspace('idle', { connected: false }), /本机服务未连接/);
   assert.match(button('idle', { connected: false }), /disabled=""/);
 });
@@ -234,11 +253,11 @@ test('重连失败按退避间隔重试，成功后解除重连状态', async t 
   const originalNow = Date.now;
   let now = 1000, attempts = 0;
   Date.now = () => now; t.after(() => { Date.now = originalNow; });
-  let report = { enabled: true, desiredEnabled: true, phase: 'active', testState: 'passed' };
+  let report = { enabled: false, desiredEnabled: true, phase: 'idle', testState: 'pending' };
   const hook = protectionHook(t, async action => {
     if (action === 'resume') {
       attempts++;
-      report = { ...report, testState: attempts === 1 ? 'failed' : 'passed', testError: attempts === 1 ? 'network not ready' : null };
+      report = { ...report, enabled: attempts > 1, phase: attempts === 1 ? 'idle' : 'active', testState: attempts === 1 ? 'failed' : 'passed', testError: attempts === 1 ? 'network not ready' : null };
     }
     return report;
   });
@@ -249,19 +268,19 @@ test('重连失败按退避间隔重试，成功后解除重连状态', async t 
   await hook.refresh(); assert.equal(attempts, 2);
 });
 
-test('服务掉线后恢复自动重连，多个唤醒通知不并发执行保护操作', async t => {
-  let offline = true, attempts = 0, release;
-  const report = { enabled: true, desiredEnabled: true, phase: 'active', testState: 'passed' };
+test('服务恢复或普通检测失败时保护仍启用，只读刷新不重新应用配置或锁按钮', async t => {
+  let offline = true, attempts = 0;
+  const report = { enabled: true, desiredEnabled: true, phase: 'partial', testState: 'failed' };
   const hook = protectionHook(t, async action => {
     if (offline) throw new TypeError('fetch failed');
-    if (action === 'resume') { attempts++; await new Promise(resolve => { release = resolve; }); }
+    if (action === 'resume') attempts++;
     return report;
   });
   await hook.refresh(); assert.equal(hook.state().connected, false);
   offline = false; hook.wake();
   await new Promise(resolve => setImmediate(resolve));
-  hook.wake(); await hook.refresh(); assert.equal(attempts, 1);
-  release(); await new Promise(resolve => setImmediate(resolve));
+  hook.wake(); await hook.refresh(); assert.equal(attempts, 0);
+  assert.equal(hook.state().busy, false);
   assert.equal(hook.state().connected, true); assert.equal(hook.state().error, '');
 });
 

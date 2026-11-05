@@ -10,16 +10,19 @@ import { RepairDialog } from "./RepairDialog";
 import { currentSimulation, simulationSignals, nativeClientSignals } from "@/detection/simulation-evidence";
 import { mergePointSignals, mergePointCheckSignals, requestSignalSimulation } from "@/detection/single-signal";
 import { signalPolicy, signalTestKind } from "@/detection/signal-policy";
-import { activeRuntimePolicy, synchronizeBrowserCloak } from "@/detection/environment-runtime";
+import { activeRuntimePolicy, synchronizeBrowserCloak, watchBrowserCloak, type BrowserCloakExecution } from "@/detection/environment-runtime";
 import { installRuntimePolicy, restoreRuntimePolicy } from "@/detection/runtime-policy.mjs";
 import { protectionRequest } from "@/detection/protection";
-import { buildGatewayCheck } from "@/detection/gateway-check";
+import { buildGatewayCheck, readNetCore, readNetCoreNetwork, controlNetCore, importNetCore, measureNetCoreDelay, setNetCoreMode, refreshNetCore as refreshNetCoreSubscription, type NetCoreReport, type NetCoreNetworkState, type NetCoreAction, type NetCoreImportPayload, type ExitHistory } from "@/detection/gateway-check";
+import { AddConfigDialog } from "./AddConfigDialog";
+import { NetworkExemptDialog } from "./NetworkExemptDialog";
+import { BrowserPickerDialog } from "./BrowserPickerDialog";
 import { environmentScores } from "@/detection/environment-evidence";
 import { verificationScores, verificationItem } from "@/detection/verification-score";
 import { defaultSignals, normalizeRegion, type SignalView } from "@/detection/client-engine";
 import { runBrowserScan, type BrowserScan } from "@/detection/browser-scan";
 import { buildExitTarget, fetchExitGeo, type ExitGeo } from "@/detection/exit-geo";
-import { checkGateway, readGateway, setGatewayCloak, type CloakState, type GatewayCheck } from "@/detection/gateway-check";
+import { checkGateway, probeNodeExits, readGateway, setGatewayCloak, type CloakState, type GatewayCheck } from "@/detection/gateway-check";
 import { detectorLocaleText } from "@/detection/locale";
 import { detectionConfig } from "@/detection/config";
 import type { LocaleCode } from "@/i18n/messages";
@@ -42,25 +45,44 @@ export function Detector({ locale = "zh" }: { locale?: LocaleCode }) {
   const [pointBusy, setPointBusy] = useState<string | null>(null);
   const [pointResults, setPointResults] = useState<Record<string, { signal: SignalResult; simulation: boolean; profileUpdatedAt?: string | null; cloakUpdatedAt?: string | null }>>({});
   const [exitGeo, setExitGeo] = useState<ExitGeo | null>(null);
-  const [exitLoading, setExitLoading] = useState(false);
+  const [netCore, setNetCore] = useState<NetCoreReport | null>(null);
+  const [netCoreBusy, setNetCoreBusy] = useState(false);
+  const [netCoreError, setNetCoreError] = useState("");
+  const [addConfigOpen, setAddConfigOpen] = useState(false);
+  // 逐节点实测出口：显式触发，避免自动轮询造成出口 IP 抖动。
+  const [netCoreExits, setNetCoreExits] = useState<Record<string, { countryCode: string | null; country: string | null; ip: string | null } | null>>({});
+  const [netCoreExiting, setNetCoreExiting] = useState(false);
+  // 修改配置：复用同一个表单，预填当前订阅地址。
+  const [editConfigOpen, setEditConfigOpen] = useState(false);
+  const [networkExemptOpen, setNetworkExemptOpen] = useState(false);
+  const [netCoreNetwork, setNetCoreNetwork] = useState<NetCoreNetworkState | null>(null);
+  const [exitHistory, setExitHistory] = useState<ExitHistory | null>(null);
+  const [netCoreDelays, setNetCoreDelays] = useState<Record<string, number | null>>({});
+  const [netCoreMeasuring, setNetCoreMeasuring] = useState(false);
   const [checkError, setCheckError] = useState("");
+  // 浏览器迷惑层报告：未接入就是 null，界面把它显示成「未验证」而不是通过。
+  const [browserCloak, setBrowserCloak] = useState<BrowserCloakExecution | null>(null);
+  const [linkingBrowser, setLinkingBrowser] = useState(false);
+  const [browserPickerOpen, setBrowserPickerOpen] = useState(false);
   const [detailSignalId, setDetailSignalId] = useState<string | null>(null);
   const [baseline, setBaseline] = useState<Baseline | null>(null);
   const [filter, setFilter] = useState("all");
   const [search, setSearch] = useState("");
   const [running, setRunning] = useState(false);
-  const [sampling, setSampling] = useState(false);
+  const [manualChecking, setManualChecking] = useState(false);
+  const [completedSample, setCompletedSample] = useState<{ id: string; runId?: string } | null>(null);
   const [sampleRetry, setSampleRetry] = useState(0);
-  const [sampledRun, setSampledRun] = useState<string | null>(null);
   const [transitioning, setTransitioning] = useState(false);
   const [powerAction, setPowerAction] = useState<"start" | "stop" | null>(null);
   const powerLock = useRef(false);
   const scanLock = useRef(false);
+  const scanTask = useRef<Promise<void> | null>(null);
+  const scanVersion = useRef(0);
   const cloakBusy = protection.busy;
   const gatewayConnecting = !protection.connected;
-  const loading = running || sampling || selfTest.busy || pointBusy !== null;
+  const loading = manualChecking || pointBusy !== null;
   const target = protection.report?.enabled && protection.report.target ? protection.report.target : buildExitTarget(exitGeo);
-  const measurementsStale = Boolean(protection.report?.enabled && (protection.report.phase === "restart_required" || !protection.report.runId || sampledRun !== protection.report.runId));
+  const measurementsStale = Boolean(protection.report?.enabled && (protection.report.phase === "restart_required" || !protection.report.runId));
   const browserSignals = useMemo(() => measurementsStale ? [] : browserScan?.signals ?? [], [browserScan, measurementsStale]);
   const simulationJob = measurementsStale ? null : currentSimulation(selfTest.job, optimization, selfTest.error);
   const claudeSignals = useMemo(() => measurementsStale ? [] : simulationSignals(nativeClientSignals(claudeCheck?.signals ?? [], claudeCheck?.cloak?.updatedAt === optimization?.updatedAt && claudeCheck?.report?.profile?.updatedAt === optimization?.target?.updatedAt), simulationJob, optimization, locale).map((signal) => {
@@ -69,21 +91,97 @@ export function Detector({ locale = "zh" }: { locale?: LocaleCode }) {
   }), [claudeCheck, simulationJob, optimization, locale, pointResults, measurementsStale]);
 
   const refreshExit = useCallback(async () => {
-    setExitLoading(true);
-    try { const geo = await fetchExitGeo(locale); setExitGeo(geo); }
-    finally { setExitLoading(false); }
+    const geo = await fetchExitGeo(locale); setExitGeo(geo);
   }, [locale]);
-  const runAll = useCallback(async () => {
-    if (scanLock.current) throw new Error(zh ? "已有检测正在执行，请稍候。" : "A scan is already running.");
-    scanLock.current = true; setRunning(true); setCheckError("");
+  // 内核状态只读轮询：失败保留真实错误，不静默回退为“未启用”。
+  const refreshNetCore = useCallback(async () => {
     try {
+      const value = await readNetCore();
+      setNetCore(value.netCore);
+      setExitHistory(value.exitHistory);
+      // 延迟随状态下发：检测时自动填上，用户不需要先点「测速」。
+      const measured = value.netCore?.delays;
+      if (measured) setNetCoreDelays(measured);
+      setNetCoreError("");
+    }
+    catch (error) { setNetCoreError(error instanceof Error ? error.message : String(error)); }
+  }, []);
+  const measureNetCore = useCallback(async (options: { silent?: boolean } = {}) => {
+    const names = (netCore?.nodes ?? []).filter((name): name is string => typeof name === "string");
+    if (!names.length) return;
+    // 自动/定时测速静默执行：界面不切「测速中」，旧结果继续显示，新结果回来直接覆盖。
+    if (!options.silent) setNetCoreMeasuring(true);
+    try {
+      const result = await measureNetCoreDelay(names, { force: true });
+      if (result.delays) setNetCoreDelays(result.delays);
+      if (result.netCore) setNetCore(result.netCore);
+      if (!result.ok) setNetCoreError(result.reason ?? "测速失败。");
+    } catch (error) { setNetCoreError(error instanceof Error ? error.message : String(error)); }
+    finally { if (!options.silent) setNetCoreMeasuring(false); }
+  }, [netCore]);
+  const probeExits = useCallback(async () => {
+    const names = (netCore?.nodes ?? []).filter((name): name is string => typeof name === "string");
+    if (!names.length) return;
+    setNetCoreExiting(true);
+    try {
+      const result = await probeNodeExits(names);
+      if (result.exits) setNetCoreExits(result.exits);
+      if (result.netCore) setNetCore(result.netCore);
+      if (!result.ok) setNetCoreError(result.reason ?? (zh ? "出口检测失败。" : "Exit probe failed."));
+    } catch (error) { setNetCoreError(error instanceof Error ? error.message : String(error)); }
+    finally { setNetCoreExiting(false); }
+  }, [netCore, zh]);
+  const netCoreAction = useCallback(async (action: NetCoreAction, node?: string, options: { enabled?: boolean } = {}) => {
+    setNetCoreBusy(true);
+    try {
+      const result = await controlNetCore(action, node, options);
+      if (result.netCore) setNetCore(result.netCore);
+      setNetCoreError(result.ok ? "" : (result.reason ?? (zh ? "内核操作未生效。" : "Kernel action had no effect.")));
+    } catch (error) { setNetCoreError(error instanceof Error ? error.message : String(error)); }
+    finally { setNetCoreBusy(false); }
+  }, [zh]);
+  useEffect(() => {
+    let cancelled = false;
+    const tick = () => { if (!cancelled) void refreshNetCore(); };
+    tick();
+    const timer = setInterval(tick, 15000);
+    return () => { cancelled = true; clearInterval(timer); };
+  }, [refreshNetCore]);
+  // 节点列表就绪后自动测一次延迟：用户不必先点「测速」，也不必等 15 秒轮询才看到数字。
+  const delaysCount = Object.keys(netCoreDelays).length;
+  const nodeCount = netCore?.nodes?.length ?? 0;
+  useEffect(() => {
+    if (netCore?.state !== "running" || !nodeCount || delaysCount > 0 || netCoreMeasuring) return;
+    // 放到下一个 tick 再触发：effect 里直接改状态会违反 react-hooks/set-state-in-effect。
+    const timer = setTimeout(() => { void measureNetCore({ silent: true }); }, 0);
+    return () => clearTimeout(timer);
+  }, [netCore?.state, nodeCount, delaysCount, netCoreMeasuring, measureNetCore]);
+
+  // 内网豁免摘要只读一次：它不是轮询指标，弹窗保存后会用返回的真实状态覆盖它。
+  useEffect(() => {
+    let cancelled = false;
+    void readNetCoreNetwork().then((value) => { if (!cancelled) setNetCoreNetwork(value); }).catch(() => {});
+    return () => { cancelled = true; };
+  }, []);
+  const runAll = useCallback((options: { background?: boolean; isCurrent?: () => boolean; runId?: string } = {}) => {
+    if (scanTask.current) return scanTask.current;
+    const version = scanVersion.current;
+    const current = () => version === scanVersion.current && (options.isCurrent?.() ?? true);
+    scanLock.current = true; setRunning(true);
+    if (!options.background) setCheckError("");
+    const task = (async () => { try {
       const [browser, gateway] = await Promise.all([runBrowserScan(normalizeRegion("auto"), locale, detectorText), checkGateway(locale)]);
+      if (!current()) return;
+      if (gateway.error) throw new Error(gateway.error);
       setBrowserScan(browser); setClaudeCheck(gateway); setOptimization(gateway.cloak); setPointResults({});
       if (gateway.geo) setExitGeo(gateway.geo);
-      if (gateway.error) throw new Error(gateway.error);
-    } catch (error) { setCheckError(error instanceof Error ? error.message : String(error)); throw error; }
-    finally { scanLock.current = false; setRunning(false); }
-  }, [locale, detectorText, zh]);
+      setCompletedSample({ id: crypto.randomUUID(), runId: options.runId });
+    } catch (error) { if (current() && !options.background) setCheckError(error instanceof Error ? error.message : String(error)); throw error; }
+    finally { if (version === scanVersion.current) { scanTask.current = null; scanLock.current = false; setRunning(false); } }
+    })();
+    scanTask.current = task;
+    return task;
+  }, [locale, detectorText]);
   const scanRef = useRef(runAll);
   const selfTestRef = useRef(selfTest);
   useEffect(() => { scanRef.current = runAll; selfTestRef.current = selfTest; }, [runAll, selfTest]);
@@ -98,7 +196,7 @@ export function Detector({ locale = "zh" }: { locale?: LocaleCode }) {
     const scan = async () => {
       if (cancelled) return;
       if (scanLock.current || powerLock.current) { timer = setTimeout(() => void scan(), 1000); return; }
-      try { await scanRef.current(); }
+      try { await scanRef.current({ background: true, isCurrent: () => !cancelled }); }
       catch { if (!cancelled) timer = setTimeout(() => void scan(), Math.min(30000, 3000 * 2 ** Math.min(attempts++, 3))); }
     };
     let timer = setTimeout(() => void scan(), 0);
@@ -118,21 +216,19 @@ export function Detector({ locale = "zh" }: { locale?: LocaleCode }) {
   const sampleLock = useRef(false);
   useEffect(() => {
     const id = protection.report?.runId;
-    if (!id || lastSampledRun.current === id || !protection.report?.enabled || !protection.connected || protection.report.testState !== "passed" || transitioning || protection.busy || protection.report.phase === "starting" || protection.report.phase === "stopping") return;
+    if (!id || lastSampledRun.current === id || !protection.report?.enabled || !protection.connected || !["passed", "failed"].includes(protection.report.testState ?? "") || transitioning || protection.busy || protection.report.phase === "starting" || protection.report.phase === "stopping") return;
     let cancelled = false;
     const sample = async () => {
       if (cancelled) return;
       if (powerLock.current || scanLock.current || sampleLock.current) { timer = setTimeout(() => void sample(), 500); return; }
-      sampleLock.current = true; setSampling(true);
+      sampleLock.current = true;
       try {
-        await synchronizeBrowserCloak({ force: true });
-        if (cancelled) return;
         await selfTestRef.current.refresh();
         if (cancelled) return;
-        await scanRef.current();
-        if (!cancelled) { lastSampledRun.current = id; setSampledRun(id); }
-      } catch (error) { if (!cancelled) { setCheckError(String(error)); timer = setTimeout(() => setSampleRetry(value => value + 1), Math.min(30000, 3000 * 2 ** Math.min(sampleRetry, 3))); } }
-      finally { sampleLock.current = false; setSampling(false); }
+        await scanRef.current({ background: true, isCurrent: () => !cancelled, runId: id });
+        if (!cancelled) lastSampledRun.current = id;
+      } catch { if (!cancelled) timer = setTimeout(() => setSampleRetry(value => value + 1), Math.min(30000, 3000 * 2 ** Math.min(sampleRetry, 3))); }
+      finally { sampleLock.current = false; }
     };
     let timer = setTimeout(() => void sample(), 0);
     return () => { cancelled = true; clearTimeout(timer); };
@@ -224,7 +320,6 @@ export function Detector({ locale = "zh" }: { locale?: LocaleCode }) {
     return orderedIds().map((id) => map.get(id)).filter((signal): signal is SignalView => Boolean(signal));
   }, [browserSignals, claudeSignals, detectorText, zh]);
 
-  const riskScores = useMemo(() => environmentScores(browserScan ? browserSignals : null, claudeCheck?.report ? claudeSignals : null), [browserScan, browserSignals, claudeCheck, claudeSignals]);
 
   const scores = useMemo(() => verificationScores(browserScan ? browserSignals : null, claudeCheck?.report ? claudeSignals : null), [browserScan, browserSignals, claudeCheck, claudeSignals]);
 
@@ -244,23 +339,27 @@ export function Detector({ locale = "zh" }: { locale?: LocaleCode }) {
   const observedRun = useRef<string | null>(null);
   useEffect(() => {
     const report = protection.report;
-    if (!report?.enabled || report.testState !== "passed" || !report.runId || sampledRun !== report.runId || running || observedRun.current === `${report.runId}:${riskScores.combined}` || riskScores.combined === null || !browserScan || !claudeCheck?.report) return;
-    observedRun.current = `${report.runId}:${riskScores.combined}`;
-    void protectionRequest("observe", { runId: report.runId, score: riskScores.combined }).then(() => protection.refresh()).catch(() => { observedRun.current = null; });
-  }, [protection, sampledRun, riskScores.combined, running, browserScan, claudeCheck]);
+    const maximum = scores.coverage.combined.maximum;
+    if (!report?.enabled || report.testing || !["passed", "failed"].includes(report.testState ?? "") || !report.runId || completedSample?.runId !== report.runId || running || observedRun.current === completedSample.id || scores.combined === null || maximum <= 0 || !browserScan || !claudeCheck?.report) return;
+    observedRun.current = completedSample.id;
+    void protectionRequest("observe", { runId: report.runId, sampleId: completedSample.id, score: Math.max(0, Math.min(100, 100 * (1 - scores.combined / maximum))), verificationScore: scores.combined, verificationMaximum: maximum }).then(() => protection.refresh()).catch(() => { observedRun.current = null; });
+  }, [protection, completedSample, scores, running, browserScan, claudeCheck]);
 
   const refreshChecks = async (enabled: boolean) => {
-    await Promise.all([refreshExit(), enabled ? protection.act("test") : runAll()]);
+    await Promise.all([refreshExit(), enabled ? protectionRequest("test").then(() => protection.refresh()) : runAll({ background: true })]);
   };
   const toggleProtection = async (stop = false) => {
-    if (powerLock.current || sampleLock.current || transitioning || protection.busy || loading || exitLoading || protection.report?.testing || !protection.connected || !protection.report || protection.report.phase === "starting" || protection.report.phase === "stopping") return;
+    if (powerLock.current || transitioning || protection.busy || !protection.connected || !protection.report || protection.report.phase === "starting" || protection.report.phase === "stopping") return;
     powerLock.current = true;
+    scanVersion.current++; scanTask.current = null; scanLock.current = false; setRunning(false);
     const restarting = protection.report.phase === "restart_required" && !stop;
     const stopping = !restarting && (protection.report.enabled || protection.report.phase === "restore_failed");
     setPowerAction(stopping ? "stop" : "start");
     setTransitioning(true); setCheckError("");
     try {
       if (stopping) {
+        // 只退 TUN：内核继续跑（节点仍可测速/切换），只是不再接管系统流量。
+        await netCoreAction("tunnel", undefined, { enabled: false });
         const report = await protection.act("stop");
         if (report.phase === "restore_failed") throw new Error(report.issues.join("；"));
         if (baseline) {
@@ -277,26 +376,44 @@ export function Detector({ locale = "zh" }: { locale?: LocaleCode }) {
         localStorage.setItem(baselineKey, JSON.stringify(saved)); setBaseline(saved);
         localStorage.setItem("checkcc.protection-local-pending.v1", "true");
         await protection.act("start");
+        // 启动保护后重新接管 TUN（内核若已停止则一并拉起）。
+        await netCoreAction("tunnel", undefined, { enabled: true });
       }
       setPowerAction(null);
       if (stopping) {
         await selfTest.refresh();
-        while (scanLock.current) await new Promise(resolve => setTimeout(resolve, 100));
       }
-      await refreshChecks(!stopping);
+      void refreshChecks(!stopping).catch(() => {});
     } catch (error) { setCheckError(error instanceof Error ? error.message : String(error)); }
     finally { powerLock.current = false; setPowerAction(null); setTransitioning(false); }
   };
   const recheck = async () => {
-    if (powerLock.current || sampleLock.current || scanLock.current || loading || transitioning || protection.busy || protection.report?.testing || exitLoading) return;
-    setTransitioning(true); setCheckError("");
-    try { await refreshChecks(Boolean(protection.report?.enabled)); }
+    if (powerLock.current || manualChecking || transitioning || protection.busy) return;
+    setManualChecking(true); setCheckError("");
+    try { await runAll({ runId: protection.report?.runId ?? undefined }); }
     catch (error) { setCheckError(error instanceof Error ? error.message : String(error)); }
-    finally { setTransitioning(false); }
+    finally { setManualChecking(false); }
   };
+  // 接入并验证浏览器：带 launch 才会拉起受管浏览器；完成后重扫，让浏览器侧信号按新声明刷新。
+  const linkBrowser = async () => {
+    setLinkingBrowser(true);
+    try {
+      const report = await synchronizeBrowserCloak({ launch: true, force: true });
+      setBrowserCloak(report);
+      setCheckError("");
+      await recheck();
+    } catch (error) {
+      setCheckError(error instanceof Error ? error.message : String(error));
+    } finally { setLinkingBrowser(false); }
+  };
+  useEffect(() => watchBrowserCloak((report) => setBrowserCloak(report)), []);
   return <>
-    <ProtectionWorkspace error={checkError || protection.error} locale={locale} report={protection.report} connected={protection.connected} powerAction={powerAction} checking={!powerAction && (exitLoading || loading || protection.report?.testing === true)} busy={cloakBusy || transitioning || exitLoading || loading || protection.report?.testing === true} scores={scores} geo={exitGeo} target={target} baseline={baseline} browser={browserSignals} claude={claudeSignals} signals={allSignals} filter={filter} search={search} onFilter={setFilter} onSearch={setSearch} onToggle={() => void toggleProtection()} onStop={() => void toggleProtection(true)} onMonitor={(enabled, intervalMs) => { void protection.act("monitor", { enabled, intervalMs }).catch(() => {}); }} onRefresh={() => void recheck()} onSelect={setDetailSignalId}
+    <ProtectionWorkspace error={checkError || protection.error} locale={locale} report={protection.report} connected={protection.connected} powerAction={powerAction} checking={manualChecking} busy={cloakBusy || transitioning} scores={scores} geo={exitGeo} target={target} baseline={baseline} browser={browserSignals} claude={claudeSignals} signals={allSignals} filter={filter} search={search} onFilter={setFilter} onSearch={setSearch} onToggle={() => void toggleProtection()} onStop={() => void toggleProtection(true)} onMonitor={(enabled, intervalMs) => { void protection.act("monitor", { enabled, intervalMs }).catch(() => {}); }} onRefresh={() => void recheck()} onSelect={setDetailSignalId} netCore={netCore} netCoreBusy={netCoreBusy} netCoreError={netCoreError} onNetCoreRefresh={() => void refreshNetCore()} onNetCoreRestart={() => void netCoreAction("restart")} onNetCoreSelect={(name) => void netCoreAction("select", name)} onNetCoreAddConfig={() => setAddConfigOpen(true)} onNetCoreEditConfig={() => setEditConfigOpen(true)} onNetCoreOpenNetworkConfig={() => setNetworkExemptOpen(true)} netCoreNetwork={netCoreNetwork} netCoreExitHistory={exitHistory} onNetCoreMeasure={() => void measureNetCore()} onNetCoreModeChange={(mode) => { setNetCoreBusy(true); void setNetCoreMode(mode).then((result) => { if (result.netCore) setNetCore(result.netCore); if (!result.ok) setNetCoreError(result.reason ?? "切换出站模式失败。"); }).catch((error) => setNetCoreError(error instanceof Error ? error.message : String(error))).finally(() => setNetCoreBusy(false)); }} netCoreMeasuring={netCoreMeasuring} netCoreDelays={netCoreDelays} netCoreExits={netCoreExits} netCoreExiting={netCoreExiting} onNetCoreProbeExits={() => void probeExits()} browserCloak={browserCloak} linkingBrowser={linkingBrowser} onLinkBrowser={() => void linkBrowser()} onOpenBrowserPicker={() => setBrowserPickerOpen(true)} onNetCoreRefreshSubscription={() => void refreshNetCoreSubscription(true).then((result) => { if (result.netCore) setNetCore(result.netCore); if (!result.ok) setNetCoreError(result.reason ?? "订阅更新失败。"); }).catch((error) => setNetCoreError(error instanceof Error ? error.message : String(error)))}
       cards={visibleSignals.length ? <div className="signal-card-grid">{visibleSignals.map((signal) => <SignalCard key={signal.id} signal={signal} browser={browserSignals.find((item) => item.id === signal.id)} claude={claudeSignals.find((item) => item.id === signal.id)} locale={locale} target={target} job={simulationJob} simulationBusy={selfTest.busy} checking={loading} testing={pointBusy === signal.id} detailLabel={zh ? "配置与详情" : "Configuration & details"} onSelect={setDetailSignalId} />)}</div> : <p className="workspace-empty">{zh ? "没有匹配的检测项目。" : "No matching test items."}</p>} />
-    {detailSignal && <RepairDialog key={detailSignal.id} signal={detailSignal} browser={browserSignals.find((item) => item.id === detailSignal.id)} claude={claudeSignals.find((item) => item.id === detailSignal.id)} signals={allSignals} locale={locale} target={target} protectionEnabled={protection.report?.enabled} loading={loading || transitioning || cloakBusy || protection.report?.testing === true || protection.report?.phase === "restart_required"} onClose={() => setDetailSignalId(null)} onRecheck={() => runSignal(detailSignal.id)} onRuntimeRecheck={runAll} onApplyGateway={(choice) => runSignal(detailSignal.id, choice)} />}
+    {editConfigOpen && <AddConfigDialog locale={locale} busy={netCoreBusy} initialUrl={typeof netCore?.source?.url === "string" ? netCore.source.url : ""} onClose={() => setEditConfigOpen(false)} onImport={async (payload: NetCoreImportPayload) => { const result = await importNetCore(payload); if (result.netCore) setNetCore(result.netCore); else await refreshNetCore(); return result; }} />}
+    {addConfigOpen && <AddConfigDialog locale={locale} busy={netCoreBusy} onClose={() => setAddConfigOpen(false)} onImport={async (payload: NetCoreImportPayload) => { const result = await importNetCore(payload); if (result.netCore) setNetCore(result.netCore); else await refreshNetCore(); return result; }} />}
+    {browserPickerOpen && <BrowserPickerDialog locale={locale} busy={netCoreBusy} onClose={() => setBrowserPickerOpen(false)} onSaved={() => {}} onLink={async () => { await linkBrowser(); }} />}
+    {networkExemptOpen && <NetworkExemptDialog locale={locale} busy={netCoreBusy} onClose={() => setNetworkExemptOpen(false)} onSaved={async (state) => { setNetCoreNetwork(state); if (state.netCore) setNetCore(state.netCore); else await refreshNetCore(); setNetCoreError(state.problem ?? ""); }} />}
+    {detailSignal && <RepairDialog key={detailSignal.id} signal={detailSignal} browser={browserSignals.find((item) => item.id === detailSignal.id)} claude={claudeSignals.find((item) => item.id === detailSignal.id)} signals={allSignals} locale={locale} target={target} protectionEnabled={protection.report?.enabled} loading={loading || transitioning || cloakBusy || protection.report?.phase === "restart_required"} onClose={() => setDetailSignalId(null)} onRecheck={() => runSignal(detailSignal.id)} onRuntimeRecheck={runAll} onApplyGateway={(choice) => runSignal(detailSignal.id, choice)} />}
   </>;
 }

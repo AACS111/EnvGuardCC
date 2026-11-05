@@ -192,3 +192,58 @@
 - 风险估计沿用原站偏移0.7、Emoji0.4系数；其余按实测规则强度加权。
 - 首页重新检测与出口刷新共用完整复检，保护开启时实际重新运行保护测试；删除分数卡检测时间。
 - 自动监测可选30秒、1分钟、5分钟、10分钟，并由服务端校验和更新实际调度；新控件复用token、键盘焦点和禁用状态，无新增动画。
+
+
+## 无感后台检测（2026-11-04）
+- 保留现有布局与视觉 token；顶部“重新检测”改为“检测”，只用于用户主动采样验证得分。
+- 自动检测不占用全局忙碌状态，不禁用导航、网络模式、节点选择、配置和保护关闭；仅配置启停锁住相冲突的操作。
+- 自动检测保留上次结果，完成后原位更新；后台不强制同步浏览器配置，不因普通检测失败重新应用保护。
+- 验证得分按适用总分归一化，与上次有效检测比较，下降达到40%提醒；首次不提醒，同一轮持续异常不重复提醒。
+
+## 内网直连配置弹窗（2026-11-04）
+- 采用单页分组表单骨架（与「添加配置」弹窗同族）+ 顶部「当前生效」结论条；方向种子指派的「时间线」「画布」被明确否决：配置低频、条目 1–5 条，引入事件流或拖拽布局的维护成本高于收益，且与现有 `.repair-dialog` 语言冲突。
+- 入口固定为网络页「内网直连（VPN / 公司网络）」区块的「配置」次操作按钮；未配置时也必须可见，否则用户不知道内网域名需要显式声明。
+- 结论条是弹窗内唯一主角：`--workspace-subheading` 600 + 边框语义色（ok/warn/danger），分组标题统一 `--workspace-subheading` 600（与 `.netcore-block h3` 一致，不另造 700 档）。
+- 列表项显示「规范化后的真实产物」（`DOMAIN-SUFFIX,…` / `IP-CIDR,…`），落在默认私网段里的地址标注「已由默认私网规则覆盖」，只提示、不拦截保存。
+- 同排输入框与按钮统一 44px 最小高度；删除按钮 32px + 3px 焦点环；三个添加入口必须带 `aria-label`，不靠 placeholder 充当名称。
+- 主操作只有一个「保存并重启内核」；「保存」为次操作，保存后结论条转为「待重启」。内核未运行时主操作禁用，不出现点了没反应的按钮。
+- 校验全部在服务端：保存前用 `buildKernelConfig` + `assertKernelConfig` 试算，非法值原样返回具体原因且不写盘；文件仍是唯一真相（原子写、0600）。
+- 界面默认只说人话：摘要列真实域名 / 内网 DNS / 网卡，不出现 `DOMAIN-SUFFIX,…`、`IP-CIDR,…`、`10.10.10.5#ENVGUARD-LOCAL-DNS` 这类内核语法；列表项给语义描述（「所有子域名都走直连」/「直连，不进隧道」），裸规则收进「查看生成的规则（高级）」折叠。摘要由纯函数 `exemptSummary()` 生成并被测试锁定，防止规则语法再次漏到默认界面。
+- 没有任何豁免时，摘要给结论与后果（「内网域名会被当成公网去解析，通常打不开」），不摆「0 个域名 / 0 个 IP」这类仪表盘计数。
+- 「测试解析」只走内核真实解析（`/dns/query`）：实测普通进程直连内网 DNS 会被 strict-route 拦成 ETIMEOUT，进程级探测会给出假结论。测试时若草稿与生效配置不一致，先保存并重启内核再查询，并在结果里注明「已按新配置重启内核」。
+- 解析结果按三种状态给结论：真实地址＝已豁免；`198.18.x` 假地址＝仍在走代理（域名没填对）；无 Answer（NXDOMAIN）＝需要填内网 DNS 或域名写错。永久失败文案必须给出下一步，不只报错。
+
+## 声明面一致性与三层架构（2026-11-04）
+- 新增单一真相源 `src/detection/environment-profile.mjs`：由出口画像派生 `languages / locale / timezone / offsetMinutes / acceptLanguage`。内核、网关、迷惑层都从它取值，禁止各自拼接字符串——跨信号矛盾是最容易被识别的破绽。
+- `runtime-policy.mjs` 补齐两个已知矛盾点：`Date#getTimezoneOffset`（此前 `Intl` 已改、`Date` 未改）与 `Intl.DateTimeFormat#resolvedOptions().timeZone`；并对 `navigator.userAgentData.platform` 做真实覆盖，校验时要求「UA 与 UA-CH 平台自洽」。
+- `verifyRuntimePolicy()` 扩到 6 类判据（字体/语言/locale/时区/偏移/UA-CH），任一项漂移即判失败；注入脚本用 `node:vm` 干净上下文回归，防止引入外部符号导致注入即崩。
+- 明确不伪造「系统事实」：Emoji 渲染风格与字体渲染像素不做像素级伪造——韩国用户同样使用 Windows + 对应字体，伪造成 macOS 只会与 UA 自相矛盾；字体仍沿用「拦截中文/厂商字体」的只读值策略，检测侧应将其标为环境固有限制。
+- 网关与浏览器共用同一 `acceptLanguage` 生成顺序（主标签、基码、en），避免两侧头不一致。
+
+## 网关声明面归一化（2026-11-04）
+- 网关只做「UA 与 Client Hints 自洽」的归一化：`sec-ch-ua-platform` / `sec-ch-ua-mobile` 由 UA 推出的平台决定，`sec-ch-ua` 品牌版本与 UA 主版本对齐（`Not?A_Brand` 保留自身版本号）。
+- 不伪造平台：客户端是 Windows 就仍是 Windows——韩国用户同样用 Windows，伪造成 macOS 会与 UA、TLS 指纹、UA-CH 三者互相矛盾。没有 `sec-ch-ua` 的客户端不凭空补头（凭空出现的 hints 本身就是指纹）。
+- 关闭模拟保护时原样转发，不做任何归一化，保持「关了就是关了」的语义。
+- `/__checkcc/status` 新增 `headerAlignment`（platform / 平台提示 / 主版本 / 提示主版本 / 是否自洽），只报事实、不参与打分；`safeHeaders` 白名单同步加入三个 `sec-ch-ua*` 头，便于诊断核对。
+
+## 检测项分层与字体路径自证（2026-11-04）
+- 新增 `src/detection/signal-requirement.ts`：把异常项分成 `rewritable`（声明面可保护）/ `environment`（字体、Emoji、平台等系统事实）/ `link`（出口、可达性、链路）。
+- 概览的「异常项目」只统计 `rewritable`；`environment` 与 `link` 收进折叠的「保护范围外」并标注类别。这样红点数反映「保护是否生效」，而不是「保护改不了的事」。
+- 页脚统计改为 `可保护 X · 保护范围外 Y`，两边都可点击下钻，不做静默降级。
+- 字体层补齐一致性：`FontFaceSet` 的 `values/keys/entries/Symbol.iterator/size/forEach` 与 `check/load`、canvas 宽度口径一致，并输出 `fontPathsConsistent`；任一路径仍能读到被屏蔽字体就判验证失败（专门抓「只补了 check」这类半补丁）。
+- 仍不伪造 Emoji 渲染像素：与 UA/平台冲突的伪造比不伪造更容易被识别。
+
+## 本地浏览器清单与接入偏好（2026-11-04）
+- 明确边界：**已在运行的浏览器无法附加**（没有调试端口）。因此「直接接入」= 用选中的浏览器可执行文件拉起一份受管实例（独立 `user-data-dir` + 调试端口），在你的日常配置之外注入迷惑层，关闭即释放。
+- 新增 `scripts/browser-catalog.mjs`：按平台列出 Chromium 家族（Chrome / Edge / Brave / Vivaldi / Chromium）与 Firefox；只做存在性探测，不读配置、不启动进程。Firefox 标为「不支持调试接入」，列出来是为了让用户看见原因，而不是静默隐藏。
+- 偏好存 `<state>/browser-cloak.json`：`{ excluded: [...], preferred }`，只接受已知 id；`pickBrowser()` 跳过被排除项、preferred 优先，**全部排除时返回 null 并如实报错**，不回退到「随便找个浏览器」。
+- 界面：保护配置「浏览器模拟保护」行新增「选择浏览器」→ 弹窗列出本机浏览器（名称/路径/是否可接入）、每行「不接入」开关与「用这个接入」按钮；接入按钮走 `launch: true`，不接入只影响受管实例，不改动这些浏览器自身设置。
+- 接入通道修正：Windows 上 headful 受管浏览器改走 `--remote-debugging-port` + WebSocket（Chrome 自我重启会丢掉 pipe，表现为「环境连接已关闭」）；headless 仍走 pipe。
+- 受管实例默认是干净配置：接入时只从**用户选中浏览器**的 `User Data/Default/Bookmarks` 复制一份书签（纯 JSON、无完整性校验）；登录态、扩展、Cookie 一律不复制——它们带 MAC 校验，复制过去也不会生效，反而让人误以为登录态被带走。目标已存在书签时不覆盖，保留用户在受管实例里的改动。
+- CDP 命令超时从 7s 放宽到 20s（`CHECKCC_CDP_TIMEOUT` 可覆盖）：慢机器或首次导航会被 7s 误判成「客户端没有响应」。
+- `test:environment` 改为串行 + 不再加全局 `--test-timeout`（每个 Chromium 用例自带 60–120s 上限）；并发跑多份真实浏览器会互相抢资源，导致超时假失败。
+- 受管浏览器启动参数补齐 `--no-first-run` / `--no-default-browser-check` + 起始 `about:blank`：受管实例是全新 profile，缺这两个开关时 Chrome 会打开首次运行页（Windows 上该页面会自动下载 Chrome 安装包，表现为每点一次接入多一个 `chrome (N).exe`）。
+- `check-environment-runtime` 的真实浏览器用例超时统一提到 180s：这些用例各自要拉起一份 Chromium，在负载高的机器上 60s 会被误判成失败（单跑 6–16s，串跑接近 60s）。
+- 受管浏览器在 CDP 连接后立即 `Browser.setDownloadBehavior: deny`：它的职责只是验证声明面，不允许任何页面（首次运行页、promo、重定向）往用户目录写文件。症状对应「点一次接入就多一个 `chrome (N).exe`」。命令失败不阻断接入（老版本内核不支持时静默跳过）。
+- 接入前清理旧受管实例：`<state>/managed-<kind>.pid` 记录 pid，启动前若仍存活则先结束（3s 内没退出就明确报错，让用户手动关）。原因：Chrome 会把「同 user-data-dir 的新启动」委托给已运行实例，并把命令行里的非开关 token（可执行文件路径、`--host-resolver-rules` 里的 `*` / `~NOTFOUND` / `EXCLUDE` / `127.0.0.1` / `localhost`）当成 URL 逐个打开，表现为刷出一屏垃圾标签页、地址栏是 `files/Google/Chrome/Application/chrome.exe ...`。
+- 接入前同时清掉受管 profile 的 `Current Session/Tabs`、`Last Session/Tabs`，避免上次被委托产生的垃圾标签页在下次打开时被恢复。

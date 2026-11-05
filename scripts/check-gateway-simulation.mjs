@@ -117,7 +117,9 @@ test("local Claude-like receiver verifies actual gateway forwarding and evidence
     return { report, check, verified, languageBadge: signalOptimization(chineseBrowser, check.signals.find((signal) => signal.id === "language"), report.cloak.enabled, verified) };
   };
   const record = (row, value, responseStatus) => Object.assign(row, {
-    responseStatus, sentLanguage: originalLanguage, receiverLanguage: seen?.headers["accept-language"], receiverLocale: seen?.headers["x-checkcc-target-locale"],
+    responseStatus, sentLanguage: originalLanguage, receiverLanguage: seen?.headers["accept-language"],
+    // 区域标记从不上行，接收端看不到；改为读取网关记录的本地改写意图。
+    receiverLocale: value.report?.lastRequest?.intentHeaders?.["x-checkcc-target-locale"] ?? null,
     realRequestVerifiedByProjectRules: value.check.verifiedRequest, optimizationVerifiedByProjectRules: value.verified, languageBadge: value.languageBadge,
   });
   try {
@@ -129,7 +131,7 @@ test("local Claude-like receiver verifies actual gateway forwarding and evidence
       const response = await sendMessage();
       assert.equal(response.status, 200);
       assert.equal(seen.headers["accept-language"], originalLanguage);
-      assert.equal(seen.headers["x-checkcc-target-locale"], "zh-CN");
+      assert.equal(seen.headers["x-checkcc-target-locale"], undefined, "自定义区域标记不得发往真实上游");
       const value = await evidence();
       assert.equal(value.verified, false);
       record(row, value, response.status);
@@ -150,7 +152,7 @@ test("local Claude-like receiver verifies actual gateway forwarding and evidence
       const response = await sendMessage();
       assert.equal(response.status, 200);
       assert.equal(seen.headers["accept-language"], initialLanguageHeader);
-      assert.equal(seen.headers["x-checkcc-target-locale"], initialTarget.locale);
+      assert.equal(seen.headers["x-checkcc-target-locale"], undefined, "自定义区域标记不得发往真实上游");
       assert.equal(seen.headers["x-api-key"], key);
       assert.equal(seen.headers["x-checkcc-client"], undefined);
       assert.equal(seen.body, response.body);
@@ -160,7 +162,7 @@ test("local Claude-like receiver verifies actual gateway forwarding and evidence
       for (const marker of [key, response.body, "本地模拟请求"]) assert.equal(JSON.stringify(value.report).includes(marker), false);
       record(row, value, response.status);
       Object.assign(row, { requestBodyUnchanged: true, diagnosticSecretsRedacted: true });
-      messageProbe = { method: "POST", path: "/v1/messages", status: response.status, sentLanguage: originalLanguage, receivedLanguage: seen.headers["accept-language"], sentLocale: "zh-CN", receivedLocale: seen.headers["x-checkcc-target-locale"], bodyUnchanged: seen.body === response.body };
+      messageProbe = { method: "POST", path: "/v1/messages", status: response.status, sentLanguage: originalLanguage, receivedLanguage: seen.headers["accept-language"], sentLocale: "zh-CN", receivedLocale: value.report?.lastRequest?.intentHeaders?.["x-checkcc-target-locale"] ?? "", bodyUnchanged: seen.body === response.body };
     });
 
     await scenario("stream", "Streaming response passes through; SDK platform and body remain unchanged", async (row) => {
@@ -215,7 +217,7 @@ test("local Claude-like receiver verifies actual gateway forwarding and evidence
       assert.equal(verifiedOptimization(previous.check, beforeNewRequest.report.cloak), false);
       const response = await sendMessage();
       assert.equal(seen.headers["accept-language"], "ja-JP,ja;q=0.9,en;q=0.5");
-      assert.equal(seen.headers["x-checkcc-target-locale"], "ja-JP");
+      assert.equal(seen.headers["x-checkcc-target-locale"], undefined, "自定义区域标记不得发往真实上游");
       const value = await evidence();
       assert.equal(value.verified, true);
       record(row, value, response.status);
@@ -226,7 +228,7 @@ test("local Claude-like receiver verifies actual gateway forwarding and evidence
       await configure(false);
       const response = await sendMessage();
       assert.equal(seen.headers["accept-language"], originalLanguage);
-      assert.equal(seen.headers["x-checkcc-target-locale"], "zh-CN");
+      assert.equal(seen.headers["x-checkcc-target-locale"], undefined, "关闭改写时同样不得上行");
       const value = await evidence();
       assert.equal(value.verified, false);
       assert.notEqual(value.languageBadge, "optimized");

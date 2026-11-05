@@ -98,3 +98,29 @@ export async function restoreEnvironment() {
   result.results.unshift({ target: "local", state: "restored", detail: "当前浏览器已恢复原始接口。", pages: 1 });
   return result;
 }
+
+// 本地浏览器清单：仅存在性探测；「接入」= 用该浏览器拉起受管实例（不影响日常配置）。
+export type LocalBrowser = { id: string; name: string; family: string; supported: boolean; installed: boolean; path: string | null };
+export type BrowserCatalog = {
+  browsers: LocalBrowser[];
+  excluded: string[];
+  preferred: string | null;
+  active: { id: string; name: string; path: string } | null;
+};
+
+async function browserToken() {
+  if (!helperToken) helperToken = (await helperRequest("/session?tokenOnly=1")).token;
+  return helperToken;
+}
+
+export async function readBrowsers(): Promise<BrowserCatalog> {
+  const token = await browserToken();
+  const response = await fetch(`${helperUrl}/browsers`, { headers: { "X-CheckCC-Client": "repair-ui", "X-CheckCC-Token": token }, cache: "no-store", signal: AbortSignal.timeout(8000) });
+  const value = await response.json();
+  if (!response.ok) throw new Error(value.error ?? `HTTP ${response.status}`);
+  return value as BrowserCatalog;
+}
+
+export async function saveBrowsers(preference: { excluded?: string[]; preferred?: string | null }): Promise<BrowserCatalog> {
+  return await executeHelper("/browsers", preference) as unknown as BrowserCatalog;
+}

@@ -14,7 +14,7 @@ if (devURL && new URL(devURL).origin !== origin) throw new Error('开发页面�
 if (!process.env.CHECKCC_DESKTOP_USER_DATA) throw new Error('缺少桌面用户数据目录。');
 process.env.CHECKCC_STATE_DIR ||= path.join(process.env.CHECKCC_DESKTOP_USER_DATA, 'state');
 process.env.CHECKCC_NODE_EXECUTABLE = process.execPath;
-let helper, gateway, site, settings, powerTimer, stopping, resetPending = false;
+let helper, gateway, site, settings, powerTimer, stopping, kernel, resetPending = false;
 let queue = Promise.resolve(), shutdownRequested = false;
 let finishStartup;
 const startupFinished = new Promise(resolve => { finishStartup = resolve; });
@@ -41,9 +41,13 @@ async function report() {
 }
 const closeRuntime = createShutdown({ restore: () => helper?.closeRuntime(), closeServices: async () => {
     clearInterval(powerTimer);
+    // 退出时必须把定时器与内核一并关掉：否则进程退了、内核仍在接管流量（实测事故）。
+    kernel?.stopAutoRefresh?.();
+    kernel?.stopPublicDnsSync?.();
     await closeServer(helper?.server);
     await closeServer(gateway);
     await closeServer(site);
+    await kernel?.stop();
 } });
 async function close() {
   stopping = closeRuntime().catch(error => { stopping = null; throw error; });
@@ -82,7 +86,21 @@ try {
   if (!devURL) login = await native('get_login');
   settings = await store.load();
   const { createGateway } = await import('../scripts/claude-gateway.mjs');
-  gateway = createGateway();
+  const { createKernelRuntime } = await import('../scripts/net-core/runtime.mjs');
+  // 内核先于网关：页面通过网关诊断接口读取内核状态。未配置节点时保持“未启用”。
+  kernel = await createKernelRuntime({
+    stateDir: process.env.CHECKCC_STATE_DIR,
+    root,
+    logger: (line) => console.error('[net-core]', line),
+  });
+  if (kernel.enabled) {
+    if (!await kernel.start()) console.error('[net-core] 内核未能启动，页面会显示未启用原因。');
+    kernel.startAutoRefresh?.();
+    kernel.startPublicDnsSync?.();
+  } else {
+    console.error('[net-core] 未启用：', kernel.reason);
+  }
+  gateway = createGateway({ netCore: kernel });
   await new Promise((resolve, reject) => { gateway.once('error', reject); gateway.listen(devURL ? 3010 : 0, '127.0.0.1', resolve); });
   process.env.CHECKCC_GATEWAY_URL = `http://127.0.0.1:${gateway.address().port}`;
   const { startRepairHelper } = await import('../scripts/local-repair.mjs');

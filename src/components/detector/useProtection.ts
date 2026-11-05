@@ -23,18 +23,18 @@ export function useProtection() {
       let next = await protectionRequest();
       statusRead = true;
       if (!alive.current || mutating.current || current !== version.current) return;
-      if (!wasConnected.current) recovery.current.needed = true;
+      if (!wasConnected.current && !next.enabled) recovery.current.needed = true;
       wasConnected.current = true; setConnected(true); setReport(next);
       const wanted = next.desiredEnabled ?? next.enabled;
-      if (!wanted) { recovery.current = { needed: false, retryAt: 0, delay: 3000 }; setError(''); return; }
-      if (next.phase === 'idle' || next.phase === 'restart_required' || next.testState === 'failed') recovery.current.needed = true;
+      if (!wanted || next.enabled) { recovery.current = { needed: false, retryAt: 0, delay: 3000 }; setError(''); return; }
+      if (next.phase === 'idle') recovery.current.needed = true;
       if (!recovery.current.needed || Date.now() < recovery.current.retryAt || next.testing || ['starting', 'stopping', 'restore_failed'].includes(next.phase)) return;
       mutating.current = true; setBusy(true);
       try {
-        next = await protectionRequest('resume');
+        next = await protectionRequest('resume', { background: true });
         if (!alive.current) return;
         setReport(next);
-        if (next.testState !== 'passed' && (next.desiredEnabled ?? next.enabled)) throw new Error(next.testError || '自动重连检测尚未完成');
+        if (next.testState !== 'passed' && !next.testing && (next.desiredEnabled ?? next.enabled)) throw new Error(next.testError || '自动重连检测尚未完成');
         recovery.current = { needed: false, retryAt: 0, delay: 3000 };
         setError('');
       } finally { mutating.current = false; if (alive.current) setBusy(false); }

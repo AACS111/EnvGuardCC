@@ -1,6 +1,6 @@
 import type { RepairChoice } from "./repair-options";
 
-export type RuntimePolicy = { fontMode?: "none" | "traditional" | "one" | "two" | "three"; vendorFontLimit?: number; languages?: string[]; locale?: string; webrtcDisabled?: boolean; webrtcRelayOnly?: boolean };
+export type RuntimePolicy = { fontMode?: "none" | "traditional" | "one" | "two" | "three"; vendorFontLimit?: number; languages?: string[]; locale?: string; timezone?: string; offsetMinutes?: number; uaPlatform?: string; webrtcDisabled?: boolean; webrtcRelayOnly?: boolean };
 export function choiceRuntimePolicy(id: string, choice?: RepairChoice): RuntimePolicy | null {
   if (!choice || choice.id === "current") return null;
   if (id === "chineseFonts") {
@@ -16,5 +16,5 @@ export function choiceRuntimePolicy(id: string, choice?: RepairChoice): RuntimeP
 }
 
 export function policyAffectsSignal(policy: RuntimePolicy, id: string) {
-  return id === "chineseFonts" && Boolean(policy.fontMode) || id === "vendorFonts" && policy.vendorFontLimit !== undefined || ["language", "languageVariant"].includes(id) && Boolean(policy.languages) || id === "locale" && Boolean(policy.locale) || id.startsWith("webrtc") && (policy.webrtcDisabled === true || policy.webrtcRelayOnly === true);
+  return id === "chineseFonts" && Boolean(policy.fontMode) || id === "vendorFonts" && policy.vendorFontLimit !== undefined || ["language", "languageVariant"].includes(id) && Boolean(policy.languages) || id === "locale" && Boolean(policy.locale) || ["timezone", "timezoneOffset"].includes(id) && (policy.timezone !== undefined || policy.offsetMinutes !== undefined) || id.startsWith("webrtc") && (policy.webrtcDisabled === true || policy.webrtcRelayOnly === true);
 }

@@ -3,16 +3,17 @@ import path from 'node:path';
 import { sameTimezone, timezoneSupported } from './system-timezone.mjs';
 import { ProtectionSession } from './protection-session.mjs';
 import { collectNetworkDiagnostics } from './gateway-diagnostics.mjs';
+import { setTimeout as pause } from 'node:timers/promises';
 const regions = JSON.parse(await readFile(new URL('../src/detection/region-data.json', import.meta.url), 'utf8'));
 const { COUNTRY_LANGUAGES, COUNTRY_TIMEZONES, FALLBACK_COUNTRY_NAMES, WINDOWS_ZONES } = regions;
 
 const optionalFile = async (file) => { try { return await readFile(file, 'utf8'); } catch (error) { if (error.code === 'ENOENT') return null; throw error; } };
 const saveFile = async (file, raw) => { if (raw === null) await rm(file, { force: true }); else { await mkdir(path.dirname(file), { recursive: true }); await writeFile(file, raw, { mode: 0o600 }); } };
 const gatewayUrl = process.env.CHECKCC_GATEWAY_URL || 'http://127.0.0.1:3010';
-async function gateway(endpoint, data, origin = 'http://localhost:3000') {
+async function gateway(endpoint, data, origin = 'http://localhost:3000', signal) {
   const response = await fetch(gatewayUrl + endpoint, {
     method: data ? 'POST' : 'GET', headers: { Origin: origin, 'X-CheckCC-Client': 'gateway-ui', ...(data ? { 'Content-Type': 'application/json' } : {}) },
-    body: data ? JSON.stringify(data) : undefined, signal: AbortSignal.timeout(10000),
+    body: data ? JSON.stringify(data) : undefined, signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(10000)]) : AbortSignal.timeout(10000),
   });
   const result = await response.json();
   if (!response.ok) throw new Error(result.error ?? `HTTP ${response.status}`);
@@ -90,12 +91,14 @@ export function createProtectionService({ stateDir, runtime, browserCloak, curre
       });
       return issues;
     },
-    test: async () => {
-      let job = await gateway('/__checkcc/simulation', {});
+    test: async ({ signal } = {}) => {
+      signal?.throwIfAborted();
+      let job = await gateway('/__checkcc/simulation', {}, undefined, signal);
       const deadline = Date.now() + 120000;
       while (job.running && Date.now() < deadline) {
-        await new Promise((resolve) => setTimeout(resolve, 500));
-        job = await gateway('/__checkcc/simulation');
+        await pause(500, undefined, { signal });
+        signal?.throwIfAborted();
+        job = await gateway('/__checkcc/simulation', undefined, undefined, signal);
       }
       if (job.running) throw new Error('本轮模拟测试超时。');
       return job;

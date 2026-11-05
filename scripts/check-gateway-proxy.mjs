@@ -5,7 +5,7 @@ import path from "node:path";
 import assert from "node:assert/strict";
 import http from "node:http";
 import net from "node:net";
-import { proxyRequest, resolveProxy, selectedProxy } from "./gateway-proxy.mjs";
+import { proxyRequest, resolveProxy, selectedProxy, systemProxyStatus } from "./gateway-proxy.mjs";
 
 const listen = (server) => new Promise((resolve) => server.listen(0, "127.0.0.1", () => resolve(server.address().port)));
 const close = (server, sockets = []) => new Promise((resolve) => {
@@ -156,4 +156,23 @@ test('自动跟随系统代理，忽略旧版手动设置且不破坏旧文件',
   assert.equal(selectedProxy({ env, providedSystemProxy: 'http://127.0.0.1:7898' }).url.port, '7898');
   assert.equal(selectedProxy({ env, providedSystemProxy: null }), null);
   assert.equal(await readFile(file, 'utf8'), raw);
+});
+
+// Windows 注册表的 ProxyServer 既可能自带协议前缀，也可能只有 host:port。两者都必须解析成同一地址。
+test('Windows 系统代理注册表值允许自带协议前缀', () => {
+  const fake = (server) => (command, args) => {
+    const name = args[args.length - 1];
+    if (name === 'ProxyEnable') return 'ProxyEnable    REG_DWORD    0x1';
+    if (name === 'ProxyServer') return `ProxyServer    REG_SZ    ${server}`;
+    throw new Error('missing value');
+  };
+  for (const value of ['http://127.0.0.1:7890', '127.0.0.1:7890', 'http://127.0.0.1:7890/']) {
+    const status = systemProxyStatus({ platform: 'win32', run: fake(value) });
+    assert.equal(status.state, 'configured', value);
+    assert.equal(new URL(status.address).origin, 'http://127.0.0.1:7890', value);
+  }
+  const mapped = systemProxyStatus({ platform: 'win32', run: fake('http=127.0.0.1:7890;https=127.0.0.1:7891') });
+  assert.equal(new URL(mapped.address).origin, 'http://127.0.0.1:7891');
+  const off = systemProxyStatus({ platform: 'win32', run: (command, args) => (args[args.length - 1] === 'ProxyEnable' ? 'ProxyEnable    REG_DWORD    0x0' : 'ProxyServer    REG_SZ    http://127.0.0.1:7890') });
+  assert.equal(off.state, 'disabled');
 });

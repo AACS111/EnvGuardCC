@@ -21,12 +21,42 @@ export type CloakState = {
   target: { language: string; locale: string; timezone: string | null; countryName: string | null; updatedAt?: string | null } | null;
 };
 
+export type NetCoreRouting = {
+  state: "verified" | "violation" | "unknown";
+  total: number; claude: number; pinned: number; direct: number;
+  sampledAt?: string; group?: string;
+  violations: Array<{ host: string; chains: string[]; rule?: string | null; rulePayload?: string | null }>;
+  pinnedHosts?: string[]; groups?: string[];
+};
+
+export type NetCoreIngress = { total: number; entries: number; shared: boolean; groups: Array<{ server: string; count: number; nodes: string[] }> };
+
+
+export type NetCoreReport = {
+  /** 节点延迟：随状态一起下发（内核真实测速，缺失为 null）。 */
+  delays?: Record<string, number | null> | null;
+  /** 入口归组：多个节点共用同一入口时，故障转移是空转。 */
+  ingress?: NetCoreIngress | null;
+  enabled?: boolean;
+  state: "disabled" | "idle" | "running" | "error" | "unavailable" | string;
+  reason?: string | null; detail?: string;
+  tunEnabled?: boolean; demo?: boolean;
+  binary?: string; apiPort?: number;
+  nodes?: string[]; selected?: string | null;
+  version?: string; restarts?: number;
+  routing?: NetCoreRouting;
+  source?: { mode: "url" | "content" | "manual"; url?: string; updatedAt?: string; intervalHours?: number } | null;
+  localProxy?: string | null;
+  mode?: "claude" | "rule" | "global" | "direct";
+  elevation?: { elevated: boolean; platform: string; instruction: string };
+};
+
 export type GatewayReport = {
   version: 1; upstream: string; platform: string; profileError: string | null;
   profile: { language: string; locale: string; timezone: string | null; countryName: string | null; city: string | null; updatedAt: string | null } | null;
   proxy?: { mode: "direct" | "http-connect"; source: string; address: string | null };
   transport: string; proxyEnvironmentDetected: boolean; rewrites: number; previewHeaders: Record<string, string>;
-  lastRequest: { startedAt: string; headers: Record<string, string>; originalHeaders?: Record<string, string>; profileUpdatedAt: string | null; status: number | null; elapsedMs: number | null; tls: Probe["tls"] } | null;
+  lastRequest: { startedAt: string; headers: Record<string, string>; intentHeaders?: Record<string, string>; originalHeaders?: Record<string, string>; profileUpdatedAt: string | null; status: number | null; elapsedMs: number | null; tls: Probe["tls"] } | null;
   lastFailure: { at: string; error: string } | null;
   checkedAt?: string;
   testedSignals?: string[];
@@ -39,6 +69,8 @@ export type GatewayReport = {
   edge?: { colo: string | null; loc: string | null; city: string | null; http: number | null; error: string | null } | null;
   // 拦截迷惑层：只重写“向 Claude 声明的语言/区域”类头，不改本机系统、不伪造 IP。
   cloak?: CloakState | null;
+  // 网络内核（TUN/分流/DNS）状态；未接入时为 disabled。
+  netCore?: NetCoreReport | null;
 };
 
 export type GatewayCheck = { signals: SignalResult[]; geo: ExitGeo | null; report: GatewayReport | null; error: string | null; verifiedRequest: boolean; cloak: CloakState | null };
@@ -144,14 +176,16 @@ export function buildGatewayCheck(report: GatewayReport | null, locale: LocaleCo
   const cloakNote = cloakOn
     ? tr("拦截迷惑层已开启：网关会把语言与区域声明改写为出口目标值。", "Cloak layer enabled: the gateway rewrites language and locale declarations to the exit target.")
     : tr("拦截迷惑层已关闭：网关原样转发客户端声明，可直接对比未改写状态。", "Cloak layer disabled: client declarations pass through unchanged for direct comparison.");
-  const headerDetail = tr("仅对真实转发记录计分。预览值不是 Claude 已收到的值；自定义 x-checkcc-target-locale 也不是 Anthropic 官方区域参数。", "Only observed forwarded headers are scored. Previews are not observed Claude values; x-checkcc-target-locale is not an official Anthropic locale parameter.");
+  const headerDetail = tr("仅对真实转发记录计分。预览值不是 Claude 已收到的值；网关改写区域时只用标准 Accept-Language，自定义 x-checkcc-* 标记永不上行。", "Only observed forwarded headers are scored. Previews are not observed Claude values; locale rewrites use only standard Accept-Language, and x-checkcc-* markers are never sent upstream.");
 
   const current = report.lastRequest && report.lastRequest.profileUpdatedAt === (report.profile?.updatedAt ?? null) ? report.lastRequest : null;
   const successful = Boolean(current?.status && current.status >= 200 && current.status < 300);
   const headers = current?.headers;
+  // 区域声明只存在于本地改写意图中，从不上行；旧版报告没有该字段时回退到 headers。
+  const intent = current?.intentHeaders ?? headers;
   const original = current?.originalHeaders ?? null;
   const language = headers?.["accept-language"];
-  const outboundLocale = headers?.["x-checkcc-target-locale"];
+  const outboundLocale = intent?.["x-checkcc-target-locale"];
   const langs = language?.split(",").map((value) => value.trim().split(";")[0]) ?? [];
   const rewritten = Boolean(original && (original["accept-language"] !== language || (original["x-checkcc-target-locale"] ?? null) !== (outboundLocale ?? null)));
 
@@ -185,7 +219,7 @@ export function buildGatewayCheck(report: GatewayReport | null, locale: LocaleCo
     put("browserIpOrg", [geo.asn, geo.org].filter(Boolean).join(" · ") || missing, geo.org || geo.asn ? "ok" : "unknown", networkDetail);
   }
   if (exit) {
-    put("proxyCountry", sources.map((source) => `${source.source}: ${source.countryCode}`).join(" / ") || missing, exit.consistentCountry === true ? "ok" : exit.consistentCountry === false ? "warning" : "unknown", tr("至少两家 IP 情报源同意国家才标为核对通过；单源结果无法验证一致性。", "A country cross-check needs at least two agreeing providers. One provider cannot verify consistency."));
+    put("proxyCountry", sources.map((source) => `${source.source}: ${source.countryCode}`).join(" / ") || missing, exit.consistentCountry === true ? "ok" : exit.consistentCountry === false ? "warning" : sources.length ? "not_applicable" : "unknown", tr("至少两家 IP 情报源同意国家才标为核对通过；单源结果无法验证一致性。", "A country cross-check needs at least two agreeing providers. One provider cannot verify consistency."));
     put("ipv4", exit.ipv4 ?? missing, exit.ipv4 ? "ok" : "unknown", `${networkDetail} IPv4: ${exit.ipv4Error ?? "OK"}; IPv6: ${exit.ipv6Error ?? "OK"}`);
   }
   for (const [id, probe] of [["claudeReachability", report.probes?.claude], ["anthropicReachability", report.probes?.anthropic]] as const) {
@@ -231,7 +265,7 @@ export function buildGatewayCheck(report: GatewayReport | null, locale: LocaleCo
   put("exitType", networkType.label, networkType.kind === "datacenter" ? "warning" : "unknown", networkType.detail, networkType.kind === "datacenter" ? 1 : 0);
   put("ipSourceCount", `${sources.length} / ${tr("目标 4 源", "target 4 sources")}`, sources.length ? "ok" : "unknown", sources.length ? tr(`成功返回出口情报的源：${sources.map((item) => item.source).join(", ")}。源多不代表结论更准，仅用于交叉核对。`, `Sources that returned exit intel: ${sources.map((item) => item.source).join(", ")}. More sources do not imply a stronger conclusion; they are used for cross-checking.`) : missing);
   const consistent = exit?.consistentCountry ?? (sources.length > 1 ? countries.length === 1 : null);
-  put("multiSourceConsistency", consistent === null ? missing : consistent ? tr(`多源一致（${countries.join("/")}）`, `Consistent (${countries.join("/")})`) : tr(`多源不一致（${countries.join("/")}）`, `Inconsistent (${countries.join("/")})`), consistent === null ? "unknown" : consistent ? "ok" : "error", tr("多源出口国家不一致时，实际出口可能不稳定或分流，建议复核代理规则。", "Conflicting exit countries suggest unstable or split routing; review proxy rules."), consistent === false ? 1 : 0);
+  put("multiSourceConsistency", consistent === null ? tr("源不足，无法交叉核对", "Not enough sources to cross-check") : consistent ? tr(`多源一致（${countries.join("/")}）`, `Consistent (${countries.join("/")})`) : tr(`多源不一致（${countries.join("/")}）`, `Inconsistent (${countries.join("/")})`), consistent === null ? (sources.length ? "not_applicable" : "unknown") : consistent ? "ok" : "error", tr("多源出口国家不一致时，实际出口可能不稳定或分流，建议复核代理规则。", "Conflicting exit countries suggest unstable or split routing; review proxy rules."), consistent === false ? 1 : 0);
   put("countrySet", countries.join(" / ") || missing, countries.length > 1 ? "warning" : countries.length ? "ok" : "unknown", tr("各情报源分别报告的国家；仅作核对集合，不单独判断。", "Countries reported by each provider; a cross-check set only."));
   put("ipCountryRisk", riskyCountries.length ? riskyCountries.join(" / ") : (countries.length ? tr("中低风险国家", "Lower-risk countries") : missing), riskyCountries.length ? "error" : countries.length ? "ok" : "unknown", riskyCountries.length ? tr("出口命中本项目高风险国家名单（CN/RU/IR/KP/SY/CU）。该项为规则命中，不是账号处罚概率。", "Exit matches this project's high-risk country list (CN/RU/IR/KP/SY/CU). This is a rule hit, not an account-penalty probability.") : tr("出口不在高风险国家名单内。", "Exit is outside the high-risk country list."), riskyCountries.length ? 1 : 0);
   const reachFailure = Boolean(report.probes?.claude && !report.probes.claude.status);
@@ -295,4 +329,218 @@ export async function checkGateway(locale: LocaleCode, signalId?: string): Promi
       ? { ...signal, value: reason, assessment: "error", testedAt } : signal);
     return result;
   }
+}
+
+// 内核状态只读：GET 不触发网络探测，页面轮询用它。
+export type ExitHistory = { windowHours: number; samples: number; changes: number; stable: boolean; current: string | null; ips: string[]; firstAt: string | null; lastAt: string | null };
+
+export async function readNetCore(): Promise<{ netCore: NetCoreReport | null; exitHistory: ExitHistory | null }> {
+  const response = await fetch(`${gatewayUrl}/__checkcc/net-core`, {
+    headers: { "X-CheckCC-Client": "gateway-ui" }, cache: "no-store", signal: AbortSignal.timeout(6000),
+  });
+  const value = await response.json().catch(() => null);
+  if (!response.ok) throw new Error(value?.error ?? `HTTP ${response.status}`);
+  return { netCore: (value?.netCore ?? null) as NetCoreReport | null, exitHistory: (value?.exitHistory ?? null) as ExitHistory | null };
+}
+
+export type NetCoreAction = "start" | "stop" | "restart" | "select" | "tunnel";
+
+// 内核动作：白名单由网关二次校验；失败原因原样返回，不做兜底美化。
+export async function controlNetCore(action: NetCoreAction, node?: string, options: { enabled?: boolean } = {}): Promise<{ ok: boolean; reason: string | null; netCore: NetCoreReport | null }> {
+  const response = await fetch(`${gatewayUrl}/__checkcc/net-core`, {
+    method: "POST",
+    headers: { "X-CheckCC-Client": "gateway-ui", "Content-Type": "application/json" },
+    body: JSON.stringify({ action, ...(node ? { node } : {}), ...(action === "tunnel" ? { enabled: options.enabled !== false } : {}) }),
+    cache: "no-store", signal: AbortSignal.timeout(30000),
+  });
+  const value = await response.json().catch(() => null);
+  if (!response.ok) throw new Error(value?.error ?? `HTTP ${response.status}`);
+  return { ok: value?.ok === true, reason: typeof value?.reason === "string" ? value.reason : null, netCore: (value?.netCore ?? null) as NetCoreReport | null };
+}
+
+export type NetCoreImportPayload =
+  | { mode: "url"; url: string; selected?: string }
+  | { mode: "content"; content: string; selected?: string }
+  | { mode: "manual"; proxies: unknown[]; selected?: string }
+  | { mode: "local-proxy"; port: number; protocol: string; name?: string };
+
+export type LocalProxyEntry = { port: number; pid: number; process: string; tool: string; protocol: string };
+
+/** 扫描本机已装的代理客户端（FlClash / Clash Verge 等）可借用的端口。只读，不改它们的配置。 */
+export async function scanLocalProxies(): Promise<{ items: LocalProxyEntry[]; summary: string }> {
+  const response = await fetch(`${gatewayUrl}/__checkcc/net-core/local-proxies`, {
+    method: "GET",
+    headers: { "X-CheckCC-Client": "gateway-ui" },
+    cache: "no-store", signal: AbortSignal.timeout(20000),
+  });
+  const value = await response.json().catch(() => null);
+  if (!response.ok || !value?.ok) throw new Error(value?.error ?? `HTTP ${response.status}`);
+  return { items: Array.isArray(value.items) ? value.items : [], summary: String(value.summary ?? "") };
+}
+
+export type NetCoreImportResult = {
+  ok: boolean;
+  imported?: number;
+  skipped?: Array<{ index?: number; reason: string; link?: string }>;
+  selected?: string;
+  reason?: string;
+  netCore?: NetCoreReport | null;
+};
+
+// 导入节点：解析与落盘都在后端完成；界面只展示真实结果，不猜测成功。
+export async function importNetCore(payload: NetCoreImportPayload): Promise<NetCoreImportResult> {
+  const response = await fetch(`${gatewayUrl}/__checkcc/net-core/import`, {
+    method: "POST",
+    headers: { "X-CheckCC-Client": "gateway-ui", "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+    cache: "no-store", signal: AbortSignal.timeout(60000),
+  });
+  const value = await response.json().catch(() => null);
+  if (!response.ok) return { ok: false, reason: value?.error ?? `HTTP ${response.status}` };
+  return value as NetCoreImportResult;
+}
+
+export type NetCoreRefreshResult = { ok: boolean; reason?: string; skipped?: boolean; skippedItems?: Array<{ reason: string }>; imported?: number; selected?: string; netCore?: NetCoreReport | null };
+
+// 订阅刷新：强制拉取订阅并替换节点；失败保留现有配置。
+export async function refreshNetCore(force = true): Promise<NetCoreRefreshResult> {
+  const response = await fetch(`${gatewayUrl}/__checkcc/net-core/refresh`, {
+    method: "POST",
+    headers: { "X-CheckCC-Client": "gateway-ui", "Content-Type": "application/json" },
+    body: JSON.stringify({ force }),
+    cache: "no-store", signal: AbortSignal.timeout(60000),
+  });
+  const value = await response.json().catch(() => null);
+  if (!response.ok) return { ok: false, reason: value?.reason ?? value?.error ?? `HTTP ${response.status}`, netCore: value?.netCore ?? null };
+  return value as NetCoreRefreshResult;
+}
+
+export type NetCoreDelayResult = { ok: boolean; delays: Record<string, number | null>; reason?: string; netCore?: NetCoreReport | null };
+
+// 节点延迟：后端并行读取内核测速结果；失败节点为 null，界面不得显示成 0ms。
+// force=true 绕过缓存，用于用户主动点「测速」。
+export async function measureNetCoreDelay(names: string[], { force = false } = {}): Promise<NetCoreDelayResult> {
+  const response = await fetch(`${gatewayUrl}/__checkcc/net-core/delay`, {
+    method: "POST",
+    headers: { "X-CheckCC-Client": "gateway-ui", "Content-Type": "application/json" },
+    body: JSON.stringify(force ? { names, force: true } : { names }),
+    cache: "no-store", signal: AbortSignal.timeout(60000),
+  });
+  const value = await response.json().catch(() => null);
+  if (!response.ok) return { ok: false, delays: {}, reason: value?.error ?? `HTTP ${response.status}` };
+  return value as NetCoreDelayResult;
+}
+
+export type NetCoreEgressMode = "claude" | "rule" | "global" | "direct";
+
+// 切换出站模式：rule=海外走节点，global=全部走节点，claude=只代理 Claude，direct=全直连。
+export async function setNetCoreMode(mode: NetCoreEgressMode): Promise<{ ok: boolean; reason?: string; mode?: NetCoreEgressMode; netCore?: NetCoreReport | null }> {
+  const response = await fetch(`${gatewayUrl}/__checkcc/net-core/mode`, {
+    method: "POST",
+    headers: { "X-CheckCC-Client": "gateway-ui", "Content-Type": "application/json" },
+    body: JSON.stringify({ mode }),
+    cache: "no-store", signal: AbortSignal.timeout(60000),
+  });
+  const value = await response.json().catch(() => null);
+  if (!response.ok) return { ok: false, reason: value?.reason ?? value?.error ?? `HTTP ${response.status}`, netCore: value?.netCore ?? null };
+  return value;
+}
+
+// 用户网络声明（内网域名 / 豁免 IP / DNS / 网卡）：文件仍是唯一真相，界面只是编辑器。
+export type NetCoreNetworkConfig = {
+  directDomains?: string[];
+  dnsServers?: string[];
+  directInterface?: string;
+  dnsInterface?: string;
+  strictRoute?: boolean;
+  routeExcludeAddresses?: string[];
+};
+
+export type NetCoreNetworkEffective = {
+  target: string;
+  domainRules: string[];
+  ipRules: string[];
+  nameserverPolicy: Record<string, string[]>;
+  fakeIpFilter: string[];
+  dnsServers: string[];
+  defaultExclusions: string[];
+  redundantAddresses: Array<{ value: string; coveredBy: string }>;
+};
+
+export type NetCoreNetworkState = {
+  ok: boolean;
+  path: string;
+  config: NetCoreNetworkConfig | null;
+  effective: NetCoreNetworkEffective | null;
+  problem: string | null;
+  interfaces: Array<{ name: string; address: string }>;
+  pendingRestart: boolean;
+  canRestart: boolean;
+  reason?: string;
+  netCore?: NetCoreReport | null;
+};
+
+// 只读：文件损坏时后端也返回 problem，而不是让界面卡在报错上。
+export async function readNetCoreNetwork(): Promise<NetCoreNetworkState> {
+  const response = await fetch(`${gatewayUrl}/__checkcc/net-core/network`, {
+    headers: { "X-CheckCC-Client": "gateway-ui" }, cache: "no-store", signal: AbortSignal.timeout(10000),
+  });
+  const value = await response.json().catch(() => null);
+  if (!response.ok) throw new Error(value?.error ?? value?.reason ?? `HTTP ${response.status}`);
+  return value as NetCoreNetworkState;
+}
+
+// 保存：后端用 buildKernelConfig + assertKernelConfig 试算，非法值在这里被拒且不写盘。
+export async function saveNetCoreNetwork(config: NetCoreNetworkConfig, restart = false): Promise<NetCoreNetworkState> {
+  const response = await fetch(`${gatewayUrl}/__checkcc/net-core/network`, {
+    method: "POST",
+    headers: { "X-CheckCC-Client": "gateway-ui", "Content-Type": "application/json" },
+    body: JSON.stringify({ config, restart }),
+    cache: "no-store", signal: AbortSignal.timeout(90000),
+  });
+  const value = await response.json().catch(() => null);
+  if (!response.ok || value?.ok === false) {
+    return { ...(value ?? {}), ok: false, reason: value?.reason ?? value?.error ?? `HTTP ${response.status}` } as NetCoreNetworkState;
+  }
+  return value as NetCoreNetworkState;
+}
+
+// 解析测试：由内核代查（普通进程直接查内网 DNS 会被 strict-route 拦住），结论才可信。
+export type NetCoreDomainCheck = {
+  name: string;
+  status: number;
+  addresses: string[];
+  fakeIp: boolean;
+  restarted: boolean;
+  elapsedMs: number;
+};
+
+export async function verifyNetCoreDomain(config: NetCoreNetworkConfig, name: string): Promise<NetCoreDomainCheck & NetCoreNetworkState & { reason?: string }> {
+  const response = await fetch(`${gatewayUrl}/__checkcc/net-core/verify-domain`, {
+    method: "POST",
+    headers: { "X-CheckCC-Client": "gateway-ui", "Content-Type": "application/json" },
+    body: JSON.stringify({ config, name }),
+    cache: "no-store", signal: AbortSignal.timeout(90000),
+  });
+  const value = await response.json().catch(() => null);
+  if (!response.ok || value?.ok === false) {
+    return { ...(value ?? {}), ok: false, reason: value?.reason ?? value?.error ?? `HTTP ${response.status}` } as NetCoreDomainCheck & NetCoreNetworkState & { reason?: string };
+  }
+  return value;
+}
+
+export type NetCoreExitEntry = { countryCode: string | null; country: string | null; ip: string | null };
+export type NetCoreExitResult = { ok: boolean; exits: Record<string, NetCoreExitEntry | null>; reason?: string; netCore?: NetCoreReport | null };
+
+/** 逐节点实测出口国家：会依次切换选中节点，测完还原。显式触发，避免自动轮询造成 IP 抖动。 */
+export async function probeNodeExits(names: string[]): Promise<NetCoreExitResult> {
+  const response = await fetch(gatewayUrl + "/__checkcc/net-core/exits", {
+    method: "POST",
+    headers: { "X-CheckCC-Client": "gateway-ui", "Content-Type": "application/json" },
+    body: JSON.stringify({ names }),
+    cache: "no-store", signal: AbortSignal.timeout(180000),
+  });
+  const value = await response.json().catch(() => null);
+  if (!response.ok) return { ok: false, exits: {}, reason: value?.error ?? ("HTTP " + response.status) };
+  return value as NetCoreExitResult;
 }
