@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import { createGateway } from "./claude-gateway.mjs";
 import { startRepairHelper } from "./local-repair.mjs";
 import { createKernelRuntime } from "./net-core/runtime.mjs";
+import { ensureKernel } from "./net-core/vendor.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const require = createRequire(import.meta.url);
@@ -49,6 +50,7 @@ export async function startDev(args = process.argv.slice(2), { handleSignals = t
   }
   let gateway, helper, next, kernel;
   try {
+    if (process.env.CHECKCC_NET_CORE !== "0" && !process.env.CHECKCC_NET_CORE_BINARY) await ensureKernel();
     // 内核先启动：网关诊断接口需要读取它的状态；未配置节点时明确报“未启用”。
     kernel = await createKernelRuntime({
       stateDir: process.env.CHECKCC_STATE_DIR || path.join(root, "node_modules", ".checkcc-local"),
@@ -61,7 +63,7 @@ export async function startDev(args = process.argv.slice(2), { handleSignals = t
       process.stderr.write(`[net-core] 未启用：${kernel.reason}\n`);
     }
     gateway = await startGateway(3010, { netCore: kernel });
-    helper = await startRepairHelper();
+    helper = await startRepairHelper(undefined, { netCore: kernel });
   } catch (error) {
     // Release only listeners this launcher acquired; reused services stay untouched.
     try { await closeServer(gateway?.server); } catch { /* Preserve the startup error. */ }

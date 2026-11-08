@@ -94,7 +94,11 @@ Open the local URL printed by the terminal. Desktop mode uses port 3030 for its 
 
 ## Supported scope
 
-macOS automatically follows system HTTP/HTTPS proxy settings or system routing (including TUN), without manual in-app proxy configuration. The app does not read or rewrite third-party subscriptions, policy groups or routing configuration. Managed browsers and system-authorized timezone changes/restoration remain available; Claude desktop is opened normally.
+The bundled mihomo kernel accepts user-provided subscriptions or self-hosted nodes and provides a local HTTP/SOCKS proxy plus a separate system-capture switch. Another proxy client is not required. System capture is off on first launch; enabling TUN requires system authorization and saves that choice. Daily proxy use is independent of environment adaptation. Third-party proxy client configurations are not modified.
+
+macOS now has optional strict connection protection: pin all outbound traffic to one node and use independent PF rules to block other paths, retaining the block after the kernel exits. Explicitly disable strict mode or use the recovery tool to restore networking. Enabling reconnects existing connections and blocks ordinary LAN traffic and unauthenticated local proxy access. Only checked system PF layouts are supported. Windows does not yet have a WFP system filter; ordinary proxy mode does not retain a crash-time block. These features do not guarantee Claude service eligibility or account outcomes.
+
+See the [implementation and verification record](docs/NETWORK-SAFETY-IMPLEMENTATION.md) for actual package, native TUN, blocking and recovery test coverage. Managed browsers and authorized timezone changes/restoration remain separate features; macOS Claude desktop is opened normally.
 
 An Apple Silicon local trial package is available (`.app`, ZIP, DMG; ad-hoc signed) under `node_modules/.checkcc-dist`. `pnpm desktop:package` builds the `.app` and ZIP; `pnpm desktop:installer` also builds the DMG. Developer ID signing and notarization are not part of the current local-trial scope; first launch on another Mac needs approval in System Settings > Privacy & Security. It is installed locally in `/Applications`; other-machine validation remains pending. Actual Mac validation used Apple Silicon and macOS 27.0; older macOS and Intel support are not claimed. See [stage 4 results](docs/MACOS-STAGE4-RESULTS.md).
 

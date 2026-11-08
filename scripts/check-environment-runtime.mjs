@@ -54,11 +54,27 @@ test("实际 Chromium 将未知目标域名交给代理，不依赖本地 DNS", 
   const runtime = new EnvironmentRuntime({stateDir:directory,browserPath,headless:true,networkProxy:{url:new URL(origin)}});
   try {
     const instance = await runtime.launch("web",origin);
-    const { targetInfos } = await instance.client.send("Target.getTargets");
-    assert.deepEqual(targetInfos.filter(target => target.type === "page").map(target => target.url).sort(), ["about:blank", origin + "/"].sort());
-    const [sessionId] = [...instance.sessions].find(([,item]) => item.type === "page");
+    // Chrome 132+ 会额外创建一个 url 为空的 page target，且 Page.navigate 返回时 URL 可能尚未提交。
+    // 这里按目标页轮询，而不是对目标列表做一次性严格断言（Chrome 版本升级会让后者无故变红）。
+    const pageTargets = async () => (await instance.client.send("Target.getTargets")).targetInfos.filter(target => target.type === "page" && target.url);
+    let targets = [];
+    for (let attempt = 0; attempt < 60; attempt++) {
+      targets = await pageTargets();
+      if (targets.some(target => target.url === origin + "/")) break;
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
+    assert.ok(targets.some(target => target.url === origin + "/"), `受控浏览器没有打开目标页：${targets.map(target => target.url).join(", ")}`);
+    assert.ok(targets.some(target => target.url === "about:blank"), "受管实例应保留一个空白页");
+    const page = targets.find(target => target.url === origin + "/");
+    let sessionId;
+    for (let attempt = 0; attempt < 40 && !sessionId; attempt++) {
+      sessionId = [...instance.sessions].find(([,item]) => item.type === "page" && item.targetId === page.targetId)?.[0];
+      if (!sessionId) await new Promise(resolve => setTimeout(resolve, 50));
+    }
+    assert.ok(sessionId, "目标页没有可用的调试会话");
     const navigation = await instance.client.send("Page.navigate",{url:"http://checkcc-proxy-test.invalid/"},sessionId);
     assert.equal(navigation.errorText,undefined);
+    for (let attempt = 0; attempt < 40 && !requests.includes("http://checkcc-proxy-test.invalid/"); attempt++) await new Promise(resolve => setTimeout(resolve, 50));
     assert.ok(requests.includes("http://checkcc-proxy-test.invalid/"));
   } finally {
     await runtime.close();

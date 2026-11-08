@@ -4,6 +4,10 @@
   --repair-text: #1d1d1f;
   --repair-muted: #6e6e73;
   --repair-border: #e7e7eb;
+  /* 可交互控件的边界：1.23:1 的白底灰边认不出是按钮，这里单独给一档更深的描边。 */
+  --workspace-control-border: #d2d2d7;
+  --workspace-warn-surface: #fbf3df;
+  --workspace-warn-text: #7a5310;
   --repair-accent: #0068dc;
   --repair-accent-hover: #005bbd;
   --repair-selected: #edf5ff;
@@ -262,8 +266,8 @@
   .check-workspace *, .check-workspace *::before, .check-workspace *::after { scroll-behavior: auto; animation: none; transition: none; }
 }
 
-/* 网络内核面板：方向 4（不对称仪表盘）。只有「出口结论」有容器与边框，其余靠间距与分隔线分组。 */
-.netcore { display: grid; gap: 16px; }
+/* 网络内核面板：结论 → 出口证据 → 维护。内容收在可读宽度内，操作贴着内容而不是贴屏幕右边。 */
+.netcore { display: grid; gap: 16px; width: 100%; max-width: 1120px; margin: 0 auto; }
 .netcore-conclusion { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 16px; padding: 16px 20px; border: 1px solid var(--repair-border); border-radius: var(--workspace-radius); background: var(--repair-surface); }
 .netcore-conclusion[data-tone="ok"] { border-color: var(--score-measured); }
 .netcore-conclusion[data-tone="warn"] { border-color: var(--workspace-meter-mid); }
@@ -271,46 +275,64 @@
 .netcore-conclusion__body { display: grid; gap: 4px; min-width: 0; }
 .netcore-eyebrow { margin: 0; color: var(--repair-muted); font-size: var(--workspace-label); font-weight: 600; }
 .netcore-conclusion h2 { margin: 0; font-size: var(--workspace-display); font-weight: 800; letter-spacing: -0.02em; overflow-wrap: anywhere; }
+/* 结论下面那句是主阅读路径，比普通说明字大一号。 */
+.netcore-conclusion .netcore-detail { font-size: 13px; }
 .netcore-detail { margin: 0; color: var(--repair-muted); font-size: var(--workspace-body); overflow-wrap: anywhere; }
 .netcore-meta { display: flex; flex-wrap: wrap; gap: 4px 16px; margin: 4px 0 0; color: var(--repair-muted); font-size: var(--workspace-label); font-variant-numeric: tabular-nums; }
-.netcore-demo { color: var(--workspace-meter-mid); font-weight: 600; }
+/* 出口事实：IP / 节点 / 延迟 / 采样，用"标签 + 值"而不是一条灰字。 */
+.netcore-facts { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 18px; margin: 6px 0 0; color: var(--repair-text); font-size: 13px; font-variant-numeric: tabular-nums; }
+.netcore-facts b { margin-right: 6px; color: var(--repair-muted); font-size: var(--workspace-label); font-weight: 600; }
+.netcore-facts .netcore-muted { color: var(--repair-muted); font-size: var(--workspace-label); }
 .netcore-conclusion__state { display: grid; justify-items: end; align-content: space-between; gap: 8px; }
 .netcore-badge { padding: 2px 10px; border-radius: 999px; font-size: var(--workspace-label); font-weight: 600; }
 .netcore-badge[data-tone="ok"] { background: var(--score-measured-surface); color: var(--score-measured); }
-.netcore-badge[data-tone="warn"] { background: var(--repair-selected); color: var(--repair-text); }
+.netcore-badge[data-tone="warn"] { background: var(--workspace-warn-surface); color: var(--workspace-warn-text); }
 .netcore-badge[data-tone="danger"] { background: var(--repair-danger-surface); color: var(--repair-danger); }
 .netcore-badge[data-tone="muted"] { background: var(--workspace-track); color: var(--repair-muted); }
 .netcore-actions { display: flex; flex-wrap: wrap; gap: 4px; justify-content: flex-end; }
-.netcore-strip { display: flex; flex-wrap: wrap; margin: 0; padding: 8px 0; border-top: 1px solid var(--workspace-divider); border-bottom: 1px solid var(--workspace-divider); }
-.netcore-strip > div { display: flex; align-items: baseline; gap: 6px; padding: 0 16px; }
-.netcore-strip > div + div { border-left: 1px solid var(--workspace-divider); }
-.netcore-strip dt { color: var(--repair-muted); font-size: var(--workspace-label); }
-.netcore-strip dd { margin: 0; font-size: var(--workspace-subheading); font-weight: 700; font-variant-numeric: tabular-nums; }
-.netcore-strip > div[data-flagged="true"] dd { color: var(--repair-danger); }
 .netcore-alert { margin: 0; padding: 6px 12px; border-radius: var(--workspace-control-radius); background: var(--repair-danger-surface); color: var(--repair-danger); font-size: var(--workspace-body); overflow-wrap: anywhere; }
+.netcore-notice { margin: 0; padding: 6px 12px; border-radius: var(--workspace-control-radius); background: var(--score-measured-surface); color: var(--score-measured); font-size: var(--workspace-body); }
 .netcore-empty { padding: 4px 0; color: var(--repair-muted); }
 .netcore-empty p { margin: 0 0 4px; }
 .netcore-block { display: grid; gap: 8px; }
 .netcore-block h3 { display: flex; align-items: center; gap: 8px; margin: 0; font-size: var(--workspace-subheading); font-weight: 600; }
+.netcore-block__head { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.netcore-block__actions { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.netcore-node-count { display: inline-flex; min-width: 18px; justify-content: center; padding: 0 6px; border-radius: 999px; background: var(--workspace-track); color: var(--repair-muted); font-size: var(--workspace-label); font-weight: 600; }
+.netcore-source-name { color: var(--repair-muted); font-size: var(--workspace-label); font-weight: 500; }
+.netcore-state-pill { padding: 1px 8px; border-radius: 999px; background: var(--workspace-track); color: var(--repair-muted); font-size: 11px; font-weight: 600; }
+.netcore-state-pill[data-tone="ok"] { background: var(--score-measured-surface); color: var(--score-measured); }
+.netcore-state-pill[data-tone="warn"] { background: var(--workspace-warn-surface); color: var(--workspace-warn-text); }
 .netcore-violations { display: grid; gap: 0; margin: 0; padding: 0; list-style: none; }
 .netcore-violations li { display: flex; align-items: baseline; gap: 12px; padding: 6px 0; border-bottom: 1px solid var(--workspace-divider); overflow-wrap: anywhere; }
 .netcore-violations li:last-child { border-bottom: 0; }
 .netcore-host { font-weight: 600; }
 .netcore-chain { color: var(--repair-danger); font-size: var(--workspace-label); }
 .netcore-count { margin-left: auto; color: var(--repair-muted); font-variant-numeric: tabular-nums; }
-.netcore-nodes { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 4px; margin: 0; padding: 0; list-style: none; }
-.netcore-node { display: flex; align-items: center; justify-content: space-between; gap: 12px; width: 100%; min-height: 36px; padding: 6px 12px; border: 1px solid var(--repair-border); border-radius: var(--workspace-control-radius); background: var(--repair-surface); color: var(--repair-text); font: inherit; text-align: left; cursor: pointer; }
+/* 节点：两行卡片（名字 + 延迟/出口），卡宽有上限，单个节点不会拉成一整条空框。 */
+.netcore-nodes { display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 320px)); gap: 6px; margin: 0; padding: 0; list-style: none; }
+.netcore-node { display: grid; gap: 2px; width: 100%; min-height: 52px; padding: 8px 12px; border: 1px solid var(--workspace-control-border); border-radius: var(--workspace-control-radius); background: var(--repair-surface); color: var(--repair-text); font: inherit; text-align: left; cursor: pointer; }
 .netcore-node[aria-pressed="true"] { border-color: var(--repair-accent); background: var(--repair-selected); }
+.netcore-node:hover:not(:disabled) { border-color: var(--repair-accent); }
 .netcore-node:disabled { cursor: not-allowed; opacity: 0.6; }
-.netcore-node__state { color: var(--repair-muted); font-size: var(--workspace-label); }
+.netcore-node__head { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.netcore-node__name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.netcore-node__badge { flex-shrink: 0; margin-left: auto; padding: 0 8px; border-radius: 999px; background: var(--repair-selected); color: var(--repair-accent); font-size: 11px; font-weight: 700; }
+.netcore-node__badge--auto { background: var(--workspace-track); color: var(--repair-muted); }
+.netcore-node__state { color: var(--repair-muted); font-size: var(--workspace-label); font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.netcore-probed { margin-top: -2px; }
+.netcore-history { color: var(--repair-muted); font-size: var(--workspace-label); }
+.netcore-history summary { cursor: pointer; font-weight: 600; }
+.netcore-history ul { display: flex; flex-wrap: wrap; gap: 4px 14px; margin: 6px 0 0; padding-left: 16px; font-variant-numeric: tabular-nums; }
 .netcore-pill { display: inline-flex; align-items: center; gap: 6px; padding: 2px 10px; border-radius: 999px; background: var(--workspace-track); color: var(--repair-muted); font-size: var(--workspace-label); font-weight: 600; }
 .netcore-pill[data-tone="ok"] { background: var(--score-measured-surface); color: var(--score-measured); }
 .netcore-pill[data-tone="warn"] { background: var(--repair-selected); color: var(--repair-text); }
 .netcore-pill[data-tone="danger"] { background: var(--repair-danger-surface); color: var(--repair-danger); }
 
-/* 添加配置：左侧来源列表 + 右侧表单。沿用 repair-dialog 容器与既有 token。 */
+/* 配置与供应商：列表 + 内嵌表单。沿用 repair-dialog 容器与既有 token。 */
 .addconfig-dialog { width: min(760px, calc(100vw - 32px)); }
 .addconfig-body { display: grid; grid-template-columns: 200px minmax(0, 1fr); gap: 16px; padding: 0 20px 16px; }
+.addconfig-body[data-editing="true"] { grid-template-columns: minmax(0, 1fr); }
 .addconfig-modes { display: grid; gap: 2px; align-content: start; }
 .addconfig-mode { display: grid; gap: 2px; width: 100%; min-height: 56px; padding: 8px 12px; border: 0; border-radius: var(--workspace-control-radius); background: transparent; color: var(--repair-text); font: inherit; text-align: left; cursor: pointer; }
 .addconfig-mode[aria-pressed="true"] { background: var(--repair-selected); }
@@ -324,16 +346,50 @@
 .addconfig-grid label { display: grid; gap: 4px; color: var(--repair-muted); font-size: var(--workspace-label); font-weight: 600; }
 .addconfig-result { padding: 8px 12px; border-radius: var(--workspace-control-radius); background: var(--score-measured-surface); color: var(--repair-text); font-size: var(--workspace-body); }
 .addconfig-result p { margin: 0; }
-.netcore-add { margin-left: auto; }
 @media (max-width: 720px) { .addconfig-body { grid-template-columns: minmax(0, 1fr); } .addconfig-modes { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 
-/* 出站模式：规则 / 全局 / 直连 / 仅 Claude，与内核配置一一对应。 */
+/* 出站模式：规则 / 全局 / 直连 / 仅 Claude，与内核配置一一对应；切换前先确认。 */
 .netcore-modes { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; }
 .netcore-modes__label { color: var(--repair-muted); font-size: var(--workspace-label); font-weight: 600; }
-.netcore-mode { min-height: 28px; padding: 2px 10px; border: 1px solid var(--repair-border); border-radius: var(--workspace-control-radius); background: var(--repair-surface); color: var(--repair-text); font: inherit; font-size: var(--workspace-label); cursor: pointer; }
+.netcore-mode { min-height: 32px; padding: 4px 12px; border: 1px solid var(--workspace-control-border); border-radius: var(--workspace-control-radius); background: var(--repair-surface); color: var(--repair-text); font: inherit; font-size: var(--workspace-body); cursor: pointer; }
 .netcore-mode[aria-pressed="true"] { border-color: var(--repair-accent); background: var(--repair-selected); font-weight: 600; }
+.netcore-mode:hover:not(:disabled) { border-color: var(--repair-accent); }
 .netcore-mode:disabled { opacity: .6; cursor: not-allowed; }
-.netcore-modes__hint { color: var(--repair-muted); font-size: var(--workspace-label); }
+.netcore-mode:focus-visible, .netcore-node:focus-visible { outline: 3px solid var(--repair-focus); outline-offset: 2px; }
+.netcore-mode-hint { margin: -10px 0 0; color: var(--repair-muted); font-size: var(--workspace-body); }
+.netcore-confirm { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; padding: 8px 12px; border: 1px solid var(--workspace-meter-mid); border-radius: var(--workspace-control-radius); background: var(--workspace-warn-surface); color: var(--workspace-warn-text); font-size: var(--workspace-body); }
+.netcore-confirm__actions { display: flex; gap: 6px; margin-left: auto; }
+
+/* 诊断与高级操作：低频信息与危险动作折叠，不占主阅读路径。 */
+.netcore-advanced { padding-top: 10px; border-top: 1px solid var(--workspace-divider); }
+.netcore-advanced > summary { color: var(--repair-muted); font-size: var(--workspace-label); font-weight: 600; cursor: pointer; }
+.netcore-diagnostics { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 8px 16px; margin: 10px 0; }
+.netcore-diagnostics > div { display: grid; gap: 2px; min-width: 0; }
+.netcore-diagnostics dt { color: var(--repair-muted); font-size: var(--workspace-label); }
+.netcore-diagnostics dd { margin: 0; font-size: var(--workspace-subheading); font-weight: 600; overflow-wrap: anywhere; }
+.netcore-advanced__actions { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 6px; }
+
+/* 配置与供应商：列表 + 内嵌表单，避免在弹窗里再套一个弹窗。 */
+.sources-dialog { width: min(820px, calc(100vw - 32px)); }
+.sources-body { display: grid; gap: 10px; padding: 0 20px 20px; max-height: min(70vh, 720px); overflow: auto; }
+.sources-body .addconfig-body { padding: 0; }
+.sources-list { display: grid; gap: 6px; margin: 0; padding: 0; list-style: none; }
+.source-item { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; padding: 10px 12px; border: 1px solid var(--repair-border); border-radius: var(--workspace-control-radius); background: var(--repair-surface); }
+.source-item[data-active="true"] { border-color: var(--score-measured); }
+.source-item__main { display: grid; gap: 3px; flex: 1 1 260px; min-width: 0; }
+.source-item__title { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.source-item__title strong { font-size: var(--workspace-subheading); overflow-wrap: anywhere; }
+.source-item__kind { color: var(--repair-muted); font-size: 11px; }
+.source-item__meta { display: flex; flex-wrap: wrap; gap: 2px 12px; margin: 0; color: var(--repair-muted); font-size: var(--workspace-label); }
+.source-item__url { overflow-wrap: anywhere; }
+.source-item__actions { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; }
+.source-item__current { color: var(--score-measured); font-size: var(--workspace-label); font-weight: 600; }
+.sources-confirm { display: grid; gap: 8px; padding: 10px 12px; border: 1px solid var(--workspace-meter-mid); border-radius: var(--workspace-control-radius); background: var(--workspace-warn-surface); color: var(--workspace-warn-text); }
+.sources-confirm p { margin: 0; font-size: var(--workspace-body); }
+.sources-confirm__actions { display: flex; justify-content: flex-end; gap: 6px; }
+.sources-footer { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; padding-top: 4px; }
+.sources-form__actions { display: flex; justify-content: flex-end; gap: 6px; }
+@media (max-width: 720px) { .netcore-nodes { grid-template-columns: minmax(0, 1fr); } .netcore-conclusion { grid-template-columns: minmax(0, 1fr); } .netcore-conclusion__state { justify-items: start; } .source-item__actions { width: 100%; } }
 
 /* 内网直连（VPN / 公司网络）：单页分组表单 + 顶部结论条。
    骨架与「添加配置」同族，只新增豁免列表所需的排版，不引入新色阶与新圆角。 */

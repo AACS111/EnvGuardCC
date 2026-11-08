@@ -399,6 +399,15 @@ test('IP 情报冲突时拒绝适配，韩国出口映射到韩国时区和语�
   assert.throws(() => targetFromExit({ primary: { ip: '203.0.113.44', countryCode: 'KR' }, consistentCountry: false }), /冲突/);
   const target = targetFromExit({ primary: { ip: '203.0.113.44', countryCode: 'KR', timezone: 'Asia/Seoul', city: 'Seoul' } });
   assert.equal(target.windowsTimezone, 'Korea Standard Time'); assert.equal(target.language, 'ko-KR');
+  assert.equal(target.hosting, false);
+});
+
+test('云机房出口在目标里带 hosting 标记，界面可以提示 Claude 可能拒绝', () => {
+  const target = targetFromExit({ primary: { ip: '43.133.78.123', countryCode: 'KR', timezone: 'Asia/Seoul', asn: 132203, org: '6 COLLYER QUAY', isp: 'Shenzhen Tencent Computer Systems Company Limited', domain: 'tencent.com' } });
+  assert.equal(target.hosting, true);
+  assert.equal(target.asn, 132203);
+  const residential = targetFromExit({ primary: { ip: '203.0.113.44', countryCode: 'KR', asn: 4766, org: 'Korea Telecom' } });
+  assert.equal(residential.hosting, false);
 });
 
 test('启动保护不打开浏览器，已有连接继续验证，未连接或验证失败仍报告部分生效', async t => {
@@ -500,4 +509,33 @@ test('启动保护开关独立控制下一次启动，不依赖上次手动开�
   await session.start('http://localhost:3000');
   await assert.rejects(session.startupPreference(false), /尚未恢复/);
   await session.stop();
+});
+
+test('固定出口在 Claude 不支持地区时拒绝启动，且不写入任何浏览器/网关配置', async t => {
+  const stateDir = await mkdtemp(path.join(os.tmpdir(), 'checkcc-protection-region-'));
+  t.after(() => rm(stateDir, { recursive: true, force: true }));
+  let applied = 0;
+  const kernel = {
+    report: async () => ({ state: 'running', tunEnabled: true, tunCaptured: true }),
+    verifyConnection: async () => ({ state: 'running', tunEnabled: true, tunCaptured: true }),
+    setTunnel: async () => ({ changed: false }),
+    connectionState: () => ({ strictEnabled: false }),
+    probeSelectedExit: async () => ({ ip: '203.0.113.9', countryCode: 'CN', timezone: 'Asia/Shanghai' }),
+  };
+  const service = createProtectionService({
+    stateDir,
+    runtime: { load: async () => ({}) },
+    browserCloak: { sync: async () => ({ results: [], requestProbe: null }), close: async () => {} },
+    currentZone: async () => 'Asia/Shanghai',
+    setZone: async () => {},
+    restoreTimezone: async () => {},
+    canTest: () => true,
+    network: () => kernel,
+    platform: 'darwin',
+    gatewayRequest: async () => { applied += 1; return { cloak: { enabled: false } }; },
+  });
+  await assert.rejects(service.start('http://localhost:3000'), /固定出口位于 Claude 不支持的地区：CN/);
+  assert.equal(applied, 0, '地区校验失败后不得碰浏览器/网关配置');
+  assert.equal(service.report().enabled, false);
+  assert.match(service.report().issues.join(), /Claude 不支持的地区：CN/);
 });

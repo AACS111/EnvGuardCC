@@ -1,6 +1,6 @@
 "use client";
 // 内网直连（VPN / 公司网络）：编辑 net-core-network.json。
-// 骨架沿用「添加配置」弹窗的单页表单，顶部补一条「当前生效」结论：
+// 骨架沿用「配置与供应商」弹窗的单页表单，顶部补一条「当前生效」结论：
 // 用户改完能立刻看到会生成什么规则，而不是只相信自己填对了一串地址。
 import { useEffect, useRef, useState } from "react";
 import type { LocaleCode } from "@/i18n/messages";

@@ -9,9 +9,25 @@ import path from "node:path";
 export const HOST_LABEL = "com.envguardcc.kernelhost";
 export const HOST_TASK = "EnvGuardCC-KernelHost";
 
+// bootout 返回时旧作业可能还在退出；此时立即 bootstrap 会得到错误 5。
+export async function waitForMacHostUnload({ run, pause = ms => new Promise(resolve => setTimeout(resolve, ms)), attempts = 40 } = {}) {
+  try { await run("launchctl", ["bootout", `system/${HOST_LABEL}`]); } catch { /* 下面核实是否已卸载 */ }
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    try { await run("launchctl", ["print", `system/${HOST_LABEL}`]); }
+    catch (error) {
+      // launchctl 的“不存在”退出码；权限/执行失败不能冒充卸载成功。
+      if ([3, 113].includes(Number(error.code ?? error.status))) return;
+      throw error;
+    }
+    await pause(250);
+  }
+  throw new Error("旧系统助手仍在退出，尚未重新加载。请稍后重试；没有把安装报告为成功。");
+}
+
 function quote(value) {
   return `"${String(value).replace(/"/g, '\\"')}"`;
 }
+const posix = value => `'${String(value).replace(/'/g, `'\\''`)}'`;
 
 /**
  * @param {object} options
@@ -25,19 +41,25 @@ function quote(value) {
  */
 export function buildHostInstallPlan({ platform = process.platform, nodePath, hostScript, stateDir, binary, apiPort = 39090, port = 39091 } = {}) {
   if (!nodePath || !hostScript || !stateDir || !binary) throw new Error("安装计划缺少必要路径。");
-  const tokenFile = path.join(stateDir, "host-token");
+  const paths = platform === "win32" ? path.win32 : path.posix;
+  const tokenFile = paths.join(stateDir, "host-token");
   const args = ["--state-dir", quote(stateDir), "--token-file", quote(tokenFile), "--binary", quote(binary), "--api-port", String(apiPort), "--port", String(port)];
 
   if (platform === "win32") {
+    for (const value of [nodePath, hostScript, stateDir, binary]) {
+      if (/["%\r\n\0]/.test(value)) throw new Error("Windows 宿主路径不得包含引号、百分号或换行。");
+    }
     // schtasks 的 /TR 值上限是 261 字符，整条命令很容易超限；
     // 因此生成一个短路径包装脚本，计划任务只指向它。
-    const launch = path.join(stateDir, "host", "host-launch.cmd");
+    const launch = paths.join(paths.dirname(hostScript), "host-launch.cmd");
     if (launch.length > 200) throw new Error(`包装脚本路径过长（${launch.length} 字符），请使用更短的状态目录。`);
-    const launchContent = ["@echo off", `${quote(nodePath)} ${quote(hostScript)} ${args.join(" ")}`, ""].join("\r\n");
+    const launchContent = ["@echo off", "setlocal DisableDelayedExpansion", 'set "NODE_OPTIONS="', 'set "NODE_PATH="', `${quote(nodePath)} ${quote(hostScript)} ${args.join(" ")}`, ""].join("\r\n");
     return {
       platform,
       files: [{ path: launch, content: launchContent, mode: 0o644, note: "计划任务指向该短路径脚本；/TR 有 261 字符上限" }],
       commands: [
+        { note: "启动脚本不继承用户目录权限。", cmd: "icacls.exe", args: [launch, "/inheritance:r", "/grant:r", "*S-1-5-18:F", "*S-1-5-32-544:F", "/Q"] },
+        { note: "所有者固定为管理员组，普通用户不能更改 DACL。", cmd: "icacls.exe", args: [launch, "/setowner", "*S-1-5-32-544", "/Q"] },
         {
           note: "以 SYSTEM 身份、开机自动运行内核宿主。安装时需要管理员权限。",
           cmd: "schtasks.exe",
@@ -46,13 +68,14 @@ export function buildHostInstallPlan({ platform = process.platform, nodePath, ho
         { note: "安装后立即启动一次，无需重启系统。", cmd: "schtasks.exe", args: ["/Run", "/TN", HOST_TASK] },
       ],
       uninstallCommands: [
+        { cmd: "schtasks.exe", args: ["/End", "/TN", HOST_TASK], optional: true },
         { cmd: "schtasks.exe", args: ["/Delete", "/TN", HOST_TASK, "/F"] },
-        { cmd: "cmd.exe", args: ["/c", "del", "/f", quote(launch)] },
+        { cmd: "cmd.exe", args: ["/c", "del", "/f", quote(launch)], optional: true },
       ],
       tokenFile,
       launchFile: launch,
       notes: [
-        "令牌文件由首次运行的宿主生成（0600）；删除后下次启动会重新生成。",
+        "授权前由当前用户生成令牌；Windows 的访问权限依赖用户状态目录 ACL，不能用 POSIX 0600 代替。",
         "计划任务只允许本机访问宿主端口，令牌缺失或不匹配一律拒绝。",
       ],
     };
@@ -63,7 +86,7 @@ export function buildHostInstallPlan({ platform = process.platform, nodePath, ho
     const plist = `/Library/LaunchDaemons/${HOST_LABEL}.plist`;
     const script = [
       "#!/bin/sh",
-      `exec ${quote(nodePath)} ${quote(hostScript)} ${args.join(" ")}`,
+      `exec /usr/bin/env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin HOME=/var/root ${[nodePath, hostScript, "--state-dir", stateDir, "--token-file", tokenFile, "--binary", binary, "--api-port", apiPort, "--port", port].map(posix).join(" ")}`,
       "",
     ].join("\n");
     const plistContent = `<?xml version="1.0" encoding="UTF-8"?>
@@ -85,11 +108,15 @@ export function buildHostInstallPlan({ platform = process.platform, nodePath, ho
       files: [
         { path: helper, content: script, mode: 0o755, note: "root:wheel 755，用户态不可写" },
         { path: plist, content: plistContent, mode: 0o644, note: "launchd 以 root 执行宿主" },
+        { path: "/Library/PrivilegedHelperTools/com.envguardcc.kernel-recover", content: `#!/bin/sh\nexec /usr/bin/env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin HOME=/var/root ${[nodePath, hostScript, "--recover-network"].map(posix).join(" ")}\n`, mode: 0o755, note: "独立网络恢复工具；不依赖应用页面或节点配置" },
       ],
-      commands: [{ note: "加载特权守护进程（需要 sudo）。", cmd: "launchctl", args: ["bootstrap", "system", plist] }],
+      commands: [
+        { note: "清除之前停用助手留下的禁用状态。", cmd: "launchctl", args: ["enable", `system/${HOST_LABEL}`] },
+        { note: "加载特权守护进程（需要 sudo）。", cmd: "launchctl", args: ["bootstrap", "system", plist] },
+      ],
       uninstallCommands: [
         { cmd: "launchctl", args: ["bootout", "system", plist] },
-        { cmd: "rm", args: ["-f", plist, helper] },
+        { cmd: "rm", args: ["-f", plist, helper, "/Library/PrivilegedHelperTools/com.envguardcc.kernel-recover"] },
       ],
       tokenFile,
       notes: [

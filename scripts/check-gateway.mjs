@@ -232,6 +232,115 @@ test("内核导入接口：支持链接/内容/手工，非法输入明确拒绝
   }
 });
 
+test("配置来源接口：列出、切换、重命名、删除、刷新，非法操作明确拒绝", async () => {
+  const calls = [];
+  const netCore = {
+    report: async () => ({ state: "running" }),
+    sources: () => [{ id: "src_a", name: "A 机场", mode: "url", nodeCount: 1, active: true }],
+    activateSource: async (id) => { calls.push(["activate", id]); return { activeId: id, changed: true }; },
+    deleteSource: async (id) => { calls.push(["delete", id]); return { activeId: null }; },
+    renameSource: async (id, name) => { calls.push(["rename", id, name]); return { id, name }; },
+    refresh: async (options) => { calls.push(["refresh", options]); return { imported: 2 }; },
+  };
+  const gateway = createGateway({ netCore, collect: async () => ({}) });
+  const url = await listen(gateway);
+  const post = (body) => fetch(url + "/__checkcc/net-core/sources", {
+    method: "POST", headers: { ...ui, "Content-Type": "application/json" }, body: JSON.stringify(body),
+  });
+  try {
+    const listed = await (await fetch(url + "/__checkcc/net-core/sources", { headers: ui })).json();
+    assert.equal(listed.ok, true);
+    assert.equal(listed.sources[0].name, "A 机场");
+
+    assert.equal((await (await post({ action: "activate", id: "src_a" })).json()).activeId, "src_a");
+    assert.equal((await (await post({ action: "rename", id: "src_a", name: "A 二号" })).json()).name, "A 二号");
+    const refreshed = await (await post({ action: "refresh", id: "src_a" })).json();
+    assert.equal(refreshed.imported, 2);
+    assert.deepEqual(calls[2], ["refresh", { force: true, sourceId: "src_a" }]);
+    assert.equal((await (await post({ action: "delete", id: "src_a" })).json()).activeId, null);
+
+    assert.equal((await post({ action: "explode", id: "src_a" })).status, 400);
+    assert.equal((await post({ action: "activate" })).status, 400);
+    assert.equal((await fetch(url + "/__checkcc/net-core/sources", { method: "PUT", headers: ui })).status, 405);
+
+    const failing = createGateway({ netCore: { ...netCore, activateSource: async () => { throw new Error("该配置没有可用节点"); } }, collect: async () => ({}) });
+    const url2 = await listen(failing);
+    try {
+      const bad = await (await fetch(url2 + "/__checkcc/net-core/sources", { method: "POST", headers: { ...ui, "Content-Type": "application/json" }, body: JSON.stringify({ action: "activate", id: "src_a" }) })).json();
+      assert.equal(bad.ok, false);
+      assert.match(bad.reason, /没有可用节点/);
+    } finally { await close(failing); }
+
+    const noRuntime = createGateway({ collect: async () => ({}) });
+    const url3 = await listen(noRuntime);
+    try {
+      const empty = await (await fetch(url3 + "/__checkcc/net-core/sources", { headers: ui })).json();
+      assert.equal(empty.ok, false);
+      assert.match(empty.reason, /未接入网络内核/);
+    } finally { await close(noRuntime); }
+  } finally { await close(gateway); }
+});
+
+test("内核动作失败时把报告里的真实原因带回接口", async () => {
+  const netCore = {
+    report: async () => ({ state: "error", reason: "TUN 需要更高权限：安装特权助手后重试。" }),
+    start: async () => false,
+    stop: async () => {},
+  };
+  const gateway = createGateway({ netCore, collect: async () => ({}) });
+  const url = await listen(gateway);
+  try {
+    const response = await fetch(url + "/__checkcc/net-core", {
+      method: "POST", headers: { ...ui, "Content-Type": "application/json" }, body: JSON.stringify({ action: "start" }),
+    });
+    const value = await response.json();
+    assert.equal(value.ok, false);
+    // start() 用返回值表达失败：不能只回一个没有信息量的 ok:false。
+    assert.match(value.reason, /TUN 需要更高权限/);
+    assert.equal(value.netCore.state, "error");
+  } finally { await close(gateway); }
+});
+
+test("特权宿主安装接口：只接受 install，失败原因原样返回", async () => {
+  const netCore = {
+    report: async () => ({ state: "running", hostMode: false }),
+    installHost: async () => ({ installed: true, hostMode: true }),
+  };
+  const gateway = createGateway({ netCore, collect: async () => ({}) });
+  const url = await listen(gateway);
+  const post = (body) => fetch(url + "/__checkcc/net-core/host", {
+    method: "POST", headers: { ...ui, "Content-Type": "application/json" }, body: JSON.stringify(body),
+  });
+  try {
+    assert.equal((await fetch(url + "/__checkcc/net-core/host", { headers: ui })).status, 405);
+    assert.equal((await post({ action: "uninstall" })).status, 400);
+    const installed = await (await post({ action: "install" })).json();
+    assert.equal(installed.ok, true);
+    assert.equal(installed.hostMode, true);
+
+    const failing = { report: async () => ({ state: "error" }), installHost: async () => { throw new Error("授权已取消，未安装特权宿主。"); } };
+    const g2 = createGateway({ netCore: failing, collect: async () => ({}) });
+    const url2 = await listen(g2);
+    try {
+      const refused = await (await fetch(url2 + "/__checkcc/net-core/host", {
+        method: "POST", headers: { ...ui, "Content-Type": "application/json" }, body: JSON.stringify({ action: "install" }),
+      })).json();
+      assert.equal(refused.ok, false);
+      assert.match(refused.reason, /授权已取消/);
+    } finally { await close(g2); }
+
+    const noRuntime = createGateway({ collect: async () => ({}) });
+    const url3 = await listen(noRuntime);
+    try {
+      const value = await (await fetch(url3 + "/__checkcc/net-core/host", {
+        method: "POST", headers: { ...ui, "Content-Type": "application/json" }, body: JSON.stringify({ action: "install" }),
+      })).json();
+      assert.equal(value.ok, false);
+      assert.match(value.reason, /未接入网络内核/);
+    } finally { await close(noRuntime); }
+  } finally { await close(gateway); }
+});
+
 test("内核订阅刷新接口：到期跳过与强制刷新都能如实返回", async () => {
   const calls = [];
   const netCore = {

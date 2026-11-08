@@ -5,6 +5,7 @@ export type ProtectionReport = {
   phase: 'idle' | 'starting' | 'active' | 'partial' | 'restart_required' | 'stopping' | 'restore_failed';
   enabled: boolean; target: ProtectionTarget | null; issues: string[];
   desiredEnabled?: boolean;
+  connection?: { state: string; checkedAt: string | null; tunCaptured: boolean | null; reason: string | null; systemKillSwitch: boolean; strictTravel: boolean };
   history: { at: string; message: string }[]; lastTestAt: string | null; nextTestAt: string | null;
   runId: string | null; score: number | null; alarm: boolean; monitoring: boolean;
   verificationScore?: number; scoreReference?: number | null; scoreDropPercent?: number;

@@ -6,7 +6,7 @@ export function BrowserCloakStatus({ report, locale }: { report: BrowserCloakExe
   const browser = report?.results.find((item) => item.target === "web");
   const failed = report?.results.find((item) => item.state === "failed");
   const verified = !failed && report?.enabled && browser?.state === "verified" && report.requestProbe?.state === "verified";
-  const status = !report ? (zh ? "未跟随网关，请点击接入并验证浏览器。" : "Not linked; connect and verify the browser.")
+  const status = !report ? (zh ? "未跟随网关，请点击“启动保护浏览器”。" : "Not linked; click “Launch protected browser”.")
     : failed ? (zh ? "同步或执行失败。" : "Synchronization or execution failed.")
     : !report.enabled ? (zh ? "已关闭；请核对各端恢复结果。" : "Off; check restoration results.")
     : verified ? (zh ? "受控 Claude 页面接口与实际请求语言头均已验证。" : "Managed Claude interfaces and request language verified.")

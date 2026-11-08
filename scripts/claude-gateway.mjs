@@ -172,6 +172,10 @@ export function createGateway({ upstreamBase = "https://api.anthropic.com", prof
       const rawPath = request.url || "/";
       if (!rawPath.startsWith("/") || rawPath.startsWith("//") || rawPath.includes("\\")) return sendJson(response, 400, { error: "无效的上游路径。" });
       const pathname = rawPath.split("?")[0];
+      if (!pathname.startsWith("/__checkcc/")) {
+        const connection = netCore?.connectionState?.();
+        if (connection?.strictEnabled && connection.state !== "verified") return sendJson(response, 503, { error: "严格模式暂停连接，等待网络重新验证。" });
+      }
 
       if (pathname.startsWith("/__checkcc/")) {
         if (origin) {
@@ -186,7 +190,7 @@ export function createGateway({ upstreamBase = "https://api.anthropic.com", prof
           response.writeHead(204); return response.end();
         }
         if (request.headers["x-checkcc-client"] !== "gateway-ui") return sendJson(response, 403, { error: "缺少诊断客户端标识。" });
-        if (!["/__checkcc/status", "/__checkcc/diagnostics", "/__checkcc/cloak", "/__checkcc/simulation", "/__checkcc/message-probe", "/__checkcc/browser-probe", "/__checkcc/net-core", "/__checkcc/net-core/import", "/__checkcc/net-core/refresh", "/__checkcc/net-core/delay", "/__checkcc/net-core/exits", "/__checkcc/net-core/mode", "/__checkcc/net-core/network", "/__checkcc/net-core/verify-domain", "/__checkcc/net-core/local-proxies"].includes(pathname)) return sendJson(response, 404, { error: "未知诊断接口。" });
+        if (!["/__checkcc/status", "/__checkcc/diagnostics", "/__checkcc/cloak", "/__checkcc/simulation", "/__checkcc/message-probe", "/__checkcc/browser-probe", "/__checkcc/net-core", "/__checkcc/net-core/host", "/__checkcc/net-core/import", "/__checkcc/net-core/sources", "/__checkcc/net-core/refresh", "/__checkcc/net-core/delay", "/__checkcc/net-core/exits", "/__checkcc/net-core/mode", "/__checkcc/net-core/network", "/__checkcc/net-core/verify-domain", "/__checkcc/net-core/local-proxies"].includes(pathname)) return sendJson(response, 404, { error: "未知诊断接口。" });
         // 本地代理扫描：列出本机可借用的 FlClash / Clash Verge 等端口（只读，不改它们的设置）。
         if (pathname === "/__checkcc/net-core/local-proxies") {
           if (request.method !== "GET") return sendJson(response, 405, { error: "扫描仅允许 GET。" });
@@ -237,9 +241,38 @@ export function createGateway({ upstreamBase = "https://api.anthropic.com", prof
               // 订阅自带的 proxy-server-nameserver 决定节点域名能否解析，必须一并落盘。
               proxyServerDns: Array.isArray(parsed.proxyServerDns) ? parsed.proxyServerDns : null,
               source: value?.mode === "url" ? { mode: "url", url: value.url, updatedAt: new Date().toISOString() } : null,
+              // 编辑已有供应商：只改这一条，不新建重复项。
+              sourceId: typeof value?.sourceId === "string" && value.sourceId ? value.sourceId : null,
+              sourceName: typeof value?.name === "string" && value.name.trim() ? value.name.trim() : null,
             });
             return sendJson(response, 200, { ok: true, ...result, ...await kernelPayload() });
           } catch (error) { return sendJson(response, 400, { error: error.message }); }
+        }
+        // 供应商（配置来源）：一条来源 = 一份可切换的节点快照。
+        if (pathname === "/__checkcc/net-core/sources") {
+          if (!netCore || typeof netCore.sources !== "function") return sendJson(response, 200, { ok: false, sources: [], reason: "本次启动未接入网络内核。" });
+          if (request.method === "GET") return sendJson(response, 200, { ok: true, sources: netCore.sources(), ...await kernelPayload() });
+          if (request.method !== "POST") return sendJson(response, 405, { error: "配置来源仅允许 GET/POST。" });
+          let sourceBody = "";
+          for await (const chunk of request) {
+            sourceBody += chunk;
+            if (Buffer.byteLength(sourceBody) > 8192) return sendJson(response, 413, { error: "请求体过大。" });
+          }
+          let value;
+          try { value = JSON.parse(sourceBody || "{}"); }
+          catch { return sendJson(response, 400, { error: "无效的 JSON。" }); }
+          const id = typeof value?.id === "string" ? value.id : "";
+          if (!id) return sendJson(response, 400, { error: "请提供要操作的配置。" });
+          try {
+            const { action } = value;
+            let result;
+            if (action === "activate") result = await netCore.activateSource(id);
+            else if (action === "delete") result = await netCore.deleteSource(id);
+            else if (action === "rename") result = await netCore.renameSource(id, value?.name);
+            else if (action === "refresh") result = await netCore.refresh({ force: true, sourceId: id });
+            else return sendJson(response, 400, { error: "未知的配置操作。" });
+            return sendJson(response, 200, { ok: true, ...result, sources: netCore.sources(), ...await kernelPayload() });
+          } catch (error) { return sendJson(response, 400, { ok: false, reason: error.message, ...await kernelPayload() }); }
         }
         // 解析测试：用内核真实解析一次，判断这份声明到底够不够。
         if (pathname === "/__checkcc/net-core/verify-domain") {
@@ -347,6 +380,26 @@ export function createGateway({ upstreamBase = "https://api.anthropic.com", prof
             return sendJson(response, 200, { ok: true, ...result, ...await kernelPayload() });
           } catch (error) { return sendJson(response, 400, { ok: false, reason: error.message, ...await kernelPayload() }); }
         }
+        // 特权宿主安装：只接受固定动作，路径来自服务端；macOS 会弹系统授权窗口。
+        if (pathname === "/__checkcc/net-core/host") {
+          if (request.method !== "POST") return sendJson(response, 405, { error: "宿主安装仅允许 POST。" });
+          if (!netCore || typeof netCore.installHost !== "function") return sendJson(response, 200, { ok: false, reason: "本次启动未接入网络内核。" });
+          let hostBody = "";
+          for await (const chunk of request) {
+            hostBody += chunk;
+            if (Buffer.byteLength(hostBody) > 4096) return sendJson(response, 413, { error: "请求体过大。" });
+          }
+          let hostValue;
+          try { hostValue = JSON.parse(hostBody || "{}"); }
+          catch { return sendJson(response, 400, { error: "无效的 JSON。" }); }
+          if (hostValue?.action !== "install") return sendJson(response, 400, { error: "未知的宿主操作。" });
+          try {
+            const result = await netCore.installHost();
+            return sendJson(response, 200, { ok: true, ...result, ...await kernelPayload() });
+          } catch (error) {
+            return sendJson(response, 200, { ok: false, reason: error.message, ...await kernelPayload() });
+          }
+        }
         // 内核操作：只允许白名单动作，不暴露通用执行能力。
         if (pathname === "/__checkcc/net-core") {
           if (!netCore) return sendJson(response, 200, { ok: false, netCore: { state: "disabled", reason: "本次启动未接入网络内核。" } });
@@ -362,7 +415,8 @@ export function createGateway({ upstreamBase = "https://api.anthropic.com", prof
           try { kernelValue = JSON.parse(kernelBody || "{}"); }
           catch { return sendJson(response, 400, { error: "无效的 JSON。" }); }
           const action = kernelValue?.action;
-          if (!["start", "stop", "restart", "select", "tunnel"].includes(action)) return sendJson(response, 400, { error: "未知的内核操作。" });
+          if (!["start", "stop", "restart", "select", "tunnel", "strict", "unlock-region"].includes(action)) return sendJson(response, 400, { error: "未知的内核操作。" });
+          if (["tunnel", "strict"].includes(action) && typeof kernelValue?.enabled !== "boolean") return sendJson(response, 400, { error: "网络开关必须是布尔值。" });
           let node = null;
           if (action === "select") {
             node = kernelValue?.node;
@@ -372,16 +426,28 @@ export function createGateway({ upstreamBase = "https://api.anthropic.com", prof
           let reason = null;
           try {
             if (action === "start") ok = await netCore.start();
+            else if (action === "strict") {
+              if (typeof netCore.setStrictMode !== "function") throw new Error("当前后台不支持系统断流保护，请更新应用。");
+              await netCore.setStrictMode(kernelValue.enabled);
+            }
+            else if (action === "unlock-region") {
+              if (typeof netCore.unlockRegion !== "function") throw new Error("当前后台不支持区域锁定解除，请更新应用。");
+              await netCore.unlockRegion();
+            }
             else if (action === "tunnel") {
               // 关闭保护只退 TUN，内核保持运行。
               if (typeof netCore.setTunnel !== "function") { ok = false; reason = "本次启动未支持单独的 TUN 开关。"; }
-              else await netCore.setTunnel(kernelValue?.enabled !== false);
+              else await netCore.setTunnel(kernelValue.enabled);
             }
             else if (action === "stop") await netCore.stop();
             else if (action === "restart") { await netCore.stop(); ok = await netCore.start(); }
             else ok = await netCore.select(node);
           } catch (error) { ok = false; reason = error.message; }
-          return sendJson(response, 200, { action, ok, reason, ...await kernelPayload() });
+          const payload = await kernelPayload();
+          // start() 用返回值表达失败，不抛异常：把内核报告里的真实原因带回接口，
+          // 否则界面只能显示「内核操作未生效」这种没有信息量的话。
+          if (!ok && !reason) reason = payload.netCore?.reason ?? null;
+          return sendJson(response, 200, { action, ok, reason, ...payload });
         }
         if (pathname === "/__checkcc/browser-probe") {
           if (request.method !== "GET") return sendJson(response, 405, { error: "浏览器接收端仅允许 GET。" });

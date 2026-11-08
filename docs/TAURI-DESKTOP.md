@@ -89,3 +89,17 @@ Tauri NSIS 安装器为 27.7 MiB。详细字节数保存在产物目录的 `taur
 - 安装保护直接使用 Windows Toolhelp 进程快照，按完整进程名匹配；不解析 tasklist 输出，也不依赖安装脚本的暂存寄存器。`pnpm test:installer` 用实际 NSIS 探针验证未运行放行、运行拦截且不结束进程、退出后放行三种场景，CI 在 Windows 打包后执行。
 
 待实机验收：macOS arm64 构建与系统集成、Windows 旧版就地升级/卸载、系统缺少 WebView2 的联网安装，以及登录启动和系统睡眠/解锁。这些项目不计入已通过的验证。
+
+## 内置网络内核
+
+`pnpm dev:tauri` 和 `pnpm dev` 会按 `scripts/net-core/kernel-manifest.json` 自动准备当前平台的 Mihomo，缓存于 `node_modules/.checkcc-kernel`。每次启动前核验固定 SHA-256；缓存缺失或损坏时重新下载，未固定校验值的平台明确拒绝准备。离线开发可提前运行 `pnpm kernel:fetch` 准备缓存。显式设置 `CHECKCC_NET_CORE=0` 或 `CHECKCC_NET_CORE_BINARY` 时，开发启动器不自动下载。
+
+`pnpm desktop:package` 将已校验的内核、后台依赖和 `third_party/mihomo` 来源/许可证一并放入桌面包；最终用户无需另装 Clash 或内核。更新内核时需更新清单版本、下载地址及经验证的校验值，不应在普通构建中自动更新版本。
+
+绑定内核不等于已验证系统 VPN 接管。普通开发默认不开 TUN；TUN 仍需要系统权限及可用的真实出口节点。正常退出、强制终止、特权宿主崩溃、DNS/路由恢复必须分别验收。
+
+网络页现可独立开启/关闭系统接管，成功后保存意愿；环境保护会话由后台先核验隧道再应用配置。主内核与临时探测内核已启用随机控制器密钥；升级后应重新安装特权宿主以使用受保护运行包和新的配置验证逻辑。macOS 严格模式使用独立 PF 规则并保留崩溃后的阻断，普通模式和 Windows 不提供该能力。Windows UAC 授权代码已实现，但本轮未做 Windows 实机验收。详见[实现与验收记录](NETWORK-SAFETY-IMPLEMENTATION.md)。
+
+内核通过独立 Node 守护进程启动：正常停止关闭控制管道；父进程被强制结束时，守护进程在管道 EOF 后先正常终止内核，1.5 秒后仍未退出则强制终止。特权宿主同时要求应用每 5 秒续约；失联 30 秒后回收内核。升级旧宿主时需重新安装/重启宿主，使心跳租约代码生效。停止操作必须确认退出；失败会报错并保留控制接口供重试，不再报告假成功。
+
+隔离生命周期回归：`node --test scripts/check-kernel-vendor.cjs scripts/check-kernel-lifecycle.cjs`。真实内核测试不修改系统代理、不开 TUN；它们不能替代实机的 TUN、路由和 DNS 恢复验收。普通“关闭保护”仅关闭 TUN，内核继续提供节点诊断；需要完全退出内核时，从应用托盘退出应用。

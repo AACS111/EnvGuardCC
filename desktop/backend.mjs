@@ -44,10 +44,11 @@ const closeRuntime = createShutdown({ restore: () => helper?.closeRuntime(), clo
     // 退出时必须把定时器与内核一并关掉：否则进程退了、内核仍在接管流量（实测事故）。
     kernel?.stopAutoRefresh?.();
     kernel?.stopPublicDnsSync?.();
+    // 内核未确认退出时保留页面与控制接口，允许用户查看错误并重试退出。
+    await kernel?.stop();
     await closeServer(helper?.server);
     await closeServer(gateway);
     await closeServer(site);
-    await kernel?.stop();
 } });
 async function close() {
   stopping = closeRuntime().catch(error => { stopping = null; throw error; });
@@ -104,7 +105,7 @@ try {
   await new Promise((resolve, reject) => { gateway.once('error', reject); gateway.listen(devURL ? 3010 : 0, '127.0.0.1', resolve); });
   process.env.CHECKCC_GATEWAY_URL = `http://127.0.0.1:${gateway.address().port}`;
   const { startRepairHelper } = await import('../scripts/local-repair.mjs');
-  helper = await startRepairHelper(devURL ? 3001 : 0);
+  helper = await startRepairHelper(devURL ? 3001 : 0, { netCore: kernel });
   if (!helper.server) { helper = null; throw new Error('本机助手端口已被占用，请先退出旧服务。'); }
   const ports = { helper: helper.server.address().port, gateway: gateway.address().port };
   if (!devURL) {

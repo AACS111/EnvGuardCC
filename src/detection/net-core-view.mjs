@@ -64,6 +64,7 @@ export function netCoreView(report, { locale = "zh", exitHistory = null } = {}) 
       localProxy: null,
       mode: null,
       elevated: null,
+      platform: null,
       tunHint: null,
       exitStability: null,
       actions: { canStart: false, canStop: false, canRestart: false, canSelect: false },
@@ -75,6 +76,9 @@ export function netCoreView(report, { locale = "zh", exitHistory = null } = {}) 
   const normalizedState = rawState === "disabled" ? "unconfigured" : rawState;
   const state = STATE_LABELS[normalizedState] ? normalizedState : "unavailable";
   const routing = report.routing && typeof report.routing === "object" ? report.routing : null;
+  const sampled = Date.parse(routing?.sampledAt ?? "");
+  const sampleAge = Date.now() - sampled;
+  const freshRouting = Number.isFinite(sampled) && sampleAge >= -5000 && sampleAge <= 45000;
   const demo = report.demo === true;
   const tunEnabled = report.tunEnabled === true;
   // 配置里开了 ≠ 网卡真的接管了：分开显示，才能区分「没启用 TUN」和「启用了但没接管」。
@@ -129,7 +133,7 @@ export function netCoreView(report, { locale = "zh", exitHistory = null } = {}) 
     conclusion = {
       tone: "muted",
       title: t("内核已停止 · 流量直连", "Kernel stopped · traffic goes direct"),
-      detail: t("当前没有任何流量被隧道接管；需要代理时重新开启保护。", "No traffic is captured by the tunnel; start protection again to route through it."),
+      detail: t("当前没有任何流量被隧道接管；需要代理时点击「启动内核」，或重新开启保护。", "No traffic is captured by the tunnel; press \"Start kernel\" or turn protection on again to route through it."),
     };
   } else if (state === "unavailable") {
     tone = "warn";
@@ -143,15 +147,16 @@ export function netCoreView(report, { locale = "zh", exitHistory = null } = {}) 
     conclusion = {
       tone: "danger",
       title: t("存在未走专用出口的连接", "Connections bypassed the dedicated exit"),
-      detail: report.detail || t("请复查置顶规则是否被其它规则抢先命中。", "Check whether another rule captured these domains first."),
+      detail: t(`${Number(routing?.direct ?? 0)} 条连接没有走专用出口，见下方明细。`, `${Number(routing?.direct ?? 0)} connection(s) bypassed the dedicated exit; see the details below.`),
     };
   } else if (routing?.state === "verified") {
     // 未启用 TUN、或配置了却没接管，都不能算通过。
-    tone = demo || !tunEnabled || tunCaptured === false ? "warn" : "ok";
+    tone = demo || !tunEnabled || tunCaptured !== true || !freshRouting ? "warn" : "ok";
     conclusion = {
       tone,
-      title: t("Claude 流量全部走专用出口", "All Claude traffic uses the dedicated exit"),
-      detail: report.detail || "",
+      title: t("已观察到的 Claude 连接走专用出口", "Observed Claude connections use the dedicated exit"),
+      // 后端 detail 是内部术语（CLAUDE-PIN）且只有中文：结论文案在视图层按语言重写。
+      detail: t(`内核观察到的 ${Number(routing?.claude ?? 0)} 条 Claude 连接走了专用出口，未覆盖内核外流量。`, `The ${Number(routing?.claude ?? 0)} observed Claude connections used the dedicated exit; traffic outside the kernel is not covered.`),
     };
   } else {
     // 没有路由证据（含 routing 缺失、state=unknown、claude=0）：一律不得显示为通过。
@@ -159,13 +164,30 @@ export function netCoreView(report, { locale = "zh", exitHistory = null } = {}) 
     conclusion = {
       tone: "warn",
       title: t("未观察到 Claude 连接", "No Claude connections observed"),
-      detail: report.detail || t("无法验证是否走隧道；这不等于通过。", "Tunnel routing is unverified; this is not a pass."),
+      detail: t("无法验证是否走隧道；这不等于通过。", "Tunnel routing is unverified; this is not a pass."),
     };
   }
 
   if (state === "running" && demo) {
     label = t("运行中 · 演示", "Running · Demo");
     conclusion.title = `${t("演示模式", "Demo mode")} · ${conclusion.title}`;
+  }
+  if (state === "running" && routing?.state === "verified" && !freshRouting) {
+    conclusion.detail += t(" 路由证据缺失或已过期，请复检。", " Routing evidence is missing or expired; recheck routing.");
+  }
+  if (report.strictMode === true && report.capabilities?.strictTravel !== true) {
+    tone = "warn";
+    conclusion = { tone, title: t("严格连接尚未放行", "Strict connection is not released"), detail: t("系统阻断状态或固定出口尚未验证；复检连接或关闭严格模式恢复联网。", "System filtering or the pinned exit is unverified; recheck or disable strict mode to restore networking.") };
+  }
+  // 区域锁定优先于「运行中」的其他结论：Claude 已经被拒绝，不能再显示为可用。
+  if (report.regionLock?.locked) {
+    tone = "danger";
+    label = t("已阻断", "Blocked");
+    conclusion = {
+      tone,
+      title: t("Claude 流量已阻断", "Claude traffic blocked"),
+      detail: report.regionLock.reason || t("固定出口未通过复检，Claude 域名已被拒绝。", "The pinned exit failed recheck; Claude domains are rejected."),
+    };
   }
   if (state === "running" && !tunEnabled) {
     // 宿主模式下 TUN 关闭是「关闭保护 / 暂停接管」的正常态，不是故障：
@@ -177,6 +199,8 @@ export function netCoreView(report, { locale = "zh", exitHistory = null } = {}) 
   } else if (state === "running" && tunCaptured === false) {
     conclusion.detail = [conclusion.detail, t("TUN 已配置但未接管流量（网卡未生效），请重启内核或检查宿主权限。", "TUN is configured but not capturing traffic; restart the kernel or check the host privilege.")]
       .filter(Boolean).join(zh ? " " : " ");
+  } else if (state === "running" && tunEnabled && tunCaptured === null) {
+    conclusion.detail += t(" 隧道接管状态未知，不能确认系统流量已受保护。", " Tunnel capture is unknown; system traffic protection is unverified.");
   }
 
   const violations = dedupeViolations(routing?.violations).map((item) => ({
@@ -187,7 +211,7 @@ export function netCoreView(report, { locale = "zh", exitHistory = null } = {}) 
   // 未启用 TUN 时必须说明原因，而不是让用户以为内核坏了。
   const tunHint = state === "running" && !tunEnabled
     ? (hostMode
-      ? t("内核已由特权宿主托管，但当前配置未启用 TUN（CHECKCC_NET_CORE_TUN=0）。", "The kernel is hosted but TUN is disabled in the current configuration (CHECKCC_NET_CORE_TUN=0).")
+      ? t("系统接管已关闭，内核仍可提供本机代理；开启接管后会重新验证隧道。", "System capture is off; the kernel still provides a local proxy. Enabling capture will reverify the tunnel.")
       : (elevated !== true
         ? (report.elevation?.instruction || t("TUN 需要管理员权限才能接管系统流量。", "TUN requires administrator privileges to capture system traffic."))
         : t("当前是本机直连模式，未安装特权宿主；需要 TUN 请安装宿主。", "Running kernel directly without the privileged host; install the host to use TUN.")))
@@ -226,6 +250,7 @@ export function netCoreView(report, { locale = "zh", exitHistory = null } = {}) 
     localProxy,
     mode,
     elevated,
+    platform: typeof report.elevation?.platform === "string" ? report.elevation.platform : null,
     tunHint,
     exitStability: stability,
     actions: {

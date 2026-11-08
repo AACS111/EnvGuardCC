@@ -3,6 +3,8 @@ import path from 'node:path';
 import { sameTimezone, timezoneSupported } from './system-timezone.mjs';
 import { ProtectionSession } from './protection-session.mjs';
 import { collectNetworkDiagnostics } from './gateway-diagnostics.mjs';
+import { assertClaudeSupportedExit } from '../src/detection/claude-regions.mjs';
+import { isHostingExit } from '../src/detection/exit-quality.mjs';
 import { setTimeout as pause } from 'node:timers/promises';
 const regions = JSON.parse(await readFile(new URL('../src/detection/region-data.json', import.meta.url), 'utf8'));
 const { COUNTRY_LANGUAGES, COUNTRY_TIMEZONES, FALLBACK_COUNTRY_NAMES, WINDOWS_ZONES } = regions;
@@ -26,19 +28,58 @@ export function targetFromExit(exit) {
   const language = COUNTRY_LANGUAGES[geo.countryCode]?.[0];
   if (!language) throw new Error('当前出口国家暂无可靠的语言适配规则。');
   const timezone = geo.timezone ?? COUNTRY_TIMEZONES[geo.countryCode] ?? null;
-  return { ip: geo.ip, countryCode: geo.countryCode, countryName: FALLBACK_COUNTRY_NAMES[geo.countryCode] ?? geo.countryCode, city: geo.city, timezone, windowsTimezone: WINDOWS_ZONES[timezone] ?? null, language, locale: language };
+  return {
+    ip: geo.ip, countryCode: geo.countryCode, countryName: FALLBACK_COUNTRY_NAMES[geo.countryCode] ?? geo.countryCode,
+    city: geo.city, timezone, windowsTimezone: WINDOWS_ZONES[timezone] ?? null, language, locale: language,
+    // 云机房/托管 IP 即使国家正确也可能被 Claude 拒绝；界面据此给出警告。
+    asn: geo.asn ?? null, org: geo.org ?? null, isp: geo.isp ?? null, domain: geo.domain ?? null,
+    hosting: typeof geo.hosting === "boolean" ? geo.hosting : isHostingExit(geo),
+  };
 }
 
-export function createProtectionService({ stateDir, runtime, browserCloak, currentZone, setZone, restoreTimezone, canTest, platform = process.platform, gatewayRequest = gateway }) {
+export function createProtectionService({ stateDir, runtime, browserCloak, currentZone, setZone, restoreTimezone, canTest, network = () => null, platform = process.platform, gatewayRequest = gateway }) {
   const profileFile = path.join(stateDir, 'region-profile.json');
   const timezoneBackup = path.join(stateDir, 'timezone-backup.json');
   const policyFile = path.join(stateDir, 'environment-policy.json');
   const gateway = gatewayRequest;
   let browserIssues = [];
+  let previousTunnel = null;
+  const assertNetwork = async () => {
+    const kernel = network();
+    if (!kernel) return;
+    const report = kernel.verifyConnection ? await kernel.verifyConnection() : await kernel.report();
+    if (report.state !== "running" || report.tunEnabled !== true || report.tunCaptured !== true) throw new Error(report.reason || "隧道接管尚未验证，环境防护未生效。");
+  };
   const browserErrors = report => [...report.results.filter(result => result.state !== "verified").map(result => result.detail), ...(report.requestProbe?.state !== "verified" ? [report.requestProbe?.detail || "浏览器实际请求尚未验证。"] : [])];
   const session = new ProtectionSession({
     stateDir, canTest,
-    detect: async () => targetFromExit((await collectNetworkDiagnostics(new URL(process.env.CHECKCC_UPSTREAM || 'https://api.anthropic.com'), { signalId: 'country' })).exit),
+    beforeActivate: async () => {
+      const kernel = network();
+      if (!kernel) return;
+      if (previousTunnel === null) {
+        const before = await kernel.report();
+        previousTunnel = before.state === "running" && before.tunCaptured === true;
+      }
+      await kernel.setTunnel(true);
+      await assertNetwork();
+    },
+    beforeTest: assertNetwork,
+    afterStop: async ({ rollback = false } = {}) => {
+      const kernel = network();
+      if (kernel?.connectionState?.().strictEnabled) { previousTunnel = null; return; }
+      if (kernel) await kernel.setTunnel(rollback ? previousTunnel === true : false);
+      previousTunnel = null;
+    },
+    detect: async () => {
+      const kernel = network();
+      if (kernel?.probeSelectedExit) {
+        const primary = await kernel.probeSelectedExit();
+        // 固定出口必须位于 Claude 官方支持地区：否则宁可拒绝启动，也不把账号暴露给封禁风险。
+        assertClaudeSupportedExit(primary);
+        return targetFromExit({ primary, consistentCountry: true });
+      }
+      return targetFromExit((await collectNetworkDiagnostics(new URL(process.env.CHECKCC_UPSTREAM || 'https://api.anthropic.com'), { signalId: 'country' })).exit);
+    },
     snapshot: async () => {
       await runtime.load();
       const status = await gateway('/__checkcc/status');
@@ -108,6 +149,17 @@ export function createProtectionService({ stateDir, runtime, browserCloak, curre
     const remaining = session.report().issues.filter(issue => !browserIssues.includes(issue));
     browserIssues = browserErrors(report);
     session.updateIssues([...remaining, ...browserIssues]);
+  };
+  const environmentReport = session.report.bind(session);
+  session.report = () => {
+    const report = environmentReport();
+    const connection = network()?.connectionState?.() ?? null;
+    if (!connection) return report;
+    if (report.enabled && connection.state !== "verified") {
+      report.phase = report.phase === "active" ? "partial" : report.phase;
+      report.issues = [...new Set([...report.issues, connection.reason || "系统隧道未验证，环境检测不能代表网络保护已生效。"] )];
+    }
+    return { ...report, connection };
   };
   return session;
 }

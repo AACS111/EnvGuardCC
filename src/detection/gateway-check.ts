@@ -31,6 +31,29 @@ export type NetCoreRouting = {
 
 export type NetCoreIngress = { total: number; entries: number; shared: boolean; groups: Array<{ server: string; count: number; nodes: string[] }> };
 
+/** 供应商（配置来源）：一条来源保存一份节点快照，切换时整批替换。 */
+export type NetCoreSource = {
+  id: string;
+  name: string;
+  mode: "url" | "manual" | "content" | "local" | string;
+  url: string | null;
+  nodeCount: number;
+  selected: string | null;
+  updatedAt: string;
+  intervalHours: number;
+  active: boolean;
+};
+
+export type NetCoreExit = {
+  countryCode: string | null;
+  country: string | null;
+  ip: string | null;
+  asn?: number | null;
+  org?: string | null;
+  isp?: string | null;
+  domain?: string | null;
+  hosting?: boolean;
+};
 
 export type NetCoreReport = {
   /** 节点延迟：随状态一起下发（内核真实测速，缺失为 null）。 */
@@ -40,9 +63,18 @@ export type NetCoreReport = {
   enabled?: boolean;
   state: "disabled" | "idle" | "running" | "error" | "unavailable" | string;
   reason?: string | null; detail?: string;
-  tunEnabled?: boolean; demo?: boolean;
+  tunEnabled?: boolean; tunCaptured?: boolean | null; hostMode?: boolean; demo?: boolean;
+  networkGeneration?: number; lastHealthAt?: string | null;
+  capabilities?: { independentProxy: boolean; systemKillSwitch: boolean; strictTravel: boolean };
+  strictMode?: boolean;
+  /** 区域锁定：固定出口在 Claude 不支持地区时，内核直接 REJECT Claude 域名。 */
+  regionLock?: { locked: boolean; type?: "region" | "network"; reason?: string | null; countryCode?: string | null; ip?: string | null; at?: string } | null;
+  takeover?: { phase: "idle" | "checking" | "quitting" | "waiting" | "ready" | "blocked"; closed: string[]; reason: string | null; checkedAt: string | null };
+  guard?: { provider: string | null; supported: boolean; armed: boolean; phase: string; checkedAt: string | null; reason: string | null } | null;
   binary?: string; apiPort?: number;
   nodes?: string[]; selected?: string | null;
+  sources?: NetCoreSource[];
+  activeId?: string | null;
   version?: string; restarts?: number;
   routing?: NetCoreRouting;
   source?: { mode: "url" | "content" | "manual"; url?: string; updatedAt?: string; intervalHours?: number } | null;
@@ -343,26 +375,50 @@ export async function readNetCore(): Promise<{ netCore: NetCoreReport | null; ex
   return { netCore: (value?.netCore ?? null) as NetCoreReport | null, exitHistory: (value?.exitHistory ?? null) as ExitHistory | null };
 }
 
-export type NetCoreAction = "start" | "stop" | "restart" | "select" | "tunnel";
+export type NetCoreAction = "start" | "stop" | "restart" | "select" | "tunnel" | "strict" | "unlock-region";
 
 // 内核动作：白名单由网关二次校验；失败原因原样返回，不做兜底美化。
 export async function controlNetCore(action: NetCoreAction, node?: string, options: { enabled?: boolean } = {}): Promise<{ ok: boolean; reason: string | null; netCore: NetCoreReport | null }> {
   const response = await fetch(`${gatewayUrl}/__checkcc/net-core`, {
     method: "POST",
     headers: { "X-CheckCC-Client": "gateway-ui", "Content-Type": "application/json" },
-    body: JSON.stringify({ action, ...(node ? { node } : {}), ...(action === "tunnel" ? { enabled: options.enabled !== false } : {}) }),
-    cache: "no-store", signal: AbortSignal.timeout(30000),
+    body: JSON.stringify({ action, ...(node ? { node } : {}), ...(["tunnel", "strict"].includes(action) ? { enabled: options.enabled !== false } : {}) }),
+    cache: "no-store", signal: AbortSignal.timeout(["strict", "tunnel", "start", "restart"].includes(action) ? 120000 : 30000),
   });
   const value = await response.json().catch(() => null);
   if (!response.ok) throw new Error(value?.error ?? `HTTP ${response.status}`);
   return { ok: value?.ok === true, reason: typeof value?.reason === "string" ? value.reason : null, netCore: (value?.netCore ?? null) as NetCoreReport | null };
 }
 
-export type NetCoreImportPayload =
+export type HostInstallResult = { ok: boolean; reason: string | null; hostMode: boolean };
+
+/**
+ * 通过系统授权弹窗安装特权宿主（macOS）。
+ * 只发送固定动作，安装路径与命令由服务端决定；密码/Touch ID 在系统窗口完成。
+ */
+export async function installKernelHost(): Promise<HostInstallResult> {
+  const response = await fetch(`${gatewayUrl}/__checkcc/net-core/host`, {
+    method: "POST",
+    headers: { "X-CheckCC-Client": "gateway-ui", "Content-Type": "application/json" },
+    body: JSON.stringify({ action: "install" }),
+    cache: "no-store", signal: AbortSignal.timeout(180000),
+  });
+  const value = await response.json().catch(() => null);
+  if (!response.ok) return { ok: false, reason: value?.error ?? `HTTP ${response.status}`, hostMode: false };
+  return { ok: value?.ok === true, reason: typeof value?.reason === "string" ? value.reason : null, hostMode: value?.hostMode === true };
+}
+
+export type NetCoreImportPayload = (
   | { mode: "url"; url: string; selected?: string }
   | { mode: "content"; content: string; selected?: string }
   | { mode: "manual"; proxies: unknown[]; selected?: string }
-  | { mode: "local-proxy"; port: number; protocol: string; name?: string };
+  | { mode: "local-proxy"; port: number; protocol: string; name?: string }
+) & {
+  /** 编辑已有供应商：只更新这一条，不新建。 */
+  sourceId?: string;
+  /** 供应商名称；不传时由后端按域名/来源生成。 */
+  name?: string;
+};
 
 export type LocalProxyEntry = { port: number; pid: number; process: string; tool: string; protocol: string };
 
@@ -401,6 +457,23 @@ export async function importNetCore(payload: NetCoreImportPayload): Promise<NetC
 }
 
 export type NetCoreRefreshResult = { ok: boolean; reason?: string; skipped?: boolean; skippedItems?: Array<{ reason: string }>; imported?: number; selected?: string; netCore?: NetCoreReport | null };
+
+export type NetCoreSourceAction = "activate" | "delete" | "rename" | "refresh";
+
+export type NetCoreSourceResult = { ok: boolean; reason?: string; activeId?: string | null; name?: string; sources?: NetCoreSource[]; netCore?: NetCoreReport | null };
+
+/** 供应商操作：切换 / 删除 / 重命名 / 刷新单条订阅。写操作统一走后端，失败保留原状态。 */
+export async function netCoreSourceAction(action: NetCoreSourceAction, id: string, name = ""): Promise<NetCoreSourceResult> {
+  const response = await fetch(`${gatewayUrl}/__checkcc/net-core/sources`, {
+    method: "POST",
+    headers: { "X-CheckCC-Client": "gateway-ui", "Content-Type": "application/json" },
+    body: JSON.stringify({ action, id, name }),
+    cache: "no-store", signal: AbortSignal.timeout(65000),
+  });
+  const value = await response.json().catch(() => null);
+  if (!response.ok) return { ok: false, reason: value?.reason ?? value?.error ?? `HTTP ${response.status}`, netCore: value?.netCore ?? null };
+  return { ok: value?.ok !== false, reason: value?.reason, ...value } as NetCoreSourceResult;
+}
 
 // 订阅刷新：强制拉取订阅并替换节点；失败保留现有配置。
 export async function refreshNetCore(force = true): Promise<NetCoreRefreshResult> {

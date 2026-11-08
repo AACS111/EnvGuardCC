@@ -2,12 +2,14 @@
 // 需要管理员（Windows）/ root（macOS）；非特权时会给出可直接执行的提权命令，而不是静默失败。
 
 import { execFileSync } from "node:child_process";
-import { access, mkdir, readFile, writeFile } from "node:fs/promises";
+import { access, mkdir, readFile, writeFile, lstat, chmod, chown } from "node:fs/promises";
 import { randomBytes } from "node:crypto";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { buildHostInstallPlan, describePlan } from "./service.mjs";
+import { buildHostInstallPlan, describePlan, waitForMacHostUnload } from "./service.mjs";
 import { resolveKernelBinary } from "./runtime.mjs";
+import { stageHostBundle } from "./host-bundle.mjs";
+import { createFirewallGuard } from "./firewall.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(here, "..", "..");
@@ -43,7 +45,7 @@ async function main() {
   if (!binary) throw new Error("未找到内核二进制，请先运行 pnpm kernel:fetch。");
   await access(hostScript);
 
-  const plan = buildHostInstallPlan({
+  let plan = buildHostInstallPlan({
     platform: process.platform,
     nodePath: process.execPath,
     hostScript,
@@ -62,7 +64,11 @@ async function main() {
       process.exitCode = 2;
       return;
     }
-    for (const step of plan.uninstallCommands) execFileSync(step.cmd, step.args, { stdio: "inherit", windowsHide: true });
+    for (const step of plan.uninstallCommands) {
+      if (step === plan.uninstallCommands[0] && process.platform === "darwin") await createFirewallGuard().release();
+      try { execFileSync(step.cmd, step.args, { stdio: "inherit", windowsHide: true }); }
+      catch (error) { if (!step.optional) throw error; }
+    }
     process.stdout.write("[install] 已卸载宿主。\n");
     return;
   }
@@ -90,9 +96,26 @@ async function main() {
     return;
   }
 
+  // 系统服务必须指向管理员保护的独立运行包，不能指向源码树或用户可写应用目录。
+  const installed = await stageHostBundle({ hostScript, binary });
+  plan = buildHostInstallPlan({
+    platform: process.platform, nodePath: installed.nodePath, hostScript: installed.hostScript,
+    stateDir, binary: installed.binary,
+    apiPort: Number(process.env.CHECKCC_NET_CORE_API_PORT || 39090),
+    port: Number(process.env.CHECKCC_NET_CORE_HOST_PORT || 39091),
+  });
+  if (process.platform === "darwin") {
+    // 重装时先卸载旧服务，再加载新版本；普通首次安装的“不存在”可忽略。
+    await waitForMacHostUnload({ run: async (command, args) => execFileSync(command, args, { stdio: "pipe" }) });
+  } else if (process.platform === "win32") {
+    try { execFileSync("schtasks.exe", ["/End", "/TN", "EnvGuardCC-KernelHost"], { stdio: "ignore", windowsHide: true }); } catch { /* not running */ }
+  }
   for (const file of plan.files) {
     await mkdir(path.dirname(file.path), { recursive: true });
+    try { if ((await lstat(file.path)).isSymbolicLink()) throw new Error("拒绝替换符号链接形式的系统宿主文件。"); }
+    catch (error) { if (error.code !== "ENOENT") throw error; }
     await writeFile(file.path, file.content, { mode: file.mode });
+    if (process.platform === "darwin") { await chmod(file.path, file.mode); await chown(file.path, 0, 0); }
     process.stdout.write(`[install] 已写入 ${file.path}\n`);
   }
   for (const step of plan.commands) {
@@ -112,7 +135,9 @@ async function main() {
     } catch { /* 还在启动 */ }
     await new Promise((resolve) => setTimeout(resolve, 500));
   }
-  process.stdout.write("[install] 宿主未在 10 秒内应答，请运行 schtasks /Query /TN EnvGuardCC-KernelHost /V /FO LIST 检查，或用 pnpm kernel:host:uninstall 重装。\n");
+  process.stdout.write(process.platform === "darwin"
+    ? "[install] 宿主未及时应答。请检查 launchctl print system/com.envguardcc.kernelhost 与 /var/log/com.envguardcc.kernelhost.log。\n"
+    : "[install] 宿主未及时应答，请运行 schtasks /Query /TN EnvGuardCC-KernelHost /V /FO LIST 检查。\n");
   process.exitCode = 3;
 }
 

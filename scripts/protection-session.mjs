@@ -8,8 +8,8 @@ const AUTO_ADAPT_LIMIT = 5;
 
 // One durable baseline per activation. Re-adaptation must never replace it.
 export class ProtectionSession {
-  constructor({ stateDir, snapshot, apply, restore, detect, test, intervalMs = 60000, canTest = () => true }) {
-    Object.assign(this, { snapshot, apply, restore, detect, test, intervalMs, canTest });
+  constructor({ stateDir, snapshot, apply, restore, detect, test, intervalMs = 60000, canTest = () => true, beforeActivate = async () => {}, beforeTest = async () => {}, afterStop = async () => {} }) {
+    Object.assign(this, { snapshot, apply, restore, detect, test, intervalMs, canTest, beforeActivate, beforeTest, afterStop });
     this.file = path.join(stateDir, 'protection-session.json');
     this.preferenceFile = path.join(stateDir, 'protection-preference.json');
     this.desiredEnabled = false;
@@ -87,6 +87,7 @@ export class ProtectionSession {
     if (origin) this.origin = origin;
     this.state.phase = 'starting'; this.state.issues = [];
     try {
+      await this.beforeActivate();
       const target = await this.detect();
       if (!target?.ip || !target.language || !target.locale) throw new Error('无法识别当前出口 IP，未应用任何配置。');
       if (!this.pending) {
@@ -104,8 +105,11 @@ export class ProtectionSession {
       return this.report();
     } catch (error) {
       this.state.issues.push(error.message);
-      if (this.pending) await this.restorePending();
-      else this.state.phase = 'idle';
+      if (this.pending) await this.restorePending({ rollback: true });
+      else {
+        try { await this.afterStop({ rollback: true }); this.state.phase = 'idle'; }
+        catch (cleanup) { this.state.phase = 'restore_failed'; this.state.issues.push(cleanup.message); }
+      }
       throw error;
     }
   }
@@ -119,6 +123,7 @@ export class ProtectionSession {
       const wasEnabled = this.state.enabled;
       if (!wasEnabled) await this.activate(origin);
       try {
+        if (wasEnabled) await this.beforeActivate();
         const target = wasEnabled ? await this.detect() : this.state.target;
         if (!target?.ip || !target.language || !target.locale) throw new Error('网络尚未恢复，等待重新连接。');
         this.state.phase = 'starting';
@@ -159,6 +164,8 @@ export class ProtectionSession {
     this.testing = true;
     this.state.nextTestAt = this.state.monitoring ? new Date(Date.now() + this.intervalMs).toISOString() : null;
     try {
+      await this.beforeTest();
+      if (!current()) return;
       const target = detectedTarget ?? await Promise.race([this.detect({ signal: controller.signal }), cancelled]);
       if (!current()) return;
       if (!target?.ip || !target.language) throw new Error('出口识别失败，旧检测结果已过期。');
@@ -267,10 +274,15 @@ export class ProtectionSession {
     this.state.phase = 'stopping'; this.state.enabled = false; this.state.nextTestAt = null;
     this.state.runId = null; this.state.testError = null; this.state.testState = 'pending';
     clearInterval(this.timer); this.timer = null;
-    if (!this.pending) { this.state.phase = 'idle'; return; }
+    if (!this.pending) {
+      try { await this.afterStop(options); this.state.phase = 'idle'; this.state.issues = []; }
+      catch (error) { this.state.phase = 'restore_failed'; this.state.issues = [error.message]; }
+      return;
+    }
     try {
       const issues = await this.restore(this.pending.baseline, this.pending.origin, options);
       if (issues.length) throw new Error(issues.join('；'));
+      await this.afterStop(options);
       await rm(this.file, { force: true }); this.pending = null;
       this.state.phase = 'idle'; this.state.issues = []; this.state.alarm = false; this.state.score = null;
       this.event('模拟保护已关闭，本次改动已自动恢复');

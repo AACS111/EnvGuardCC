@@ -8,7 +8,7 @@ import { parse as parseYaml } from "yaml";
 import { proxyRequest } from "../gateway-proxy.mjs";
 
 export const MAX_SUBSCRIPTION_BYTES = 4 * 1024 * 1024;
-const SHARE_SCHEMES = /^(ss|ssr|vmess|trojan|vless|hysteria2?|tuic):\/\//i;
+const SHARE_SCHEMES = /^(ss|ssr|vmess|trojan|vless|anytls|hysteria2?|tuic):\/\//i;
 
 function toInt(value) {
   const number = Number(value);
@@ -105,6 +105,30 @@ export function shareLinkToProxy(link, index = 0) {
     if (params.flow) proxy.flow = params.flow;
     return proxy;
   }
+  if (scheme === "anytls") {
+    // anytls://password@host:port?sni=...&insecure=1#name
+    const body = raw.slice(raw.indexOf("://") + 3);
+    const [beforeHash, hash = ""] = body.split("#");
+    const [authority, query = ""] = beforeHash.split("?");
+    const at = authority.lastIndexOf("@");
+    if (at < 0) return null;
+    const password = decodeURIComponent(authority.slice(0, at));
+    const match = authority.slice(at + 1).match(/^(.+):(\d+)$/);
+    if (!match) return null;
+    const params = parseQuery(query);
+    const proxy = {
+      name: decodeURIComponent(hash) || `anytls ${index + 1}`,
+      type: "anytls",
+      server: match[1],
+      port: toInt(match[2]),
+      password,
+      tls: true,
+    };
+    if (params.sni) proxy.servername = params.sni;
+    if (params.insecure === "1" || params.allowInsecure === "1") proxy["skip-cert-verify"] = true;
+    if (params.fp) proxy["client-fingerprint"] = params.fp;
+    return proxy;
+  }
   // ssr / hysteria / tuic：mihomo 支持，但所需字段较多；不猜测，明确报告不支持。
   return null;
 }
@@ -136,7 +160,7 @@ function decodeLinkList(text) {
 export function parseShareLinks(text) {
   const body = decodeLinkList(text);
   const links = body.split(/\r?\n/).map((line) => line.trim()).filter((line) => SHARE_SCHEMES.test(line));
-  if (!links.length) throw new Error("没有识别到分享链接（ss/vmess/trojan/vless）。");
+  if (!links.length) throw new Error("没有识别到分享链接（ss/vmess/trojan/vless/anytls）。");
   const proxies = [];
   const skipped = [];
   links.forEach((link, index) => {
@@ -207,8 +231,10 @@ export function normalizeProxies(proxies) {
 // CHECKCC_SUBSCRIPTION_UA 可指定任意 UA（覆盖整个列表），用于只放行特定客户端的机场。
 export const SUBSCRIPTION_UA_PROFILES = [
   "FlClash/0.9.0",
-  "EnvGuardCC/1.0",
+  "ClashMetaForAndroid/2.10.1",
   "clash-verge/v2.0",
+  "ClashforWindows/0.20.39",
+  "EnvGuardCC/1.0",
 ];
 
 /** 网络层错误分类：订阅域名失效时表现为 403 / 连接重置，不解释清楚只会让人怀疑程序坏了。 */
@@ -236,7 +262,7 @@ export async function fetchSubscription(url, { download = defaultFetch, timeoutM
  * 经本地代理（FlClash / Clash Verge 等的混合端口）取文本。
  * 用户机器上已有的代理工具往往能下到本程序直连下不到的订阅，借它一用比让用户手动折腾更实际。
  */
-export function fetchTextViaProxy(url, { proxy, userAgent, timeoutMs = 15000 } = {}) {
+export function fetchTextViaProxy(url, { proxy, userAgent = "EnvGuardCC/1.0", timeoutMs = 15000 } = {}) {
   const target = new URL(url);
   if (target.protocol !== "https:" && target.protocol !== "http:") return Promise.reject(new Error("只支持 http/https。"));
   const proxyUrl = new URL(proxy.includes("://") ? proxy : `http://${proxy}`);
@@ -258,6 +284,19 @@ export function fetchTextViaProxy(url, { proxy, userAgent, timeoutMs = 15000 } =
   });
 }
 
+/**
+ * 订阅站常见坑：同一个链接按 UA 返回不同格式（Clash YAML / base64 分享链接 / HTML 错误页），
+ * 甚至 200 + 错误页。拿到 200 不等于拿到了可用订阅，必须校验内容再决定是否换下一个 UA。
+ */
+export function looksLikeSubscription(text) {
+  const raw = String(text ?? "").trim();
+  if (!raw) return false;
+  if (/(^|\n)\s*proxies\s*:/m.test(raw)) return true;
+  if (SHARE_SCHEMES.test(raw)) return true;
+  const decoded = base64Decode(raw);
+  return SHARE_SCHEMES.test(decoded) || /(^|\n)\s*proxies\s*:/m.test(decoded);
+}
+
 export async function defaultFetch(url, { timeoutMs = 15000, fetchImpl = globalThis.fetch, userAgents, scan, proxyFetch = fetchTextViaProxy } = {}) {
   const override = typeof process.env.CHECKCC_SUBSCRIPTION_UA === "string" ? process.env.CHECKCC_SUBSCRIPTION_UA.trim() : "";
   const profiles = userAgents ?? (override ? [override] : SUBSCRIPTION_UA_PROFILES);
@@ -268,8 +307,9 @@ export async function defaultFetch(url, { timeoutMs = 15000, fetchImpl = globalT
     try {
       response = await fetchImpl(url, { redirect: "follow", signal: AbortSignal.timeout(timeoutMs), headers: { "User-Agent": userAgent } });
     } catch (error) {
+      // 单个 UA 的连接被重置不代表订阅不可用：换下一个 UA 继续试。
       directFailure = explainNetworkError(error);
-      break;
+      continue;
     }
     // 401/403/406 是「按客户端拒绝」的典型状态码：换下一个 UA 再试，不把 UA 问题报成链接失效。
     if ([401, 403, 406].includes(response.status) && userAgent !== profiles[profiles.length - 1]) {
@@ -283,7 +323,11 @@ export async function defaultFetch(url, { timeoutMs = 15000, fetchImpl = globalT
       directFailure = `HTTP ${response.status}${hint}`;
       break;
     }
-    return await response.text();
+    const text = await response.text();
+    if (looksLikeSubscription(text)) return text;
+    // 200 但内容是错误页/不兼容格式：记录原因并换下一个 UA。
+    directFailure = "订阅返回内容不是可识别的 Clash 配置或分享链接。";
+    continue;
   }
   const directReason = directFailure ?? `HTTP ${lastStatus ?? "未知"}`;
   // 直连拿不到时借本地代理（FlClash / Clash Verge 等）再试一次：
@@ -309,7 +353,9 @@ async function tryLocalProxies(url, { profiles, timeoutMs, scan, proxyFetch }) {
     for (const userAgent of profiles) {
       try {
         const body = await proxyFetch(url, { proxy: `http://127.0.0.1:${item.port}`, userAgent, timeoutMs });
-        return { text: typeof body === "string" && body.trim() ? body : null, failures };
+        if (looksLikeSubscription(body)) return { text: body, failures };
+        failures.push(`${item.tool}:${item.port}（返回内容不是可识别的订阅格式）`);
+        break;
       } catch (error) {
         if (error?.status && [401, 403, 406].includes(error.status) && userAgent !== profiles[profiles.length - 1]) continue;
         failures.push(`${item.tool}:${item.port}（${error.message}）`);

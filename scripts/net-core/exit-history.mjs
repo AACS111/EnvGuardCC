@@ -4,8 +4,17 @@
 
 import { mkdir, readFile, writeFile, rename, rm } from "node:fs/promises";
 import path from "node:path";
+import { isIP } from "node:net";
 
 export const DEFAULT_WINDOW_MS = 48 * 60 * 60 * 1000;
+const operations = new Map();
+const serialize = (stateDir, action) => {
+  const key = path.resolve(stateDir);
+  const next = (operations.get(key) ?? Promise.resolve()).catch(() => {}).then(action);
+  operations.set(key, next);
+  void next.finally(() => { if (operations.get(key) === next) operations.delete(key); }).catch(() => {});
+  return next;
+};
 
 function file(stateDir) {
   return path.join(stateDir, "exit-history.json");
@@ -13,7 +22,7 @@ function file(stateDir) {
 
 function isValidIp(value) {
   const text = String(value ?? "").trim();
-  return /^(\d{1,3}\.){3}\d{1,3}$/.test(text) || /^[0-9a-f:]{2,}$/i.test(text);
+  return isIP(text) !== 0;
 }
 
 async function write(stateDir, entries) {
@@ -39,30 +48,33 @@ async function read(stateDir) {
 }
 
 /** 记录一次出口观测；返回窗口内的变化统计。 */
-export async function recordExit(stateDir, ip, { now = Date.now(), windowMs = DEFAULT_WINDOW_MS } = {}) {
-  const entries = (await read(stateDir)).filter((entry) => now - entry.at <= windowMs);
-  if (!isValidIp(ip)) return summarize(entries, { windowMs, current: null });
-  const last = entries.at(-1);
-  if (!last || last.ip !== ip) {
-    entries.push({ ip: String(ip).trim(), at: now });
-    await write(stateDir, entries);
-  }
-  return summarize(entries, { windowMs, current: ip });
+export function recordExit(stateDir, ip, { now = Date.now(), windowMs = DEFAULT_WINDOW_MS } = {}) {
+  return serialize(stateDir, async () => {
+    const entries = (await read(stateDir)).filter((entry) => entry.at <= now && now - entry.at <= windowMs).sort((a, b) => a.at - b.at);
+    if (!isValidIp(ip)) return summarize(entries, { windowMs, current: null });
+    const last = entries.at(-1);
+    if (!last || last.ip !== ip) {
+      entries.push({ ip: String(ip).trim(), at: now });
+      await write(stateDir, entries);
+    }
+    return summarize(entries, { windowMs, current: String(ip).trim() });
+  });
 }
 
 export async function readExitHistory(stateDir, { now = Date.now(), windowMs = DEFAULT_WINDOW_MS } = {}) {
-  const entries = (await read(stateDir)).filter((entry) => now - entry.at <= windowMs);
+  await operations.get(path.resolve(stateDir))?.catch(() => {});
+  const entries = (await read(stateDir)).filter((entry) => entry.at <= now && now - entry.at <= windowMs).sort((a, b) => a.at - b.at);
   return summarize(entries, { windowMs, current: entries.at(-1)?.ip ?? null });
 }
 
 function summarize(entries, { windowMs, current }) {
   const unique = [...new Set(entries.map((entry) => entry.ip))];
-  const changes = Math.max(0, unique.length - 1);
+  const changes = entries.reduce((count, entry, index) => count + (index > 0 && entry.ip !== entries[index - 1].ip ? 1 : 0), 0);
   return {
     windowHours: Math.round(windowMs / 3600000),
     samples: entries.length,
     changes,
-    stable: changes === 0,
+    stable: entries.length > 0 && changes === 0,
     current: current ?? null,
     ips: unique.slice(-8),
     firstAt: entries[0]?.at ? new Date(entries[0].at).toISOString() : null,

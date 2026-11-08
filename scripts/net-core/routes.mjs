@@ -1,6 +1,6 @@
 // 从内核 /connections 快照提取 Claude 路由证据。
 // 这是本产品与"靠 dig 或 STUN 推测"的关键差异：内核直接告诉我们每条连接的真实代理链，
-// 因此可以断言"零直连"，而不是给一个概率分数。
+// 证据仅覆盖内核观察到的连接，不能用来断言系统内核外的流量零直连。
 
 import { CLAUDE_DOMAINS, DEFAULT_GROUP } from "./config.mjs";
 
@@ -105,7 +105,8 @@ export function routingSummary(evidence, { locale = "zh" } = {}) {
       ? `存在未走 Claude 专用出口的连接：${hosts || "未知主机"}（直连 ${evidence.direct} 条）。`
       : `Connections bypassed the Claude-only exit: ${hosts || "unknown host"} (${evidence.direct} direct).`;
   }
+  // 组名（如 CLAUDE-PIN）是内核内部标识，不给用户看；结论里只说"专用出口"。
   return zh
-    ? `${evidence.claude} 条 Claude 连接全部命中 ${evidence.group}，无直连。`
-    : `All ${evidence.claude} Claude connections resolved through ${evidence.group}; no direct connections.`;
+    ? `内核观察到的 ${evidence.claude} 条 Claude 连接走了专用出口；未覆盖内核外流量。`
+    : `The ${evidence.claude} observed Claude connections used the dedicated exit; traffic outside the kernel is not covered.`;
 }

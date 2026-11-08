@@ -47,6 +47,7 @@ let protectionChanging = false;
 let closing = false;
 let closePending = null;
 let initializing = true;
+let networkRuntime = null;
 // 受管浏览器按偏好挑选：列表里被排除的浏览器不会被拉起。
 const browserChoice = async () => pickBrowser(await detectInstalledBrowsers(), await loadBrowserPreference(stateDir));
 const environmentRuntime = new EnvironmentRuntime({ stateDir, browserPathProvider: async () => {
@@ -75,7 +76,7 @@ async function capabilities() {
     desktopReason: process.platform === 'darwin' ? '当前 macOS Claude 不支持已验证的独立资料及调试接入；仅可普通打开，不声明已受保护。' : '',
   };
 }
-const protection = createProtectionService({ stateDir, runtime: environmentRuntime, browserCloak, currentZone, setZone, restoreTimezone: process.platform === "darwin" ? restoreSavedTimezone : undefined, canTest: () => !changing && !protectionChanging && !closing });
+const protection = createProtectionService({ stateDir, runtime: environmentRuntime, browserCloak, currentZone, setZone, restoreTimezone: process.platform === "darwin" ? restoreSavedTimezone : undefined, canTest: () => !changing && !protectionChanging && !closing, network: () => networkRuntime });
 async function readBackup() {
   try {
     const value = JSON.parse(await readFile(backupFile, "utf8"));
@@ -365,7 +366,8 @@ const server = http.createServer(async (req, res) => {
 server.requestTimeout = 120000;
 server.headersTimeout = 10000;
 server.on("error", (error) => { if (error.code !== "EADDRINUSE") console.error(`[repair] ${error.code}: ${error.message}`); });
-export async function startRepairHelper(listenPort = port) {
+export async function startRepairHelper(listenPort = port, { netCore = null } = {}) {
+  networkRuntime = netCore;
   try {
     // Never silently abandon an active routing configuration from an older version.
     try {
@@ -387,6 +389,7 @@ export async function startRepairHelper(listenPort = port) {
     if (!response.ok || !/^[a-f0-9]{64}$/.test(session.token)) throw new Error("本机助手端口被其他服务占用。");
     if (session.environmentScripts !== 1 || session.browserCloak !== 1) throw new Error("3001 端口上的本机助手为旧版本，请退出旧 repair:helper 后重启 npm run dev。");
     assertCurrentHelper(session);
+    if (netCore) throw new Error("已有独立本机助手无法接管本次网络内核。请退出旧的 repair:helper，再启动 EGCC，避免网络与保护会话由不同进程控制。");
     const url = `http://127.0.0.1:${listenPort}`;
     // The listener belongs to the existing helper process; restore its runtime only.
     return { server: null, url, closeRuntime: () => shutdownHelper(url, "http://localhost:3000", session, false) };

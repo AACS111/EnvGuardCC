@@ -5,17 +5,17 @@ EnvGuardCC 从"只看环境"扩展到"掌控出口"后的内核层说明。内�
 
 ## 为什么内置内核
 
-外部 Clash 客户端只能被"观察"，不能被"保证"：
+内置内核让节点、路由与生命周期可以由 EGCC 统一管理；具体能力仍需按观测范围和故障场景验证：
 
 | 需求 | 外部客户端 | 内置内核 |
 |---|---|---|
 | Claude 域名一定走指定出口 | 靠用户自己加规则，随时被订阅更新覆盖 | 置顶规则由程序生成，顺序受测试保护 |
 | 出口不自动漂移 | 客户端默认 `url-test` 自动切节点 | Claude 组强制 `select`，只能显式切换 |
-| 隧道断了不漏直连 | 客户端 Fail-Open，重试期间真实 IP 会发出 | `tun.strict-route` 由路由层丢弃 |
+| 异常后阻止直连 | 取决于客户端和系统配置 | macOS 可选严格模式用独立 PF 阻断；普通模式和 Windows 尚无独立系统阻断 |
 | 验证"真的走了隧道" | `dig` 看 fake-ip，属于推断 | `/connections` 返回真实代理链 |
 
-其中最后一条是核心差异：**证据不再靠推测**。`scripts/net-core/routes.mjs` 直接读取内核连接表，
-可以断言"所有 Claude 连接都命中 `CLAUDE-PIN` 且零直连"。
+`scripts/net-core/routes.mjs` 直接读取内核连接表，只能证明观察到的连接命中了指定组；不能断言内核外不存在直连。
+macOS 严格模式的原生 TUN、内核强杀后的阻断和恢复已经在受控测试中验证；不能保证第三方服务的地区资格或账号结果。平台与场景边界见 [连接保护实现记录](NETWORK-SAFETY-IMPLEMENTATION.md)。
 
 ## 结构
 
@@ -31,11 +31,11 @@ scripts/net-core/kernel-manifest.json 版本与各平台产物清单
 
 `buildKernelConfig()` 生成，`assertKernelConfig()` 校验。任何一条不满足都拒绝启动：
 
-1. `tun.enable = true` 且 `tun.strict-route = true` —— 隧道消失时由路由丢弃，而不是直连。
-2. `ipv6 = false` —— 避免双栈旁路。
+1. 生成模板中 `tun.enable = true` 且默认 `tun.strict-route = true`；运行时按用户接管意愿设置 enable。不能据此证明内核退出后持续阻断。
+2. `ipv6 = false` —— 关闭内核双栈功能；物理网卡 IPv6 旁路仍需实机验证。
 3. `dns.enhanced-mode = fake-ip` 且 `respect-rules = true` —— 解析本身也走隧道。
 4. Claude 域名规则（`anthropic.com` / `claude.ai` / `claude.com` / `claudeusercontent.com` /
-   `challenges.cloudflare.com`）必须位于规则列表**最前面**，优先于任何订阅规则。
+   `challenges.cloudflare.com`）的 QUIC 拒绝规则排最前，其后是通用域名代理规则；两者均优先于订阅和内网规则。
 5. Claude 出口组固定 `type: select`，禁止 `url-test` —— 自动测速切换会让出口 IP 漂移。
 6. 非 Claude 流量的兜底组（`AUTO-PROXY`）必须是 `fallback` / `url-test`，带 `url` + `interval`
    健康检查，且成员覆盖**全部**节点 —— 兜底绑单节点时，节点一抖全部境外流量就 fail-closed 中断。
@@ -70,13 +70,66 @@ scripts/net-core/kernel-manifest.json 版本与各平台产物清单
 
 因此 `createNetCore({ verifyTunnel: true })` 会在就绪后额外校验：
 
-1. 通过系统解析（`dns.lookup`，走 getaddrinfo，会被 TUN 的 DNS 劫持影响）查询 `claude.ai`；
+1. 通过系统解析（`dns.lookup`，走 getaddrinfo，会被 TUN 的 DNS 劫持影响）查询每次新建的 `egcc-<随机值>.claude.ai`，明确使用 IPv4，避免旧缓存和 AAAA 优先造成误判；开启和热加载后最多等待约 4 秒接管；
 2. 解析结果必须落在 fake-ip 段（默认 `198.18.0.0/16`）；
 3. 不在该段即判定隧道未接管，抛出错误并结束内核进程。
 
 `health()` 也会在每次巡检时重复该校验：隧道掉了不再靠"进程还在"充当健康。
 
+启用 TUN 前还会执行网络交接：正常退出当前用户已识别的代理客户端，等待内核与端口释放；macOS 同时检查系统 VPN、默认隧道路由和残留系统代理。未能释放时拒绝接管并显示原因。完整支持列表及平台限制见[交接说明](NETWORK-SAFETY-IMPLEMENTATION.md)。独立本机代理模式不会主动退出其他工具。
+
 > 生产环境必须传 `verifyTunnel: true`。默认 `false` 仅为让模拟内核的单元测试不受影响。
+
+## 固定出口探测：复用主内核，不再起临时内核
+
+早期实现用「临时内核 + 每节点独立入站」并行探测（`probeExitsParallel`）。TUN 开启时这条路会失效：
+临时内核 `tun.enable=false`，而 mihomo 的 `auto-detect-interface` 绑定逻辑只在 TUN listener 真正启动时生效，
+于是探测流量按系统默认路由又进入主内核的 utun，被 sniffer 按 `override-destination` 重新路由，
+Reality 握手失败（实测日志 `REALITY authentication failed`），启动环境防护必然报「固定出口探测失败」。
+
+现在改为 FlClash 式的主内核探测（Plan B）：
+
+- `buildKernelConfig({ exitProbeHost })` 在规则表里给探测主机加一条钉死 Claude 专用组的路由
+  （域名用 `DOMAIN-SUFFIX`，IP 用 `IP-CIDR`/`IP-CIDR6`），放在置顶代理规则之前；
+- 探测请求走已有的混合入口，由**主内核自己的 dialer** 拨节点（TUN 模式下已绑定物理网卡），不会被自己的 TUN 截获；
+- 不新增 `listeners`：特权宿主的配置字段白名单只接受 EGCC 生成的既有字段，额外入站需要改宿主并重新授权；
+- 严格模式重写规则后仍然使用带认证的混合入口探测；
+- `probeSelectedExit()` 不再调用 `probeExitsParallel`，`check-kernel-lifecycle.cjs` 用注入的 `createCore` 计数锁定「探测不另起内核」。
+
+`probeExitsParallel` 仍保留给「按节点逐个测出口」；拿不到并行结果时退回串行（会短暂切换选中节点）。
+
+## Claude 支持地区校验
+
+```
+src/detection/claude-regions.mjs   # 官方清单 + 判定函数（前后端共用）
+```
+
+- 清单来自 Anthropic [Supported Regions Policy](https://www.anthropic.com/legal/supported-regions)，2026-11-07 抓取，共 185 个 ISO 代码；
+  更新政策时同步改清单与 `CLAUDE_SUPPORTED_REGIONS_RETRIEVED_AT`。
+- 环境防护 `detect` 拿到固定出口后调用 `assertClaudeSupportedExit`：出口在清单外（CN/HK/RU 等）直接拒绝启动，
+  不写浏览器/网关配置，也不把该出口的时区、语言适配当成「保护成功」。
+- **边界**：只校验出口 IP 的国家/地区，不能判断用户物理位置；Anthropic 政策对「人在不支持地区」同样有限制，
+  该清单不能把这种情况变成合规，只能避免「出口本身在封禁地区」这一更直接的风险。
+
+### 区域锁定（运行中出口落回封禁地区 / 网络波动）
+
+运行中每 30 秒复检固定出口（非严格模式也检查），并在网络接口变化、隧道未接管、
+探测失败时按“无法确认出口”处理。一旦出问题：
+
+1. 在运行时内存里标记锁定（不写盘；应用退出即消失）；
+2. 重建配置，在 Claude 置顶规则之前插入 `DOMAIN-SUFFIX,<claude域名>,REJECT`（严格模式同样生效）；
+3. 热加载后只断开已建立的 Claude 连接（按 host 匹配，不动其他连接）；
+4. 界面顶部显示红色提示并提供「复检并解除」，同时尽力发一条 macOS 通知。
+
+两类锁：
+- **地区锁**：出口明确在不支持地区，必须切换节点后手动复检解除；
+- **网络锁**：网络断开/波动/探测失败导致无法确认出口，网络恢复且下一次复检通过后自动解除。
+
+锁定只拦 Claude 域名，不影响其他流量，也不会改动其他连接（只断已建立的 Claude 连接）。
+关闭窗口、应用留在托盘时阻断继续生效；彻底退出应用后隧道关闭、系统时区与浏览器配置恢复，
+阻断停止且不留锁定状态，下次启动按当前出口重新检测（出口仍在封禁地区会再次锁定）。
+若需要「退出应用后仍禁止 Claude」，要么开严格模式（PF 阻断会保留，但会阻断全部非节点流量），
+要么给特权宿主增加 Claude-only 的持久阻断（需要改宿主并重新授权）。
 
 ## 公共 DNS 与出口地区对齐（）
 
@@ -128,7 +181,7 @@ scripts/net-core/kernel-manifest.json 版本与各平台产物清单
 2. **作为出口节点**（`import` 的 `local-proxy` 模式）：追加一个指向 `127.0.0.1:port` 的 `http`/`socks5` 节点。
    追加而不替换——`importNodes(..., { append: true })`，否则会用本地代理把已有订阅节点整批覆盖掉。
 
-接口：`GET /__checkcc/net-core/local-proxies` → `{ ok, items, summary }`；界面「添加配置 → 本地代理」直接消费。
+接口：`GET /__checkcc/net-core/local-proxies` → `{ ok, items, summary }`；界面「管理配置 → 添加配置 → 本地代理」直接消费。
 
 ## 保护开关、内核与退出（三者关系必须一致）
 
@@ -227,26 +280,39 @@ node_modules/.checkcc-kernel/mihomo.exe -v
 真实内核冒烟（不开启 TUN，避免提权）：生成配置 → 启动 → `/version` → 切换组 → 热加载 → 停止。
 本仓库已在 Windows + mihomo v1.19.33 上完成该联调。
 
-## 尚未接入
+## 接入状态
 
-当前内核层是独立的可测模块，尚未接入桌面生命周期。接入顺序必须是：
+内核已接入桌面生命周期：
 
-1. `desktop/backend.mjs`：内核 → 审计 → 助手 → 网关；退出时反向关闭，失败整体回滚。
-2. `src-tauri/src/main.rs`：内核状态与提权命令（不向页面开放通用能力）。
-3. `src/detection/config/signals.ts`：接入 `tunCaptured` / `pinnedRouting` / `exitStability` /
-   `asnClass` 信号，并按"出口优先于环境"重排权重。
+1. `desktop/backend.mjs` 在应用启动时拉起内核，退出时先停内核再关闭页面与控制接口；停止未确认时会保留接口供重试。
+2. `scripts/net-core/runtime.mjs` 负责配置生成、宿主探测、TUN 开关与导入后启动。导入节点或开启保护时若内核仍是 idle，会真正启动它，而不是只改状态位。
+3. 界面「网络」页只在结论卡保留「复检路由」；启动 / 停止 / 重启内核收进「诊断与高级操作」，Tauri 层不暴露内核命令，全部经本机网关接口。
 
-在以上三步完成前，页面不应出现"已优化"之类的结论。
+仍未完成：
+
+- 页面尚未按 `tunCaptured` / `pinnedRouting` / `exitStability` / `asnClass` 重排权重。
+- TUN 需要系统权限：macOS 使用系统密码 / Touch ID 授权，Windows 使用 UAC。当前已实现两平台应用内安装入口；本轮未验证 Windows 实机 UAC。手动安装仍可用 `pnpm kernel:host:install`。
+
+在权重接入完成前，页面不应出现"已优化"之类的结论。
 
 ## 节点来源与导入
 
-界面「网络 → 添加配置」支持三种来源：
+界面「网络 → 配置厂商」支持四种来源，每条来源保存成一条可命名的「供应商」：
 
 | 方式 | 支持内容 | 说明 |
 |---|---|---|
-| 链接 | Clash 配置订阅（`proxies`）、ss / vmess / trojan / vless 分享链接、整体 base64 的链接列表 | 服务端抓取，http/https，4MB 上限 |
+| 链接 | Clash 配置订阅（`proxies`）、ss / vmess / trojan / vless / anytls 分享链接、整体 base64 的链接列表 | 服务端抓取，http/https，4MB 上限 |
 | 文件 | `.yaml / .yml / .txt / .conf / .json` | 读取后走与链接相同的解析 |
-| 自定义 | 手工填写 ss / vmess / trojan / vless 单个节点 | 缺字段直接拒绝，不猜测 |
+| 自定义 | 手工填写 ss / vmess / trojan / vless / anytls 单个节点 | 缺字段直接拒绝，不猜测 |
+| 本地代理 | 本机已运行的 FlClash / Clash Verge 等端口 | 只探测端口，追加到当前配置，不读对方配置 |
+
+供应商规则（`scripts/net-core/sources.mjs`）：
+
+1. 一条供应商 = 名称 + 节点快照 + 更新时间；切换直接用快照，不依赖网络。
+2. 同一订阅链接再次导入视为更新，不会产生重复条目。
+3. 切换供应商会重建配置并重启内核（连接短暂中断），界面先确认再执行。
+4. 删除当前供应商会切到下一条并重启；最后一条不能删，避免把内核留在空配置上。
+5. 订阅地址、更新时间与「立即更新」只在配置弹窗里出现，不占网络页主阅读路径。
 
 解析与校验规则（`scripts/net-core/subscription.mjs`）：
 
@@ -254,10 +320,32 @@ node_modules/.checkcc-kernel/mihomo.exe -v
 2. 无效条目计入 `skipped` 并给出原因，不阻断有效条目。
 3. 同名节点自动追加 ` #2`，避免内核因重名拒绝。
 4. 导入先落盘再重启内核；**解析失败不会覆盖已有节点配置**。
-5. 节点文件：`<state>/net-nodes.json`（原子写入，mode 600）。
+5. 节点文件：`<state>/net-nodes.json`（原子写入，mode 600；供应商快照与当前节点都在这一份文件里）。
+
+### 第三方机场（订阅）常见问题
+
+- **同一链接按 UA 返回不同格式**：常见 FlClash/ClashMeta 给 Clash YAML，普通客户端给 base64 分享链接，甚至 `200 + HTML 错误页`。
+  程序依次尝试 `SUBSCRIPTION_UA_PROFILES`（FlClash、ClashMetaForAndroid、Clash Verge、Clash for Windows、EnvGuardCC），
+  **校验内容确实是 Clash 配置或分享链接**才采用；网络错误或格式不符会换下一个 UA，最后才回退本地代理。
+  可用 `CHECKCC_SUBSCRIPTION_UA` 强制指定机场只放行的 UA。
+- **anytls**：机场常用 `anytls://`；已支持解析，并和其它 TLS 节点一样补 `client-fingerprint`。
+- **香港/中国大陆节点排在最前**：Claude 地区校验只允许支持地区；导入后请在「出口节点」里选台湾、新加坡、日本、韩国等。
+  直接拿香港节点启动环境防护会被拒绝（`固定出口位于 Claude 不支持的地区：HK`）。
+- **订阅拉取失败**：不会覆盖已有节点快照；没有可用配置时无法启动内核。失败原因会显示 HTTP 状态、UA/格式校验与本地代理尝试结果。
+- **出口 IP 漂移**：界面会标注「出口稳定性 存在漂移」；同一国家内的 IP 变化只会警告（Claude 可能要求重新登录），
+  不会像「出口变成不支持地区」那样直接阻断；严格模式才会对 IP 变化触发系统阻断。
+
+**直接拒绝启动的情况**：没有可用节点 / 订阅拉取或解析失败且无旧配置 / 所选固定出口在 Claude 不支持地区 /
+固定出口探测失败（节点不可达、网络中断）——最后一种在运行中会先阻断 Claude 并提示。
 
 `GET /__checkcc/net-core` 只读状态；`POST /__checkcc/net-core` 执行 start/stop/restart/select；
-`POST /__checkcc/net-core/import` 接收 `{mode:"url"|"content"|"manual", ...}`。
+`POST /__checkcc/net-core/import` 接收 `{mode:"url"|"content"|"manual"|"local-proxy", ...}`，
+可选 `sourceId`（编辑已有供应商）与 `name`（供应商名称）。
+
+供应商接口：`GET /__checkcc/net-core/sources` 列出；
+`POST /__checkcc/net-core/sources` 接收 `{action:"activate"|"delete"|"rename"|"refresh", id, name?}`。
+文件格式 v2：`{ version: 2, activeId, sources: [{ id, name, mode, url, proxies, selected, updatedAt, intervalHours }], proxies, selected, source, proxyServerDns }`；
+旧版只有 `{ proxies, selected, source }`，读取时自动迁移成一条 `src_legacy` 供应商。
 
 ## 特权宿主安装（Windows / macOS）
 
@@ -284,6 +372,8 @@ pnpm kernel:host:uninstall  # 卸载
 宿主只接受 `start / stop / restart`，配置文件必须位于 `<state>/net-core/*.yaml`，非环回来源与错误令牌一律拒绝。
 运行时启动时若探测到宿主健康（`GET /health` + 令牌），自动进入宿主模式；探测失败回退本机 spawn。
 
+安装器将 Node、宿主脚本、依赖和 mihomo 复制到受管理员保护的独立版本目录（macOS 的 `PrivilegedHelperTools` 子目录，Windows 的 `Program Files/EnvGuardCC/KernelHost`），服务不再直接执行用户状态目录中的脚本。宿主校验配置真实路径、字段和控制器密钥，并在私有目录中运行验证后的快照。更新此代码后应重新安装宿主；仅重启界面不会升级系统服务。安装和授权路径仍需两平台实机验收。
+
 ### 不装宿主时怎么先测 TUN
 
 在**管理员**终端里跑开发服即可（本机直连模式，内核继承管理员权限）：
@@ -297,8 +387,8 @@ $env:CHECKCC_NET_CORE_TUN="1"; pnpm dev
 | 模式 | 行为 | 典型用途 |
 |---|---|---|
 | `rule`（默认） | 局域网 + 内置国内域名直连，**其余海外流量走 `AUTO-PROXY` 故障转移组** | 日常使用：既上网又优化环境 |
-| `global` | 全部流量走 `AUTO-PROXY` 故障转移组 | 需要全量海外出口 |
-| `direct` | 全部直连 | 排障对比 |
+| `global` | 内网豁免之外的非 Claude 流量走 `AUTO-PROXY` | 需要更大代理范围 |
+| `direct`（界面：其他直连） | Claude 仍走固定组，其他流量直连 | 保留固定出口并缩小代理范围 |
 | `claude` | 只代理 Claude 家族域名 | 最小化代理范围 |
 
 - Claude 家族域名在**所有模式**下都置顶走专用组，并拒绝其 QUIC（UDP/443）。

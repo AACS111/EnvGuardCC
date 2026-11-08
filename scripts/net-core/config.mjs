@@ -32,7 +32,7 @@ export const DEFAULT_HEALTH_CHECK = { url: "https://www.gstatic.com/generate_204
 // 网络可观测面：TLS 握手指纹要与声明面一致，STUN/UDP 不洩漏。
 // （字体/Emoji 属于系统事实，内核无法伪造，不在这里假装能做到。）
 export const DEFAULT_CLIENT_FINGERPRINT = "chrome";
-export const TLS_PROXY_TYPES = new Set(["vless", "vmess", "trojan", "hysteria", "hysteria2", "tuic"]);
+export const TLS_PROXY_TYPES = new Set(["vless", "vmess", "trojan", "hysteria", "hysteria2", "tuic", "anytls"]);
 export const STUN_PORTS = [3478, 5349, 19302, 19303];
 export const LOCAL_DNS_PROXY = "ENVGUARD-LOCAL-DNS";
 export const LOCAL_DIRECT_PROXY = "ENVGUARD-LOCAL-DIRECT";
@@ -150,12 +150,18 @@ export function buildKernelConfig({
   localNetwork = {},
   logLevel = "warning",
   mixedPort,
+  // 固定出口探测主机：主内核里给这个主机加一条钉死 Claude 专用组的路由，
+  // 探测请求走已有的混合入口即可由主内核拨号（TUN 模式下已绑定物理网卡），
+  // 不需要新增入站——特权宿主的配置字段白名单不允许 listeners。
+  exitProbeHost = "",
   autoGroupName = DEFAULT_AUTO_GROUP,
   autoGroupType = DEFAULT_AUTO_GROUP_TYPE,
   healthCheck = {},
   clientFingerprint = DEFAULT_CLIENT_FINGERPRINT,
   sniffer = true,
   blockStun = true,
+  // 区域锁定：出口落回 Claude 不支持地区时，直接把 Claude 域名的 TCP 连接拒绝掉。
+  blockClaude = false,
 } = {}) {
   const nodes = (proxies ?? []).map(assertProxy).map((node) => {
     // 只给真做 TLS 握手的节点补指纹；用户显式写的值优先。
@@ -205,6 +211,13 @@ export function buildKernelConfig({
   const initial = selected ?? names[0];
   if (!names.includes(initial)) throw new Error(`选中的节点 ${initial} 不在节点列表中。`);
   if (!Number.isInteger(apiPort) || apiPort < 1 || apiPort > 65535) throw new Error("外部控制器端口无效。");
+  const probeHost = typeof exitProbeHost === "string" ? exitProbeHost.trim().toLowerCase() : "";
+  if (probeHost) {
+    const version = isIP(probeHost);
+    if (!version && !/^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)+$/.test(probeHost)) {
+      throw new Error("固定出口探测主机必须是域名或 IP。");
+    }
+  }
   if (typeof autoGroupName !== "string" || !autoGroupName.trim()) throw new Error("自动出口组名称必须是非空字符串。");
   if (autoGroupName === groupName) throw new Error("自动出口组不能与 Claude 专用出口组同名。");
   if (!AUTO_GROUP_TYPES.has(autoGroupType)) throw new Error(`自动出口组类型必须是 fallback 或 url-test（当前 ${autoGroupType}）；固定出口无法在节点故障时转移，会让境外流量整体中断。`);
@@ -217,6 +230,17 @@ export function buildKernelConfig({
 
   // 置顶规则在前，订阅规则在后：mihomo 按顺序匹配，先命中的生效。
   const pinnedRules = pinned.map((domain) => `DOMAIN-SUFFIX,${domain},${groupName}`);
+  // 区域锁定：Claude 域名的 TCP 也直接拒绝，必须排在置顶代理规则之前。
+  const claudeBlockRules = blockClaude ? pinned.map((domain) => `DOMAIN-SUFFIX,${domain},REJECT`) : [];
+  // 出口探测：把探测主机钉死到 Claude 专用组，探测走已有混合入口即可复用主内核的
+  // dialer（TUN 下已绑定物理网卡），不需要新增入站（特权宿主的字段白名单也不允许）。
+  const probeRules = !probeHost
+    ? []
+    : isIP(probeHost) === 6
+      ? [`IP-CIDR6,${probeHost}/128,${groupName}`]
+      : isIP(probeHost)
+        ? [`IP-CIDR,${probeHost}/32,${groupName}`]
+        : [`DOMAIN-SUFFIX,${probeHost},${groupName}`];
   // QUIC（UDP/443）绕开 TCP 代理路径，且 UDP 出口常与隧道不一致；Claude 域名一律拒绝，逼回 TCP。
   const quicRules = pinned.map((domain) => `AND,((NETWORK,udp),(DST-PORT,443),(DOMAIN-SUFFIX,${domain})),REJECT`);
   // STUN/TURN（UDP）在网口层丢掉：即使渲染页补丁被绕过，也拿不到真实的公网候选地址。
@@ -243,7 +267,8 @@ export function buildKernelConfig({
   const internalRules = internalDomains.map((domain) => `DOMAIN-SUFFIX,${domain},${customDomains.has(domain) ? localTarget : "DIRECT"}`);
   // 显式 HTTP/SOCKS 代理也需按配置的 IP 直连；TUN 路由排除本身不处理这类连接。
   const customIpRules = customExcludedRoutes.filter((cidr) => localTarget !== "DIRECT" || !modeRules.includes(`IP-CIDR,${cidr},DIRECT`)).map((cidr) => `IP-CIDR,${cidr},${localTarget}`);
-  const rules = [...pinnedRules, ...quicRules, ...stunRules, ...internalRules, ...customIpRules, ...modeRules, ...extraRules.map(String), modeFinal];
+  // mihomo 按首条匹配执行：UDP 拒绝必须先于同域名的通用代理规则。
+  const rules = [...quicRules, ...claudeBlockRules, ...pinnedRules, ...probeRules, ...stunRules, ...internalRules, ...customIpRules, ...modeRules, ...extraRules.map(String), modeFinal];
 
   return {
     mode: "rule",
@@ -328,7 +353,7 @@ export function buildKernelConfig({
  * 出口探测专用配置：给每个节点开一个独立入站端口（listeners.proxy 直接绑定节点）。
  * 好处是探测能全并行，而且完全不碰主内核的选中节点——不会让出口 IP 抖动。
  */
-export function buildProbeConfig({ proxies, names, basePort = 39381, mixedPort = 39380, ipv6 = false, hosts = {}, proxyServerDns = [] } = {}) {
+export function buildProbeConfig({ proxies, names, basePort = 39381, mixedPort = 39380, ipv6 = false, hosts = {}, proxyServerDns = [], secret = "" } = {}) {
   const wanted = new Set(Array.isArray(names) ? names : []);
   const nodes = (Array.isArray(proxies) ? proxies : []).filter((node) => wanted.has(node?.name));
   if (!nodes.length) throw new Error("没有可探测的节点。");
@@ -346,6 +371,9 @@ export function buildProbeConfig({ proxies, names, basePort = 39381, mixedPort =
     "log-level": "silent",
     ipv6,
     "external-controller": "127.0.0.1:0",
+    ...(secret ? { secret } : {}),
+    // 临时内核不能再次进入主 TUN；即使不创建 TUN，也要让内核跟踪物理出口网卡。
+    tun: { enable: false, "auto-detect-interface": true },
     ...(hosts && Object.keys(hosts).length ? { hosts } : {}),
     dns: {
       enable: true,
@@ -359,7 +387,42 @@ export function buildProbeConfig({ proxies, names, basePort = 39381, mixedPort =
     proxies: nodes,
   };
 }
-export function assertKernelConfig(config, { groupName = DEFAULT_GROUP, domains = CLAUDE_DOMAINS, strictRoute = true, egressMode, autoGroupName = DEFAULT_AUTO_GROUP, sniffer = true, blockStun = true, requireTlsFingerprint = true } = {}) {
+
+/** 严格会话不接受分流/直连例外，全部出站固定到同一节点。 */
+export function strictKernelConfig(config, { blockClaude = false } = {}) {
+  const candidate = structuredClone(config);
+  if (typeof candidate.secret !== "string" || candidate.secret.length < 32) throw new Error("严格模式需要有效的控制器及本机代理认证。");
+  candidate.authentication = [`egcc:${candidate.secret}`];
+  const group = candidate["proxy-groups"]?.find(item => item.name === DEFAULT_GROUP && item.type === "select");
+  if (!group?.proxies?.length) throw new Error("严格模式缺少固定出口。");
+  group.proxies = [group.proxies[0]];
+  candidate["proxy-groups"] = [group];
+  candidate.rules = [
+    ...(blockClaude ? CLAUDE_DOMAINS.map(domain => `DOMAIN-SUFFIX,${domain},REJECT`) : []),
+    ...CLAUDE_DOMAINS.map(domain => `AND,((NETWORK,udp),(DST-PORT,443),(DOMAIN-SUFFIX,${domain})),REJECT`),
+    ...CLAUDE_DOMAINS.map(domain => `DOMAIN-SUFFIX,${domain},${DEFAULT_GROUP}`),
+    ...STUN_PORTS.map(port => `AND,((NETWORK,udp),(DST-PORT,${port})),REJECT`),
+    `MATCH,${DEFAULT_GROUP}`,
+  ];
+  candidate.tun = { ...candidate.tun, enable: true, device: "utun90", "strict-route": true, "route-exclude-address": [] };
+  // 只保留节点的 hosts 引导；不能把系统解析器或内网 DNS 当作严格模式降级出口。
+  candidate.dns["nameserver-policy"] = {};
+  candidate.dns["fake-ip-filter"] = [];
+  return assertStrictKernelConfig(candidate);
+}
+
+export function assertStrictKernelConfig(config) {
+  const group = config?.["proxy-groups"]?.find(item => item.name === DEFAULT_GROUP);
+  if (config?.authentication?.length !== 1 || config.authentication[0] !== `egcc:${config.secret}`) throw new Error("严格模式必须启用私有本机代理认证。");
+  if (config?.tun?.device !== "utun90" || config.tun.enable !== true || config.tun["strict-route"] !== true || config.ipv6 !== false) throw new Error("严格模式必须使用独立网卡、严格路由并关闭内核 IPv6。");
+  if (config["proxy-groups"].length !== 1 || group?.type !== "select" || group.proxies?.length !== 1) throw new Error("严格模式只能使用一个固定出口。");
+  if (config.rules?.at(-1) !== `MATCH,${DEFAULT_GROUP}` || config.rules.some(rule => !rule.endsWith(`,${DEFAULT_GROUP}`) && !rule.endsWith(",REJECT"))) throw new Error("严格模式不得包含直连、兜底或额外出口。");
+  if (config.tun["route-exclude-address"]?.length) throw new Error("严格模式不得排除物理路由。");
+  // 严格模式只留带认证的混合入口；额外入站会把固定出口暴露给本机任意进程。
+  if (config.listeners?.length) throw new Error("严格模式不得暴露额外的本机入站。");
+  return config;
+}
+export function assertKernelConfig(config, { groupName = DEFAULT_GROUP, domains = CLAUDE_DOMAINS, strictRoute = true, egressMode, autoGroupName = DEFAULT_AUTO_GROUP, sniffer = true, blockStun = true, requireTlsFingerprint = true, blockClaude = false } = {}) {
   if (!config || typeof config !== "object") throw new Error("内核配置为空。");
   if (config.ipv6 !== false) throw new Error("必须关闭 IPv6，否则双栈旁路会绕过隧道。");
   if (sniffer) {
@@ -394,12 +457,13 @@ export function assertKernelConfig(config, { groupName = DEFAULT_GROUP, domains 
     const quic = `AND,((NETWORK,udp),(DST-PORT,443),(DOMAIN-SUFFIX,${domain})),REJECT`;
     if (!rules.includes(quic)) throw new Error(`缺少 QUIC 阻断规则 ${quic}。`);
   }
-  const lastPinnedIndex = Math.max(...pinned.map((rule) => rules.indexOf(rule)));
-  for (let index = 0; index < rules.length; index += 1) {
-    // 置顶规则之后才允许出现订阅规则；置顶规则自身必须排在最前。
-    if (pinned.includes(rules[index]) && index > lastPinnedIndex) throw new Error("置顶规则顺序被破坏。");
+  const quic = pinnedDomains.map((domain) => `AND,((NETWORK,udp),(DST-PORT,443),(DOMAIN-SUFFIX,${domain})),REJECT`);
+  const blockRules = blockClaude ? pinnedDomains.map((domain) => `DOMAIN-SUFFIX,${domain},REJECT`) : [];
+  for (const domain of blockClaude ? pinnedDomains : []) {
+    if (!rules.includes(`DOMAIN-SUFFIX,${domain},REJECT`)) throw new Error(`区域锁定缺少 Claude 阻断规则：${domain}。`);
   }
-  if (rules.slice(0, pinned.length).some((rule) => !pinned.includes(rule))) throw new Error("Claude 置顶规则必须位于规则列表最前面。");
+  const protectedRules = [...quic, ...blockRules, ...pinned];
+  if (protectedRules.some((rule, index) => rules[index] !== rule)) throw new Error("Claude 置顶规则必须先阻断 QUIC，再代理域名，且位于所有其他规则之前。");
   const last = rules[rules.length - 1];
   if (!String(last).startsWith("MATCH,")) throw new Error("最后一条规则必须是 MATCH。");
   if (blockStun && egressMode && egressMode !== "direct") {

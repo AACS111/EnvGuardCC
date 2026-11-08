@@ -55,7 +55,6 @@ yarn-error.log*
 # Local-only verification scripts: not shipped with the repo.
 /scripts/check-net-core.mjs
 /scripts/check-net-core-view.mjs
-/scripts/check-subscription.mjs
 /scripts/check-exit-history.mjs
 /scripts/check-kernel-host.mjs
 /scripts/check-browser-catalog.mjs

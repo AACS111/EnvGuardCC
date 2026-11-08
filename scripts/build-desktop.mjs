@@ -3,6 +3,7 @@ import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { createRequire } from 'node:module';
 import { projectRoot as root, run, tauriCli } from './tauri-tools.mjs';
+import { ensureKernel } from './net-core/vendor.mjs';
 
 const tools = path.join(root, 'node_modules/.tauri-tools');
 const stage = path.join(root, 'node_modules/.checkcc-tauri-backend');
@@ -13,6 +14,7 @@ const manifest = JSON.parse(await readFile(path.join(root, 'package.json'), 'utf
 if (!isMac && (process.platform !== 'win32' || process.arch !== 'x64')) throw new Error('打包需要 Windows x64 或 macOS arm64。');
 if (!process.env.CHECKCC_EXPORT_DIR) throw new Error('请使用 pnpm desktop:package 构建最新页面后打包。');
 const exported = path.resolve(process.env.CHECKCC_EXPORT_DIR);
+const kernel = await ensureKernel();
 await access(path.join(exported, 'index.html'));
 const provenance = JSON.parse(await readFile(path.join(exported, 'checkcc-build.json'), 'utf8'));
 for (const [file, hash] of Object.entries(provenance.sources)) {
@@ -61,11 +63,12 @@ for (const directory of ['scripts', 'desktop', 'public', 'src/detection', 'src/i
   await cp(path.join(root, directory), path.join(stage, directory), { recursive: true });
 }
 await cp(path.join(root, 'LICENSE'), path.join(stage, 'LICENSE'));
+await cp(path.join(root, 'third_party/mihomo'), path.join(stage, 'third_party/mihomo'), { recursive: true });
 await writeFile(path.join(stage, 'package.json'), JSON.stringify({ name: 'envguardcc-backend', version: manifest.version, type: 'module', license: 'MIT' }));
 await mkdir(path.join(stage, 'runtime'), { recursive: true });
 
 async function download(url, destination) {
-  const response = await fetch(url);
+  const response = await fetch(url, { signal: AbortSignal.timeout(120000) });
   if (!response.ok) throw new Error(`下载失败：HTTP ${response.status} ${url}`);
   await writeFile(destination, Buffer.from(await response.arrayBuffer()));
 }
@@ -74,7 +77,7 @@ const nodeArchive = nodeName + (isMac ? '.tar.gz' : '.zip');
 const nodeDirectory = path.join(tools, nodeName);
 const runtime = path.join(nodeDirectory, isMac ? 'bin/node' : 'node.exe');
 const base = `https://nodejs.org/dist/${nodeVersion}`;
-const checksumResponse = await fetch(`${base}/SHASUMS256.txt`);
+const checksumResponse = await fetch(`${base}/SHASUMS256.txt`, { signal: AbortSignal.timeout(15000) });
 if (!checksumResponse.ok) throw new Error('无法下载 Node 运行时校验值。');
 const expected = (await checksumResponse.text()).split('\n').find(line => line.trim().endsWith(' ' + nodeArchive))?.trim().split(/\s+/)[0];
 if (!/^[a-f0-9]{64}$/.test(expected || '')) throw new Error('未找到 Node 运行时校验值。');
@@ -94,6 +97,9 @@ if (isMac) {
   await run(process.execPath, [path.join(root, 'scripts/build-timezone-service.mjs'), path.join(stage, 'runtime/timezone-service')]);
 }
 await mkdir(path.join(stage, 'node_modules'), { recursive: true });
+await mkdir(path.join(stage, 'node_modules/.checkcc-kernel'), { recursive: true });
+await cp(kernel.file, path.join(stage, 'node_modules/.checkcc-kernel', path.basename(kernel.file)));
+await chmod(path.join(stage, 'node_modules/.checkcc-kernel', path.basename(kernel.file)), 0o755);
 await cp(path.join(root, 'node_modules/typescript'), path.join(stage, 'node_modules/typescript'), { recursive: true, dereference: true });
 const copied = new Map();
 async function copyRuntime(name, resolver = createRequire(path.join(root, 'package.json'))) {
@@ -112,6 +118,7 @@ async function copyRuntime(name, resolver = createRequire(path.join(root, 'packa
   for (const dependency of Object.keys(metadata.dependencies || {})) await copyRuntime(dependency, createRequire(metadataFile));
 }
 await copyRuntime('classic-level');
+await copyRuntime('yaml');
 await writeFile(path.join(stage, '使用说明.txt'), 'EnvGuardCC 使用系统 WebView，不再包含 Electron。\nWindows 需要 WebView2；安装器会在缺失时联网安装，便携版请先安装 WebView2。\n已包含 Node，无需另行安装。关闭窗口保留后台运行；请从托盘退出并等待原始配置恢复。\n');
 
 // Tauri embeds no duplicate frontend assets; the Node sidecar serves the exported site.

@@ -96,7 +96,11 @@ pnpm dev
 
 ## 平台支持范围
 
-macOS 自动跟随系统 HTTP/HTTPS 代理或系统路由（含 TUN），无需在应用内手动配置代理。应用不读取或改写第三方代理软件的订阅、策略组或路由配置。受控浏览器、系统时区修改与恢复均使用独立的通用功能；Claude 桌面端仅提供普通打开。
+内置 mihomo 可使用用户自己的订阅或自托管节点，提供本机 HTTP/SOCKS 代理和独立的系统流量接管开关；无需启动另一个代理客户端。首次默认不接管系统网络，TUN 开启需要系统授权，成功后会保存用户的接管意愿。日常代理可独立于环境适配使用。应用不读取或改写第三方代理客户端的配置。
+
+macOS 新增可选的严格连接保护：将全部出站固定到同一节点，使用独立 PF 规则阻断其他路径，内核退出后仍保留阻断；必须明确关闭严格模式或使用恢复工具解除。开启时会重连现有连接，并阻断普通内网与未认证的本机代理使用；仅支持经过检查的系统 PF 布局。Windows 尚未实现 WFP 系统断流，普通代理模式也不提供崩溃后阻断。功能不保证 Claude 的地区资格或账号结果。
+
+实际打包、原生 TUN/断流与恢复测试的范围见 [连接保护实现记录](docs/NETWORK-SAFETY-IMPLEMENTATION.md)。受控浏览器、系统时区修改与恢复是独立功能；macOS Claude 桌面端仅提供普通打开。
 
 已生成 Apple Silicon 本地试用包（`.app`、ZIP、DMG，ad-hoc 签名），产物在 `node_modules/.checkcc-dist`；`pnpm desktop:package` 生成 `.app` 和 ZIP，`pnpm desktop:installer` 再生成 DMG。按当前交付定位不申请 Developer ID 和公证，其他 Mac 首次打开需在系统设置 > 隐私与安全性中授权；已安装到本机 `/Applications`，异机验证仍未完成。当前实测为 Apple Silicon、macOS 27.0，不据此声明更旧系统或 Intel 支持。详见 [阶段四结果](docs/MACOS-STAGE4-RESULTS.md)。
 

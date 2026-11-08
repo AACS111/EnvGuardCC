@@ -11,6 +11,8 @@ export type NetCoreView = {
   version: string | null;
   restarts: number;
   tunEnabled: boolean;
+  tunCaptured: boolean | null;
+  hostMode: boolean;
   demo: boolean;
   showDemoBadge: boolean;
   apiPort: number | null;
@@ -28,6 +30,7 @@ export type NetCoreView = {
   localProxy: string | null;
   mode: "claude" | "rule" | "global" | "direct" | null;
   elevated: boolean | null;
+  platform: string | null;
   tunHint: string | null;
   exitStability: { changes: number; windowHours: number; stable: boolean; current: string | null } | null;
   actions: { canStart: boolean; canStop: boolean; canRestart: boolean; canSelect: boolean };

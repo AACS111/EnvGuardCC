@@ -22,8 +22,9 @@
       "file": "mihomo",
       "archive": "mihomo-darwin-arm64-v1.19.33.gz",
       "url": "https://github.com/MetaCubeX/mihomo/releases/download/v1.19.33/mihomo-darwin-arm64-v1.19.33.gz",
-      "sha256": null,
-      "size": null
+      "sha256": "f3e8ae41397c08cbf900ce1f7c8a168285d29954e9bca5d84d69a2b2561adfe9",
+      "size": 56810034,
+      "archiveSha256": "060b64b0f2c9a310831db0fe4adb2878de67bfa606c311813c1f13966aa504b6"
     },
     "darwin-x64": {
       "file": "mihomo",

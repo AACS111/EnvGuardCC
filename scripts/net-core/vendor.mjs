@@ -3,7 +3,7 @@
 // 首次固定校验值时使用 pinKernel()，它会下载并写回清单，产物需要人工评审后提交。
 
 import { createHash } from "node:crypto";
-import { mkdir, readFile, writeFile, rename, rm } from "node:fs/promises";
+import { mkdir, readFile, writeFile, rename, rm, chmod } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -61,8 +61,6 @@ export async function extractBinary(buffer, asset) {
   if (asset.archive.endsWith('.zip')) {
     const { mkdtemp, readdir } = await import('node:fs/promises');
     const { tmpdir } = await import('node:os');
-    const { execFile } = await import('node:child_process');
-    const { promisify } = await import('node:util');
     const directory = await mkdtemp(path.join(tmpdir(), 'checkcc-kernel-'));
     try {
       const archive = path.join(directory, 'archive.zip');
@@ -105,12 +103,37 @@ export async function vendorKernel({ manifestPath, key = platformKey(), outputDi
   if (!manifestPath) throw new Error('缺少内核清单路径。');
   const manifest = await loadManifest(manifestPath);
   const asset = assetFor(manifest, key);
-  const binary = await extractBinary(await download(asset.url), asset);
+  if (!/^[a-f0-9]{64}$/i.test(asset.sha256 ?? "")) throw new Error(`内核清单未固定 ${key} 的 sha256，拒绝下载。`);
+  const archive = await download(asset.url);
+  if (asset.archiveSha256) verifySha256(archive, asset.archiveSha256);
+  const binary = await extractBinary(archive, asset);
   const digest = verifySha256(binary, asset.sha256);
   const target = path.join(outputDir ?? path.dirname(manifestPath), asset.file);
   // 内核可执行文件在 macOS/Linux 上必须带执行位。
   await atomicWrite(target, binary, 0o755);
   return { version: manifest.version, file: target, bytes: binary.length, sha256: digest };
+}
+
+/** 开发和打包共用：每次核验缓存，缺失或校验失败时按固定清单重新准备。 */
+export async function ensureKernel({
+  manifestPath = fileURLToPath(new URL('./kernel-manifest.json', import.meta.url)),
+  key = platformKey(),
+  outputDir = fileURLToPath(new URL('../../node_modules/.checkcc-kernel/', import.meta.url)),
+  download = defaultDownload,
+} = {}) {
+  const manifest = await loadManifest(manifestPath);
+  const asset = assetFor(manifest, key);
+  if (!/^[a-f0-9]{64}$/i.test(asset.sha256 ?? "")) throw new Error(`内核清单未固定 ${key} 的 sha256，请先固定当前平台校验值。`);
+  const file = path.join(outputDir, asset.file);
+  try {
+    const binary = await readFile(file);
+    verifySha256(binary, asset.sha256);
+    await chmod(file, 0o755);
+    return { version: manifest.version, file, bytes: binary.length, sha256: asset.sha256 };
+  } catch (error) {
+    if (error.code !== 'ENOENT' && !error.message.startsWith('内核校验失败')) throw error;
+  }
+  return vendorKernel({ manifestPath, key, outputDir, download });
 }
 
 /** 首次固定：下载解压后把可执行文件的 sha256 写回清单。只更新目标平台条目。 */

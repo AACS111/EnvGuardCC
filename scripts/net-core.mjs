@@ -5,8 +5,11 @@
 import { spawn as nodeSpawn } from "node:child_process";
 import { mkdir, readFile } from "node:fs/promises";
 import dns from "node:dns/promises";
+import { randomUUID } from "node:crypto";
+import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 import { inIpv4Range } from "./net-core/config.mjs";
 import { findPortOwner, processName } from "./net-core/ports.mjs";
+import { fileURLToPath } from "node:url";
 
 const LOOPBACK = "127.0.0.1";
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -44,7 +47,7 @@ export function createNetCore({
   // 端口归属探查（测试可注入）。
   portOwner = (port) => findPortOwner(port),
   portOwnerName = (pid) => processName(pid),
-  lookup = (host) => dns.lookup(host),
+  lookup = (host, options) => dns.lookup(host, options),
   spawn = nodeSpawn,
   fetchImpl = globalThis.fetch,
   logger = () => {},
@@ -61,15 +64,38 @@ export function createNetCore({
   let exitInfo = null;
   let restarts = 0;
   let restarting = null;
+  let operation = Promise.resolve();
+  const exits = new WeakMap();
+  const kernelPids = new WeakMap();
+  const serialize = (action) => (...values) => {
+    const next = operation.then(() => action(...values));
+    operation = next.catch(() => {});
+    return next;
+  };
 
   const base = `http://${LOOPBACK}:${apiPort}`;
   const authHeaders = () => (secret ? { Authorization: `Bearer ${secret}` } : {});
 
   /** 隧道活性：fake-ip 生效时，系统解析必须落在 fake-ip 段，否则说明 TUN 未接管。 */
-  async function tunnelStatus({ host = "claude.ai" } = {}) {
-    const answer = await lookup(host);
-    const address = String(answer?.address ?? answer ?? "");
-    return { active: inIpv4Range(address), host, address };
+  async function tunnelStatus({ host = "claude.ai", waitMs = 0 } = {}) {
+    const deadline = Date.now() + waitMs;
+    for (;;) {
+      let timer;
+      try {
+        // 固定域名可能命中开启 TUN 前的系统缓存；默认 getaddrinfo 还可能优先返回 AAAA。
+        // 新子域 + 显式 A 查询验证当前 DNS 路径，不清空全系统缓存。
+        const probeHost = `egcc-${randomUUID()}.${host}`;
+        const answer = await Promise.race([
+          lookup(probeHost, { family: 4 }),
+          new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("隧道解析探测超时。")), 4000); }),
+        ]);
+        const address = String(answer?.address ?? answer ?? "");
+        const result = { active: inIpv4Range(address), host, address };
+        if (result.active || Date.now() >= deadline) return result;
+      } catch (error) { if (Date.now() >= deadline) throw error; }
+      finally { clearTimeout(timer); }
+      await delay(250);
+    }
   }
 
   function args() {
@@ -90,17 +116,25 @@ export function createNetCore({
   }
 
   function wire(next) {
+    next.on?.('message', message => {
+      if (message?.type === 'kernel-pid' && Number.isInteger(message.pid) && message.pid > 0) kernelPids.set(next, message.pid);
+    });
     next.on?.("exit", (code, signal) => {
+      exits.set(next, { code, signal });
+      if (child !== next) return;
       exitInfo = { code, signal };
       ready = false;
       if (!stopping) logger(`内核进程退出（code=${code ?? "null"} signal=${signal ?? "null"}）`);
     });
     next.on?.("error", (error) => {
+      if (!next.pid) exits.set(next, { error: error?.message });
+      if (child !== next) return;
       exitInfo = { code: null, signal: null, error: error?.message ?? String(error) };
       ready = false;
       logger(`内核进程错误：${exitInfo.error}`);
     });
     pipeLines(next.stderr, "kernel");
+    pipeLines(next.stdout, "kernel");
   }
 
   async function request(pathname, { method = "GET", body } = {}) {
@@ -137,6 +171,13 @@ export function createNetCore({
   async function launch() {
     if (!manageProcess) {
       await waitReady();
+      if (wantsTunnel()) {
+        const tunnel = await tunnelStatus({ waitMs: 4000 });
+        if (!tunnel.active) {
+          ready = false;
+          throw new Error(`隧道未接管：新的 IPv4 查询未返回 fake-ip（${tunnel.address || "空"}）。请检查助手日志、系统 DNS 或其他 VPN 的冲突。`);
+        }
+      }
       return;
     }
     if (child && ready) return;
@@ -151,7 +192,8 @@ export function createNetCore({
       throw new Error(`外部控制器端口 ${apiPort} 已被进程 ${ownerPid}${ownerName ? `（${ownerName}）` : ""} 占用；多半是上一个内核未退出。请先结束该进程或换端口，不要把它当成「内核已就绪」。`);
     }
     logger(`启动内核：${binary} ${args().join(" ")}`);
-    const next = spawn(binary, args(), { stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+    const guardian = fileURLToPath(new URL('./net-core/guardian.cjs', import.meta.url));
+    const next = spawn(process.execPath, [guardian, binary, ...args()], { stdio: ["pipe", "pipe", "pipe", "ipc"], windowsHide: true });
     child = next;
     wire(next);
     try {
@@ -161,7 +203,7 @@ export function createNetCore({
       if (!next.pid) throw new Error("内核进程未返回 PID，无法确认接管者。");
       if (exitInfo) throw new Error(`内核启动失败（退出码 ${exitInfo.code ?? "null"}${exitInfo.error ? `，${exitInfo.error}` : ""}）。`);
       if (wantsTunnel()) {
-        const tunnel = await tunnelStatus();
+        const tunnel = await tunnelStatus({ waitMs: 4000 });
         if (!tunnel.active) throw new Error(`隧道未接管：${tunnel.host} 解析为 ${tunnel.address || "空"}，不在 fake-ip 段；请确认内核具备 TUN 权限。`);
         logger(`隧道已接管：${tunnel.host} → ${tunnel.address}`);
       }
@@ -175,24 +217,34 @@ export function createNetCore({
   async function terminate() {
     if (!manageProcess) { ready = false; child = null; return; }
     const current = child;
-    child = null;
     ready = false;
     if (!current) return;
     try {
-      current.kill?.();
+      if (current.stdin?.end) current.stdin.end();
+      else current.kill?.();
     } catch {
       // 已经退出。
     }
     const deadline = Date.now() + 5000;
-    while (!exitInfo && Date.now() < deadline) await delay(50);
-    if (!exitInfo) {
+    while (!exits.has(current) && Date.now() < deadline) await delay(50);
+    if (!exits.has(current)) {
       try {
         current.kill?.("SIGKILL");
       } catch {
         // 进程已经消失。
       }
-      await delay(200);
+      const forcedDeadline = Date.now() + 2000;
+      while (!exits.has(current) && Date.now() < forcedDeadline) await delay(50);
     }
+    if (!exits.has(current)) throw new Error(`内核 ${current.pid ?? "未知 PID"} 未确认退出，拒绝报告停止成功。`);
+    const kernelPid = kernelPids.get(current);
+    if (kernelPid) {
+      let alive = false;
+      try { process.kill(kernelPid, 0); alive = true; }
+      catch (error) { if (error.code !== 'ESRCH') throw error; }
+      if (alive) throw new Error(`内核 ${kernelPid} 仍在运行，守护进程退出不代表内核已停止。`);
+    }
+    child = null;
     exitInfo = null;
   }
 
@@ -205,7 +257,6 @@ export function createNetCore({
   async function stop() {
     stopping = true;
     await terminate();
-    stopping = false;
     logger("内核已停止。");
   }
 
@@ -225,6 +276,7 @@ export function createNetCore({
 
   /** 健康巡检：返回内核是否可用；不可用时按上限自动重启，超出上限返回 false。 */
   async function health() {
+    if (stopping) return false;
     if (ready) {
       try {
         const version = await request("/version");
@@ -306,29 +358,42 @@ export function createNetCore({
    * mihomo 重载会把 select 组重置成第一个节点，不恢复的话「换了 DNS」会顺手把出口也换掉。
    */
   async function reloadFromFile() {
-    const before = await request("/proxies").catch(() => null);
+    // 读不到当前选择时不得把默认选择当成原选择继续重载。
+    const before = await request("/proxies");
     const selections = Object.entries(before?.proxies ?? {})
-      .filter(([, value]) => value?.type === "Selector" && typeof value.now === "string" && value.now)
+      .filter(([group, value]) => group !== "GLOBAL" && value?.type === "Selector" && typeof value.now === "string" && value.now)
       .map(([group, value]) => [group, value.now]);
-    const payload = await readFile(configPath, "utf8");
+    const candidate = parseYaml(await readFile(configPath, "utf8"));
+    for (const [group, name] of selections) {
+      if (group === "GLOBAL") continue; // 内核自动生成的虚拟组，不属于用户配置。
+      const selector = candidate?.["proxy-groups"]?.find(item => item?.name === group && item.type === "select");
+      if (!selector || !selector.proxies?.includes(name)) throw new Error(`拒绝重载：选择器 ${group} 的原节点 ${name} 已不存在，请显式选择新出口。`);
+      // 将原节点编译为默认值，消除“先重载成第一个节点再 PUT 恢复”的窗口。
+      selector.proxies = [name, ...selector.proxies.filter(item => item !== name)];
+    }
+    const payload = stringifyYaml(candidate);
     await request("/configs?force=true", { method: "PUT", body: { payload } });
     for (const [group, name] of selections) {
+      if (group === "GLOBAL") continue;
       // 重载是异步完成的，选择器列表可能还没就绪，按 selectProxy 的经验重试几次。
       let restored = false;
       for (let attempt = 0; attempt < 5 && !restored; attempt += 1) {
         if (attempt) await delay(250);
-        restored = await request(`/proxies/${encodePath(group)}`, { method: "PUT", body: { name } })
-          .then(() => true).catch(() => false);
+        const actual = await request(`/proxies/${encodePath(group)}`).catch(() => null);
+        restored = actual?.now === name;
       }
-      if (!restored) logger(`选择器 ${group} 恢复失败，当前节点为默认值。`);
+      if (!restored) {
+        ready = false;
+        throw new Error(`配置重载后选择器 ${group} 未保持原出口，拒绝报告成功。`);
+      }
     }
     logger(`内核配置已热加载，选择器恢复 ${selections.length} 个。`);
     return selections.length;
   }
 
   function state() {
-    return { running: ready, pid: child?.pid ?? null, restarts, exit: exitInfo };
+    return { running: ready, pid: child ? (kernelPids.get(child) ?? child.pid ?? null) : null, supervisorPid: child?.pid ?? null, restarts, exit: exitInfo };
   }
 
-  return { start, stop, restart, health, status, selectProxy, reload, reloadFromFile, request, tunnelStatus, state, args };
+  return { start: serialize(start), stop: serialize(stop), restart: serialize(restart), health: serialize(health), status, selectProxy, reload, reloadFromFile, request, tunnelStatus, state, args };
 }

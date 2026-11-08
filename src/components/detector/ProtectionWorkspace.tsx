@@ -5,7 +5,8 @@ import { NetCorePanel } from './NetCorePanel';
 import { BrowserCloakStatus } from './BrowserCloakStatus';
 import type { BrowserCloakExecution } from '@/detection/environment-runtime';
 import { netCoreView } from '@/detection/net-core-view.mjs';
-import type { ExitHistory, NetCoreNetworkState, NetCoreReport } from '@/detection/gateway-check';
+import type { ExitHistory, NetCoreExit, NetCoreNetworkState, NetCoreReport } from '@/detection/gateway-check';
+import { describeExit } from '@/detection/exit-quality.mjs';
 import { measurementStatus, measurementPoints } from '@/detection/measurement-status';
 import { signalPolicy } from '@/detection/signal-policy';
 import { partitionIssues, requirementLabel, signalRequirement } from '@/detection/signal-requirement';
@@ -29,7 +30,7 @@ type Props = {
   filter: string; search: string; onFilter: (value: string) => void; onSearch: (value: string) => void;
   onToggle: () => void; onStop: () => void; onMonitor: (enabled: boolean, intervalMs: number) => void; onRefresh: () => void; onSelect: (id: string) => void;
   netCore: NetCoreReport | null; netCoreBusy?: boolean; netCoreError?: string;
-  onNetCoreRefresh: () => void; onNetCoreRestart: () => void; onNetCoreSelect: (name: string) => void; onNetCoreAddConfig: () => void; onNetCoreEditConfig?: () => void; onNetCoreOpenNetworkConfig: () => void; onNetCoreRefreshSubscription: () => void; onNetCoreMeasure: () => void; onNetCoreModeChange: (mode: "claude" | "rule" | "global" | "direct") => void; netCoreMeasuring?: boolean; netCoreDelays?: Record<string, number | null>; netCoreExits?: Record<string, { countryCode: string | null; country: string | null; ip: string | null } | null>; netCoreExiting?: boolean; onNetCoreProbeExits?: () => void; netCoreExitHistory?: ExitHistory | null; netCoreNetwork?: NetCoreNetworkState | null;
+  onNetCoreStrict?: (enabled: boolean) => void; onNetCoreTunnel?: (enabled: boolean) => void; onNetCoreRefresh: () => void; onNetCoreStart: () => void; onNetCoreStop: () => void; onNetCoreRestart: () => void; onNetCoreAuthorizeHost?: () => void; onNetCoreSelect: (name: string) => void; onNetCoreManageSources: () => void; onNetCoreAddSource?: () => void; onNetCoreOpenNetworkConfig: () => void; onNetCoreMeasure: () => void; onNetCoreModeChange: (mode: "claude" | "rule" | "global" | "direct") => void; onNetCoreUnlockRegion?: () => void; netCoreMeasuring?: boolean; netCoreDelays?: Record<string, number | null>; netCoreExits?: Record<string, NetCoreExit | null>; netCoreExitsAt?: string | null; netCoreExiting?: boolean; onNetCoreProbeExits?: () => void; netCoreExitHistory?: ExitHistory | null; netCoreNetwork?: NetCoreNetworkState | null;
   browserCloak?: BrowserCloakExecution | null; linkingBrowser?: boolean; onLinkBrowser?: () => void; onOpenBrowserPicker?: () => void;
 };
 const time = (value: string | null | undefined) => value ? new Date(value).toLocaleTimeString([], { hour12: false }) : '—';
@@ -91,8 +92,11 @@ export function ProtectionWorkspace(props: Props) {
   const restartNotice = report?.phase === 'restart_required' ? text('出口节点已变化，旧检测结果已过期。请先关闭保护，再启动保护，按最新出口 IP 生成匹配配置。', 'The exit node changed and previous results are stale. Stop protection, then start it again to generate settings for the latest exit IP.') : null;
   const error = props.error;
   const total = scores.combined;
+  const hostingWarning = props.target?.hosting
+    ? text(`当前出口是云机房/托管 IP（${describeExit(props.target)}），Claude 可能拒绝登录；建议切换到住宅/原生 IP 节点。`, `The exit is a cloud/hosting IP (${describeExit(props.target)}); Claude may refuse login. Prefer a residential/native-IP node.`)
+    : '';
   const notices = [...new Set([
-    error, restartNotice,
+    hostingWarning, error, restartNotice,
     !connected ? text('本机服务未连接，请先启动本机服务。', 'Local service disconnected. Start the local service first.') : '',
     report?.alarm ? text('验证得分较上次有效检测下降至少40%，请查看异常项目。', 'Verification score dropped at least 40% since the previous valid check. Review the flagged items.') : '',
     report?.phase === 'restore_failed' ? text('配置恢复未完成，备份已保留。请点击“关闭保护”重试恢复。', 'Restoration incomplete. Backup retained; select Stop protection to retry restoration.') : '',
@@ -113,13 +117,18 @@ export function ProtectionWorkspace(props: Props) {
       <header className="workspace-header">
         <h1>{tabs.find(([id]) => id === tab)?.[1]}</h1>
         <div className="workspace-header-actions">
-          <span className="netcore-pill" data-tone={kernel.tone} title={kernel.conclusion.title}>{kernel.label}</span>
+          {/* 网络页的结论卡已经说明内核状态，页头不再重复同一个「运行中」。 */}
+          {tab !== 'network' && <span className="netcore-pill" data-tone={kernel.tone} title={kernel.conclusion.title}>{kernel.label}</span>}
           <button type="button" className="repair-button repair-button--quiet" disabled={busy || checking} aria-busy={checking} onClick={props.onRefresh}>{checking ? text('检测中…', 'Checking…') : text('检测', 'Check')}</button>
           <button type="button" className="repair-button workspace-power" data-enabled={protectionEnabled} disabled={busy || !connected || !report} onClick={turnOff ? props.onStop : props.onToggle} aria-busy={stopping || starting} aria-label={text('环境防护：', 'Environment protection: ') + action}>{action}</button>
         </div>
       </header>
       <div className="workspace-content">
         {notices.length > 0 && <div className="workspace-notices" role="alert">{notices.map((message) => <p key={message} className="workspace-alert">{message}</p>)}</div>}
+        {props.netCore?.regionLock?.locked && <div className="workspace-notices" role="alert">
+          <p className="workspace-alert">{props.netCore.regionLock.reason || text('固定出口未通过复检，Claude 流量已阻断。', 'The pinned exit failed recheck; Claude traffic is blocked.')}</p>
+          <button type="button" className="repair-button" onClick={() => props.onNetCoreUnlockRegion?.()} disabled={Boolean(props.netCoreBusy) || busy}>{text('复检并解除', 'Recheck and unlock')}</button>
+        </div>}
         <div id="panel-basic" role="tabpanel" aria-labelledby="tab-basic" tabIndex={0} hidden={tab !== 'basic'}>
           <section className="workspace-score" aria-label={text('环境验证得分', 'Environment verification scores')}>
             <div className="workspace-score-total"><span>{text('环境风险估计', 'Estimated environment risk')}</span><div className="workspace-risk-rings">{(['browser', 'claude'] as const).map(side => {
@@ -144,7 +153,7 @@ export function ProtectionWorkspace(props: Props) {
               <DesktopSettingsFields locale={locale} protectionEnabled={protectionEnabled} />
               <div className="workspace-browser-link"><dt>{text('浏览器模拟保护', 'Browser cloak')}</dt><dd>
                 <BrowserCloakStatus report={props.browserCloak ?? null} locale={locale} />
-                <button type="button" className="repair-button" disabled={busy || props.linkingBrowser} onClick={() => props.onLinkBrowser?.()}>{props.linkingBrowser ? text('接入中…', 'Linking…') : text('接入并验证浏览器', 'Link & verify browser')}</button>
+                <button type="button" className="repair-button" disabled={busy || props.linkingBrowser} onClick={() => props.onLinkBrowser?.()}>{props.linkingBrowser ? text('启动中…', 'Starting…') : text('启动保护浏览器', 'Launch protected browser')}</button>
                 <button type="button" className="repair-button repair-button--quiet" disabled={busy} onClick={() => props.onOpenBrowserPicker?.()}>{text('选择浏览器', 'Choose browser')}</button>
               </dd></div>
             </dl></section>
@@ -158,7 +167,7 @@ export function ProtectionWorkspace(props: Props) {
           {Boolean(report?.issues.length) && <details className="workspace-panel workspace-details"><summary>{text('执行详情', 'Operation details')} · {report!.issues.length}</summary><ul>{report!.issues.map((issue, index) => <li key={index}>{issue}</li>)}</ul></details>}
         </div>
         <div id="panel-network" role="tabpanel" aria-labelledby="tab-network" tabIndex={0} hidden={tab !== 'network'}>
-          <NetCorePanel locale={locale} report={props.netCore} busy={Boolean(props.netCoreBusy) || busy} error={props.netCoreError} onRefresh={props.onNetCoreRefresh} onRestart={props.onNetCoreRestart} onSelectNode={props.onNetCoreSelect} onAddConfig={props.onNetCoreAddConfig} onEditConfig={props.onNetCoreEditConfig} onOpenNetworkConfig={props.onNetCoreOpenNetworkConfig} onRefreshSubscription={props.onNetCoreRefreshSubscription} onMeasure={props.onNetCoreMeasure} onModeChange={props.onNetCoreModeChange} measuring={props.netCoreMeasuring} delays={props.netCoreDelays} exits={props.netCoreExits ?? {}} probingExits={props.netCoreExiting} onProbeExits={props.onNetCoreProbeExits} exitHistory={props.netCoreExitHistory ?? null} networkState={props.netCoreNetwork ?? null} />
+          <NetCorePanel locale={locale} report={props.netCore} busy={Boolean(props.netCoreBusy) || busy} error={props.netCoreError} onRefresh={props.onNetCoreRefresh} onStrictChange={props.onNetCoreStrict} onTunnelChange={props.onNetCoreTunnel} tunnelLocked={Boolean(report?.enabled)} onStart={props.onNetCoreStart} onStop={props.onNetCoreStop} onRestart={props.onNetCoreRestart} onAuthorizeHost={props.onNetCoreAuthorizeHost} onSelectNode={props.onNetCoreSelect} onManageSources={props.onNetCoreManageSources} onAddSource={props.onNetCoreAddSource} onOpenNetworkConfig={props.onNetCoreOpenNetworkConfig} onMeasure={props.onNetCoreMeasure} onModeChange={props.onNetCoreModeChange} measuring={props.netCoreMeasuring} delays={props.netCoreDelays} exits={props.netCoreExits ?? {}} exitsAt={props.netCoreExitsAt ?? null} probingExits={props.netCoreExiting} onProbeExits={props.onNetCoreProbeExits} exitHistory={props.netCoreExitHistory ?? null} networkState={props.netCoreNetwork ?? null} />
         </div>
         <div id="panel-tests" role="tabpanel" aria-labelledby="tab-tests" tabIndex={0} hidden={tab !== 'tests'}>
           <div className="workspace-toolbar"><div className="workspace-filters" role="group" aria-label={text('检测状态筛选', 'Filter tests')}>{[['all',text('全部','All')],['issues',text('异常','Issues')],['pending',text('待处理','Pending')],['passed',text('通过','Passed')]].map(([id,label]) => <button key={id} className="repair-button repair-button--quiet" type="button" aria-pressed={props.filter === id} onClick={() => props.onFilter(id)}>{label}</button>)}</div><input type="search" aria-label={text('搜索检测项','Search tests')} placeholder={text('搜索检测项','Search tests')} value={props.search} onChange={(event) => props.onSearch(event.target.value)} /></div>

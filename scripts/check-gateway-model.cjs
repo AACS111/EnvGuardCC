@@ -1006,13 +1006,13 @@ test('derived gateway values are measured, hosting orgs classify, and dialog sep
 
 test('网络内核面板：只给证据，不给未经证实的通过结论',()=>{
   const {NetCorePanel}=require(path.join(root,'src/components/detector/NetCorePanel.tsx'));
-  const render=(report,locale='zh')=>renderToStaticMarkup(React.createElement(NetCorePanel,{locale,report,busy:false,onRefresh:()=>{},onRestart:()=>{},onSelectNode:()=>{}}));
-  const running={enabled:true,state:'running',tunEnabled:true,demo:false,version:'v1.19.33',restarts:0,nodes:['住宅-东京-01','住宅-新加坡-01'],selected:'住宅-东京-01',
-    routing:{state:'verified',claude:12,pinned:12,direct:0,total:20,violations:[],sampledAt:'2026-11-04T01:27:42.036Z'},detail:'12 条 Claude 连接全部命中 CLAUDE-PIN，无直连。'};
+  const render=(report,locale='zh')=>renderToStaticMarkup(React.createElement(NetCorePanel,{locale,report,busy:false,onRefresh:()=>{},onRestart:()=>{},onSelectNode:()=>{},onStrictChange:()=>{}}));
+  const running={enabled:true,state:'running',tunEnabled:true,tunCaptured:true,demo:false,version:'v1.19.33',restarts:0,nodes:['住宅-东京-01','住宅-新加坡-01'],selected:'住宅-东京-01',
+    routing:{state:'verified',claude:12,pinned:12,direct:0,total:20,violations:[],sampledAt:new Date().toISOString()},detail:'12 条 Claude 连接全部命中 CLAUDE-PIN，无直连。'};
 
   const ok=render(running);
   assert.match(ok,/出口结论/);
-  assert.match(ok,/全部走专用出口/);
+  assert.match(ok,/已观察到的 Claude 连接走专用出口/);
   assert.match(ok,/Claude 连接/);
   assert.match(ok,/data-tone="ok"/);
   assert.doesNotMatch(ok,/netcore-violations/);
@@ -1044,20 +1044,52 @@ test('网络内核面板：只给证据，不给未经证实的通过结论',()=
   // 英文文案。
   const en=render(running,'en');
   assert.match(en,/Exit conclusion/);
-  assert.match(en,/All Claude traffic uses the dedicated exit/);
+  assert.match(en,/Observed Claude connections use the dedicated exit/);
+  const blocked=render({...running,strictMode:true,guard:{armed:true,phase:'blocked'},capabilities:{strictTravel:false}});
+  assert.match(blocked,/严格连接尚未放行/);
+  assert.doesNotMatch(blocked,/data-tone="ok"/);
+  for(const mode of blocked.match(/<button[^>]*class="netcore-mode"[^>]*>/g)??[]) assert.match(mode,/disabled=""/);
 });
 
-test('添加配置对话框：三种来源都可见，链接与自定义表单可渲染',()=>{
-  const {AddConfigDialog}=require(path.join(root,'src/components/detector/AddConfigDialog.tsx'));
-  const html=renderToStaticMarkup(React.createElement(AddConfigDialog,{locale:'zh',busy:false,onClose:()=>{},onImport:async()=>({ok:true,imported:1,selected:'x'})}));
+test('配置与供应商：列表展示名称/类型/节点数/更新时间，长链接只露域名',()=>{
+  const {SourcesDialog}=require(path.join(root,'src/components/detector/SourcesDialog.tsx'));
+  const sources=[
+    {id:'src_a',name:'首尔机场',mode:'url',url:'https://a.example.com/s.yaml',nodeCount:3,selected:'n1',updatedAt:'2026-11-05T00:00:00.000Z',intervalHours:6,active:true},
+    {id:'src_b',name:'备用机场',mode:'manual',url:null,nodeCount:1,selected:'m1',updatedAt:'2026-11-04T00:00:00.000Z',intervalHours:6,active:false},
+  ];
+  const props={locale:'zh',busy:false,sources,activeId:'src_a',onClose:()=>{},onImport:async()=>({ok:true,imported:1}),onAction:async()=>({ok:true}),onChanged:()=>{}};
+  const html=renderToStaticMarkup(React.createElement(SourcesDialog,props));
+  assert.match(html,/配置与供应商/);
+  assert.match(html,/首尔机场/);
+  assert.match(html,/备用机场/);
+  assert.match(html,/订阅链接/);
+  assert.match(html,/3 个节点/);
+  assert.match(html,/更新于/);
+  assert.match(html,/>编辑</);
+  assert.match(html,/>删除</);
+  assert.match(html,/>设为当前</);
+  // 订阅令牌只在编辑表单里出现：列表只显示域名，截图分享不会泄露完整链接。
+  assert.doesNotMatch(html,/https:\/\/a\.example\.com\/s\.yaml/);
+  assert.match(html,/a\.example\.com/);
+  const en=renderToStaticMarkup(React.createElement(SourcesDialog,{...props,locale:'en'}));
+  assert.match(en,/Configurations/);
+  assert.match(en,/In use/);
+  assert.match(en,/Use/);
+});
+
+test('添加配置表单：四种来源都可见，链接与自定义表单可渲染',()=>{
+  const {SourcesDialog}=require(path.join(root,'src/components/detector/SourcesDialog.tsx'));
+  const base={sources:[],activeId:null,busy:false,onClose:()=>{},onImport:async()=>({ok:true,imported:1,selected:'x'}),onAction:async()=>({ok:true}),onChanged:()=>{}};
+  const html=renderToStaticMarkup(React.createElement(SourcesDialog,{...base,locale:'zh',initialView:'add'}));
   assert.match(html,/添加配置/);
   assert.match(html,/订阅 \/ 分享链接/);
   assert.match(html,/>链接</);
+  assert.match(html,/>本地代理</);
   assert.match(html,/>文件</);
   assert.match(html,/>自定义</);
   assert.match(html,/placeholder="https:\/\/example\.com\/sub\.yaml"/);
-  assert.match(html,/导入会替换当前节点列表/);
-  const en=renderToStaticMarkup(React.createElement(AddConfigDialog,{locale:'en',busy:false,onClose:()=>{},onImport:async()=>({ok:true,imported:1})}));
+  assert.match(html,/导入会替换这条配置原有的节点快照/);
+  const en=renderToStaticMarkup(React.createElement(SourcesDialog,{...base,locale:'en',initialView:'add'}));
   assert.match(en,/Add configuration/);
   assert.match(en,/Subscription or share link/);
 });
@@ -1134,17 +1166,17 @@ test('检测项分层：出口类型与 IP 情报交叉核对属于链路项',()
   for (const id of ['chineseFonts','emojiStyle','vendorFonts','domesticDevice']) assert.equal(signalRequirement(id),'environment',id);
 });
 
-test('浏览器迷惑层：概览里能看见状态与「接入并验证浏览器」入口',()=>{
+test('浏览器迷惑层：概览里能看见状态与「启动保护浏览器」入口',()=>{
   const {ProtectionWorkspace} = require(path.join(root,'src/components/detector/ProtectionWorkspace.tsx'));
   const {verificationScores} = require(path.join(root,'src/detection/verification-score.ts'));
   const props = {locale:'zh',report:{phase:'idle',enabled:false,issues:[],history:[],monitoring:true,intervalMs:300000},connected:true,busy:false,scores:verificationScores(null,null),geo:null,target:null,baseline:null,browser:[],claude:[],signals:[],cards:null,filter:'all',search:'',onFilter:()=>{},onSearch:()=>{},onToggle:()=>{},onMonitor:()=>{},onRefresh:()=>{},onSelect:()=>{}};
   const html = renderToStaticMarkup(React.createElement(ProtectionWorkspace,props));
   assert.match(html,/浏览器模拟保护/);
-  assert.match(html,/接入并验证浏览器/);
+  assert.match(html,/启动保护浏览器/);
   // 未接入时不冒充已验证。
   assert.match(html,/未跟随网关/);
   const en = renderToStaticMarkup(React.createElement(ProtectionWorkspace,{...props,locale:'en'}));
-  assert.match(en,/Link &amp; verify browser/);
+  assert.match(en,/Launch protected browser/);
 });
 
 test('本地浏览器弹窗：说明边界、列出选项、双语可渲染',()=>{
