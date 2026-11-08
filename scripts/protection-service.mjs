@@ -43,7 +43,15 @@ export function createProtectionService({ stateDir, runtime, browserCloak, curre
   const policyFile = path.join(stateDir, 'environment-policy.json');
   const gateway = gatewayRequest;
   let browserIssues = [];
-  let previousTunnel = null;
+  // 保护关闭时的 Claude 阻断状态：开启失败要如实展示，不能静默放行。
+  let unprotectedBlock = { active: false, error: null };
+  const applyUnprotectedBlock = async enabled => {
+    const kernel = network();
+    if (!kernel) { unprotectedBlock = { active: false, error: null }; return; }
+    if (!kernel.setUnprotectedGuard) { unprotectedBlock = { active: false, error: "当前网络内核不支持未保护阻断，请更新 EnvGuardCC。" }; return; }
+    try { await kernel.setUnprotectedGuard(enabled); unprotectedBlock = { active: enabled, error: null }; }
+    catch (error) { unprotectedBlock = { active: false, error: error.message }; }
+  };
   const assertNetwork = async () => {
     const kernel = network();
     if (!kernel) return;
@@ -56,19 +64,24 @@ export function createProtectionService({ stateDir, runtime, browserCloak, curre
     beforeActivate: async () => {
       const kernel = network();
       if (!kernel) return;
-      if (previousTunnel === null) {
-        const before = await kernel.report();
-        previousTunnel = before.state === "running" && before.tunCaptured === true;
-      }
+      // 先解除未保护阻断，否则保护自己的模拟测试会被 REJECT 规则挡住。
+      if (kernel.setUnprotectedGuard) await kernel.setUnprotectedGuard(false);
+      unprotectedBlock = { active: false, error: null };
       await kernel.setTunnel(true);
       await assertNetwork();
     },
     beforeTest: assertNetwork,
-    afterStop: async ({ rollback = false } = {}) => {
+    afterStop: async ({ shutdown = false } = {}) => {
       const kernel = network();
-      if (kernel?.connectionState?.().strictEnabled) { previousTunnel = null; return; }
-      if (kernel) await kernel.setTunnel(rollback ? previousTunnel === true : false);
-      previousTunnel = null;
+      if (!kernel) return;
+      if (shutdown) {
+        // 退出应用即停止接管：阻断不需要跨进程保留，系统流量也不必再走内核。
+        try { if (kernel.setUnprotectedGuard) await kernel.setUnprotectedGuard(false); } catch { /* 内核随后会整体停止 */ }
+        try { if (!kernel.connectionState?.().strictEnabled) await kernel.setTunnel(false); } catch { /* 备份与错误由退出流程继续报告 */ }
+        unprotectedBlock = { active: false, error: null };
+        return;
+      }
+      await applyUnprotectedBlock(true);
     },
     detect: async () => {
       const kernel = network();
@@ -95,6 +108,8 @@ export function createProtectionService({ stateDir, runtime, browserCloak, curre
           // macOS must also disable automatic timezone selection, even if its
           // current zone already matches. setZone durably saves the original first.
           if (platform === 'darwin' || await currentZone() !== zone) await setZone(zone);
+          const actual = await currentZone();
+          if (!sameTimezone(actual, zone)) issues.push(`系统时区未应用：当前 ${actual || '未知'}，目标 ${zone}。`);
         } catch (error) { issues.push('系统时区适配失败：' + error.message); }
       }
       const report = await browserCloak.sync(origin, { launch: false, force: true });
@@ -154,12 +169,14 @@ export function createProtectionService({ stateDir, runtime, browserCloak, curre
   session.report = () => {
     const report = environmentReport();
     const connection = network()?.connectionState?.() ?? null;
-    if (!connection) return report;
+    if (!connection) return { ...report, unprotectedBlock };
     if (report.enabled && connection.state !== "verified") {
       report.phase = report.phase === "active" ? "partial" : report.phase;
       report.issues = [...new Set([...report.issues, connection.reason || "系统隧道未验证，环境检测不能代表网络保护已生效。"] )];
     }
-    return { ...report, connection };
+    return { ...report, connection, unprotectedBlock };
   };
+  // 应用启动且自动保护关闭时，由本机助手调用：保护没开也要拦住 Claude。
+  session.ensureUnprotectedBlock = async () => { await applyUnprotectedBlock(true); return session.report(); };
   return session;
 }

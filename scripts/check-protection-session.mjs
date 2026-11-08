@@ -539,3 +539,75 @@ test('固定出口在 Claude 不支持地区时拒绝启动，且不写入任何
   assert.equal(service.report().enabled, false);
   assert.match(service.report().issues.join(), /Claude 不支持的地区：CN/);
 });
+
+test('关闭保护时建立未保护阻断，开启保护先解除阻断', async t => {
+  const stateDir = await mkdtemp(path.join(os.tmpdir(), 'checkcc-unprotected-block-'));
+  t.after(() => rm(stateDir, { recursive: true, force: true }));
+  const calls = [];
+  const kernel = {
+    report: async () => ({ state: 'running', tunEnabled: true, tunCaptured: true }),
+    verifyConnection: async () => ({ state: 'running', tunEnabled: true, tunCaptured: true }),
+    setTunnel: async value => { calls.push(`tunnel:${value}`); },
+    setUnprotectedGuard: async value => { calls.push(`guard:${value}`); },
+    connectionState: () => ({ strictEnabled: false }),
+    probeSelectedExit: async () => ({ ip: '203.0.113.9', countryCode: 'KR', timezone: 'Asia/Seoul' }),
+  };
+  const service = createProtectionService({
+    stateDir,
+    runtime: { policy: {}, enabled: false, clients: new Map(), load: async () => {}, restore: async () => ({ results: [] }), close: async () => ({ results: [] }) },
+    browserCloak: { sync: async () => ({ results: [], requestProbe: { state: 'verified' } }), close: async () => {} },
+    currentZone: async () => 'Asia/Seoul',
+    setZone: async () => {},
+    restoreTimezone: async () => {},
+    canTest: () => true,
+    network: () => kernel,
+    platform: 'linux',
+    gatewayRequest: async () => ({ cloak: { enabled: false } }),
+  });
+  service.detect = async () => ({ ip: '203.0.113.9', language: 'ko', locale: 'ko-KR' });
+  await service.start('http://localhost:3000');
+  assert.deepEqual(calls.slice(0, 2), ['guard:false', 'tunnel:true']);
+
+  calls.length = 0;
+  const stopped = await service.stop();
+  assert.equal(stopped.phase, 'idle');
+  assert.equal(stopped.unprotectedBlock.active, true);
+  assert.deepEqual(calls, ['guard:true'], '关闭保护后保持接管并阻断 Claude');
+
+  calls.length = 0;
+  await service.start('http://localhost:3000');
+  assert.deepEqual(calls.slice(0, 2), ['guard:false', 'tunnel:true'], '开启保护必须先解除阻断');
+  assert.equal(service.report().unprotectedBlock.active, false);
+  await service.stop();
+});
+
+test('未保护阻断建立失败时如实报告原因，不阻止关闭保护', async t => {
+  const stateDir = await mkdtemp(path.join(os.tmpdir(), 'checkcc-unprotected-block-fail-'));
+  t.after(() => rm(stateDir, { recursive: true, force: true }));
+  const kernel = {
+    report: async () => ({ state: 'running', tunEnabled: true, tunCaptured: true }),
+    verifyConnection: async () => ({ state: 'running', tunEnabled: true, tunCaptured: true }),
+    setTunnel: async () => {},
+    setUnprotectedGuard: async value => { if (value) throw new Error('TUN 需要更高权限'); },
+    connectionState: () => ({ strictEnabled: false }),
+    probeSelectedExit: async () => ({ ip: '203.0.113.9', countryCode: 'KR', timezone: 'Asia/Seoul' }),
+  };
+  const service = createProtectionService({
+    stateDir,
+    runtime: { policy: {}, enabled: false, clients: new Map(), load: async () => {}, restore: async () => ({ results: [] }), close: async () => ({ results: [] }) },
+    browserCloak: { sync: async () => ({ results: [], requestProbe: { state: 'verified' } }), close: async () => {} },
+    currentZone: async () => 'Asia/Seoul',
+    setZone: async () => {},
+    restoreTimezone: async () => {},
+    canTest: () => true,
+    network: () => kernel,
+    platform: 'linux',
+    gatewayRequest: async () => ({ cloak: { enabled: false } }),
+  });
+  service.detect = async () => ({ ip: '203.0.113.9', language: 'ko', locale: 'ko-KR' });
+  await service.start('http://localhost:3000');
+  const stopped = await service.stop();
+  assert.equal(stopped.phase, 'idle');
+  assert.equal(stopped.unprotectedBlock.active, false);
+  assert.match(stopped.unprotectedBlock.error, /更高权限/);
+});

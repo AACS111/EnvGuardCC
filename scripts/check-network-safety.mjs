@@ -6,7 +6,8 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { parse as yaml, stringify } from "yaml";
-import { netCoreView } from "../src/detection/net-core-view.mjs";
+import { netCoreView, trafficFlowSamples } from "../src/detection/net-core-view.mjs";
+import { routingEvidence } from "./net-core/routes.mjs";
 import { createKernelRuntime, loadNodes } from "./net-core/runtime.mjs";
 import { migrateStore } from "./net-core/sources.mjs";
 import { recordExit, readExitHistory } from "./net-core/exit-history.mjs";
@@ -17,6 +18,35 @@ import { createNetCore } from "./net-core.mjs";
 import { ProtectionSession } from "./protection-session.mjs";
 
 const node = name => ({ name, type: "ss", server: "203.0.113.10", port: 443, cipher: "aes-128-gcm", password: "test" });
+
+test("路径采样包含国内普通代理、直连和阻断，且不冒充 Claude 专用出口证据", () => {
+  const connection = (host, chains) => ({ metadata: { host }, chains });
+  const routing = routingEvidence({ connections: [
+    connection("www.baidu.com", ["node-a", "AUTO-PROXY"]),
+    connection("www.example.com", ["node-a", "AUTO-PROXY"]),
+    connection("intranet.example", ["ENVGUARD-LOCAL-DIRECT"]),
+    connection("192.168.1.1", ["DIRECT"]),
+    connection("dns.example", ["ENVGUARD-LOCAL-DNS"]),
+    connection("blocked.example", ["REJECT"]),
+    connection("dropped.example", ["REJECT-DROP"]),
+    connection("pending.example", []),
+    connection("unknown.example", ["PASS"]),
+    connection("claude.ai", ["node-a", "CLAUDE-PIN"]),
+  ] });
+  assert.deepEqual(routing.traffic, { proxied: 2, direct: 3, blocked: 2, unknown: 2 });
+  assert.deepEqual(routing.paths, { proxied: 3, direct: 3, blocked: 2, unknown: 2 });
+  assert.equal(routing.pinned, 1);
+  assert.equal(routing.direct, 0, "普通直连不是 Claude 直连违规");
+  const report = { state: "running", routing };
+  assert.deepEqual(trafficFlowSamples(report), { ...routing.paths, pinned: 1 });
+  for (const extra of [{ demo: true }, { state: "idle" }, { state: "unavailable" }, { routing: { ...routing, sampledAt: new Date(Date.now() - 60000).toISOString() } }]) {
+    assert.ok(Object.values(trafficFlowSamples({ ...report, ...extra })).every(count => count === null));
+  }
+  assert.equal(trafficFlowSamples({ ...report, routing: { ...routing, traffic: undefined, paths: undefined } }).proxied, null);
+  const ordinaryOnly = routingEvidence([connection("www.baidu.com", ["node-a", "AUTO-PROXY"])]);
+  assert.equal(ordinaryOnly.state, "unknown", "国内普通代理流量不能证明 Claude 已验证");
+  assert.equal(trafficFlowSamples({ state: "running", routing: ordinaryOnly }).proxied, 1);
+});
 
 test("隧道探测使用不同的新域名和 IPv4，等待 DNS 接管但不接受真实公网地址", async () => {
   const queries = [];
@@ -85,19 +115,30 @@ test("来源 DNS 独立持久化，旧顶层 DNS 只迁移到原 active", async 
   assert.deepEqual(migrated.sources[1].proxyServerDns, ["192.0.2.53"]);
 });
 
-async function fakeRuntime(t, takeover = { prepare: async () => {}, status: () => ({ phase: "idle", closed: [] }) }) {
+async function fakeRuntime(t, takeover = { prepare: async () => {}, status: () => ({ phase: "idle", closed: [] }) }, { host = false } = {}) {
   const dir = await directory(t);
   let failNext = false;
+  let failedReloads = 0;
+  let tunnelActive = true;
+  const hostActions = [];
   let capturedSecret;
   let starts = 0, maxStarts = 0;
   let healthBroken = false, scheduled = null, interfaceAddress = "192.0.2.10", launches = 0;
   const runtime = await createKernelRuntime({
     stateDir: dir,
     takeover,
-    env: { CHECKCC_NET_CORE_BINARY: process.execPath, CHECKCC_NET_CORE_TUN: "0", CHECKCC_NET_CORE_DNS: "https://192.0.2.53/dns-query" },
+    env: { CHECKCC_NET_CORE_BINARY: process.execPath, CHECKCC_NET_CORE_TUN: "0", CHECKCC_NET_CORE_DNS: "https://192.0.2.53/dns-query",
+      ...(host ? { CHECKCC_NET_CORE_HOST: "http://127.0.0.1:39091", CHECKCC_NET_CORE_HOST_TOKEN: "test-host-token" } : {}),
+    },
+    fetchImpl: async (_url, options) => {
+      hostActions.push(JSON.parse(options.body));
+      return { ok: true, json: async () => ({ ok: true }) };
+    },
     interfaces: () => ({ test: [{ address: interfaceAddress, internal: false }] }),
     healthScheduler: { every: callback => { scheduled = callback; return { unref() {} }; }, clear: () => { scheduled = null; } },
     createCore: options => {
+      // 能力探测不访问真实节点，也不操作系统 IPv6。
+      if (options.configPath.endsWith("probe.yaml")) return { start: async () => { throw new Error("test probe disabled"); }, stop: async () => {} };
       capturedSecret = options.secret;
       let running = false, config;
       return {
@@ -119,13 +160,18 @@ async function fakeRuntime(t, takeover = { prepare: async () => {}, status: () =
           return { version: "test", connections: [], proxies: { proxies: { "CLAUDE-PIN": { now: config["proxy-groups"][0].proxies[0] } } } };
         },
         request: async () => ({ delay: 1 }),
-        tunnelStatus: async () => ({ active: true }),
-        reloadFromFile: async () => { config = yaml(await readFile(options.configPath, "utf8")); },
+        tunnelStatus: async () => ({ active: tunnelActive }),
+        reloadFromFile: async () => {
+          config = yaml(await readFile(options.configPath, "utf8"));
+          if (failedReloads > 0) { failedReloads--; throw new Error("injected reload failure"); }
+        },
       };
     },
   });
   t.after(() => runtime.stop());
   return { runtime, dir, fail: () => { failNext = true; }, secret: () => capturedSecret, maximum: () => maxStarts,
+    failReload: (count = 1) => { failedReloads = count; }, hostActions,
+    setTunnelActive: value => { tunnelActive = value; },
     tick: async () => { await scheduled?.(); }, disconnect: () => { healthBroken = true; },
     switchNetwork: () => { interfaceAddress = "192.0.2.11"; }, launches: () => launches,
   };
@@ -158,12 +204,110 @@ test("后台串行导入、模式失败回滚及控制器密钥不下发", async
   assert.ok(!JSON.stringify(before).includes(f.secret()));
   const config = yaml(await readFile(path.join(f.dir, "net-core/config.yaml"), "utf8"));
   assert.equal(config.secret, f.secret());
-  f.fail();
+  f.failReload();
   await assert.rejects(f.runtime.setMode("global"), /injected/);
   const after = await f.runtime.report();
   assert.equal(after.mode, "rule");
   assert.equal(after.state, "running");
   assert.equal(f.runtime.connectionState().systemKillSwitch, false);
+});
+
+test("代理范围热加载不重启内核，宿主 TUN 不重复交接自己的端口", async t => {
+  for (const host of [false, true]) {
+    let takeovers = 0;
+    const f = await fakeRuntime(t, {
+      prepare: async () => {
+        if (++takeovers > 1) throw new Error("端口 39090 仍被其他程序占用");
+      },
+      status: () => ({ phase: "ready", closed: [] }),
+    }, { host });
+    await f.runtime.importNodes([node("a")]);
+    if (host) await f.runtime.setTunnel(true);
+    const launches = f.launches(), actions = f.hostActions.length;
+    for (const mode of ["global", "direct", "rule"]) {
+      await f.runtime.setMode(mode);
+      const report = await f.runtime.report();
+      assert.equal(report.mode, mode);
+      assert.equal(report.state, "running");
+      assert.equal(report.tunEnabled, host);
+      if (host) assert.equal(report.tunCaptured, true);
+      assert.equal(JSON.parse(await readFile(path.join(f.dir, "net-core-mode.json"), "utf8")).mode, mode);
+      const config = yaml(await readFile(path.join(f.dir, "net-core/config.yaml"), "utf8"));
+      assert.equal(config.rules.at(-1), mode === "direct" ? "MATCH,DIRECT" : "MATCH,AUTO-PROXY");
+      assert.equal(config.tun.enable, host);
+    }
+    assert.equal(f.launches(), launches);
+    assert.equal(f.hostActions.length, actions);
+    assert.equal(takeovers, host ? 1 : 0);
+  }
+});
+
+test("代理范围部分重载失败恢复已保存模式和规则，恢复失败如实报告", async t => {
+  const f = await fakeRuntime(t);
+  await f.runtime.importNodes([node("a")]);
+  await f.runtime.setMode("global");
+  const file = path.join(f.dir, "net-core-mode.json");
+  const before = await readFile(file, "utf8");
+  const configFile = path.join(f.dir, "net-core/config.yaml");
+  const config = await readFile(configFile, "utf8");
+  const launches = f.launches();
+  f.failReload();
+  await assert.rejects(f.runtime.setMode("direct"), /injected reload failure/);
+  assert.equal(await readFile(file, "utf8"), before);
+  assert.equal(await readFile(configFile, "utf8"), config);
+  assert.equal((await f.runtime.report()).state, "running");
+  assert.equal((await f.runtime.report()).mode, "global");
+  assert.equal(f.launches(), launches);
+  f.failReload(2);
+  await assert.rejects(f.runtime.setMode("direct"), /回滚失败/);
+  assert.equal((await f.runtime.report()).state, "error");
+});
+
+test("代理范围重载后隧道失效不能返回切换成功", async t => {
+  const f = await fakeRuntime(t, undefined, { host: true });
+  await f.runtime.importNodes([node("a")]);
+  await f.runtime.setTunnel(true);
+  f.setTunnelActive(false);
+  await assert.rejects(f.runtime.setMode("global"), /隧道未接管/);
+  const report = await f.runtime.report();
+  assert.equal(report.mode, "rule");
+  assert.equal(report.state, "error");
+  assert.equal(f.runtime.connectionState().tunCaptured, null);
+});
+
+test("未保护阻断保持系统接管并拒绝 Claude 域名", async t => {
+  const f = await fakeRuntime(t, undefined, { host: true });
+  await f.runtime.importNodes([node("a")]);
+  const before = await f.runtime.report();
+  assert.equal(before.tunEnabled, false);
+
+  await f.runtime.setUnprotectedGuard(true);
+  const blocked = await f.runtime.report();
+  assert.equal(blocked.unprotectedGuard?.active, true);
+  assert.equal(blocked.claudeBlocked, true);
+  assert.equal(blocked.tunEnabled, true, "阻断必须建立在真实的系统接管上");
+  const config = yaml(await readFile(path.join(f.dir, "net-core/config.yaml"), "utf8"));
+  for (const domain of ["anthropic.com", "claude.ai", "claude.com", "claudeusercontent.com"]) {
+    assert.ok(config.rules.includes(`DOMAIN-SUFFIX,${domain},REJECT`), `${domain} 必须被拒绝`);
+  }
+  await assert.rejects(f.runtime.setTunnel(false), /保护未开启/);
+
+  await f.runtime.setUnprotectedGuard(false);
+  const cleared = await f.runtime.report();
+  assert.equal(cleared.unprotectedGuard, null);
+  // 出口探测在测试环境不可达时可能已有区域锁；未保护阻断不得在解除后残留。
+  assert.equal(cleared.claudeBlocked, Boolean(before.regionLock?.locked));
+  assert.equal(cleared.tunEnabled, true, "解除阻断不主动关闭保护即将使用的 TUN");
+});
+
+test("未保护阻断失败时回滚接管且不声明 Claude 已被阻断", async t => {
+  const f = await fakeRuntime(t, undefined, { host: true });
+  await f.runtime.importNodes([node("a")]);
+  f.setTunnelActive(false);
+  await assert.rejects(f.runtime.setUnprotectedGuard(true), /接管/);
+  const report = await f.runtime.report();
+  assert.equal(report.unprotectedGuard, null);
+  assert.equal(report.tunEnabled, false, "建立失败不能留下半开的接管");
 });
 
 test("节点配置启动失败恢复旧文件，不能返回导入成功", async t => {

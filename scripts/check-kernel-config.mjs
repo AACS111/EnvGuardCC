@@ -35,8 +35,8 @@ test('规则模式：Claude 置顶、固定出口、strict-route、fake-ip 与�
   assert.doesNotThrow(() => assertKernelConfig(config, { egressMode: 'rule' }));
 });
 
-test('claude / direct 模式不生成兜底组，最后一条为 MATCH,DIRECT', () => {
-  for (const egressMode of ['claude', 'direct']) {
+test('direct 模式不生成兜底组，最后一条为 MATCH,DIRECT', () => {
+  for (const egressMode of ['direct']) {
     const config = build({ egressMode });
     assert.equal(config['proxy-groups'].some((group) => group.name === DEFAULT_AUTO_GROUP), false);
     assert.equal(config.rules.at(-1), 'MATCH,DIRECT');

@@ -44,6 +44,7 @@ Compare the baseline with current measurements and distinguish passed, failed, a
 - Browser and Claude client diagnostics covering timezone, language, fonts, device signals, and network exit.
 - Exit IP, region, operator, and network type identification with explicit unknown states.
 - Protection controls, scheduled checks, and per-check configuration details.
+- Claude domains are blocked while protection is off, so Claude cannot be used in an unprotected state; enable protection to use it again.
 - Before-and-after comparisons that distinguish native passes, passes after protection, failures, and unknowns.
 - Configuration backups and restoration during normal shutdown, with retained backups and errors when restoration fails.
 - Windows desktop mode, macOS source-development mode, and local web mode.

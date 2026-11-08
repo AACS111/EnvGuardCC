@@ -190,7 +190,56 @@ export function createGateway({ upstreamBase = "https://api.anthropic.com", prof
           response.writeHead(204); return response.end();
         }
         if (request.headers["x-checkcc-client"] !== "gateway-ui") return sendJson(response, 403, { error: "缺少诊断客户端标识。" });
-        if (!["/__checkcc/status", "/__checkcc/diagnostics", "/__checkcc/cloak", "/__checkcc/simulation", "/__checkcc/message-probe", "/__checkcc/browser-probe", "/__checkcc/net-core", "/__checkcc/net-core/host", "/__checkcc/net-core/import", "/__checkcc/net-core/sources", "/__checkcc/net-core/refresh", "/__checkcc/net-core/delay", "/__checkcc/net-core/exits", "/__checkcc/net-core/mode", "/__checkcc/net-core/network", "/__checkcc/net-core/verify-domain", "/__checkcc/net-core/local-proxies"].includes(pathname)) return sendJson(response, 404, { error: "未知诊断接口。" });
+        if (!["/__checkcc/status", "/__checkcc/diagnostics", "/__checkcc/cloak", "/__checkcc/simulation", "/__checkcc/message-probe", "/__checkcc/browser-probe", "/__checkcc/net-core", "/__checkcc/net-core/host", "/__checkcc/net-core/import", "/__checkcc/net-core/sources", "/__checkcc/net-core/refresh", "/__checkcc/net-core/delay", "/__checkcc/net-core/exits", "/__checkcc/net-core/mode", "/__checkcc/net-core/network", "/__checkcc/net-core/verify-domain", "/__checkcc/net-core/local-proxies", "/__checkcc/net-core/connections"].includes(pathname)) return sendJson(response, 404, { error: "未知诊断接口。" });
+        if (pathname === "/__checkcc/net-core/connections") {
+          if (!["GET", "POST"].includes(request.method)) return sendJson(response, 405, { error: "传输记录仅允许 GET/POST。" });
+          const log = netCore?.connectionLog;
+          if (request.method === "GET") {
+            const params = new URL(rawPath, "http://127.0.0.1").searchParams;
+            if (params.get("view") === "settings") return sendJson(response, 200, { ok: true, ...(log?.settings?.() ?? { scope: "all" }) });
+            const host = params.get("host") ?? "";
+            for (const key of ["claude", "viaExit"]) {
+              if (params.has(key) && !["true", "false"].includes(params.get(key))) return sendJson(response, 400, { error: "连接筛选参数无效。" });
+            }
+            for (const key of ["offset", "limit"]) {
+              if (params.has(key) && !/^\d{1,9}$/.test(params.get(key))) return sendJson(response, 400, { error: "分页参数无效。" });
+            }
+            if (host.length > 253) return sendJson(response, 400, { error: "主机筛选过长。" });
+            if (params.has("kind") && !["all", "connection", "request"].includes(params.get("kind"))) return sendJson(response, 400, { error: "记录类型无效。" });
+            if (params.has("route") && !["all", "proxied", "direct", "blocked", "unknown"].includes(params.get("route"))) return sendJson(response, 400, { error: "连接路径无效。" });
+            if (params.has("state") && !["all", "active", "ended"].includes(params.get("state"))) return sendJson(response, 400, { error: "连接状态无效。" });
+            if (params.has("at") && (!Number.isFinite(Date.parse(params.get("at"))) || Date.parse(params.get("at")) > Date.now() + 5000)) return sendJson(response, 400, { error: "回放时间无效。" });
+            if (params.has("detailId") && !/^[\w-]{1,128}$/.test(params.get("detailId"))) return sendJson(response, 400, { error: "记录标识无效。" });
+            if (params.has("format") && !["json", "csv"].includes(params.get("format"))) return sendJson(response, 400, { error: "导出格式无效。" });
+            if (!log && params.has("format")) return sendJson(response, 503, { ok: false, error: "当前后台不支持传输记录导出。" });
+            if (!log) return sendJson(response, 200, { ok: true, available: false, storageError: false, retentionHours: 48, stats: { active: 0, ended: 0, total: 0 }, total: 0, offset: 0, limit: 50, items: [], recent: [] });
+            try {
+              const query = { host, claude: params.get("claude") === "true", viaExit: params.has("viaExit") ? params.get("viaExit") === "true" : null, offset: Number(params.get("offset") || 0), limit: Number(params.get("limit") || 50), kind: params.get("kind") ?? "all", route: params.get("route") ?? "all", state: params.get("state") ?? "all", at: params.get("at"), detailId: params.get("detailId") };
+              if (params.has("format")) {
+                const format = params.get("format");
+                const body = await log.export(query, format);
+                response.writeHead(200, { "Content-Type": format === "csv" ? "text/csv; charset=utf-8" : "application/json; charset=utf-8", "Content-Disposition": `attachment; filename="envguardcc-transfer-log.${format}"`, "Cache-Control": "no-store" });
+                return response.end(body);
+              }
+              return sendJson(response, 200, { ok: true, ...await log.list(query) });
+            } catch { return sendJson(response, 500, { ok: false, error: "无法读取本机传输记录。" }); }
+          }
+          let body = "";
+          for await (const chunk of request) {
+            body += chunk;
+            if (body.length > 256) return sendJson(response, 413, { error: "请求过大。" });
+          }
+          let value;
+          try { value = JSON.parse(body); } catch { return sendJson(response, 400, { error: "无效的清空请求。" }); }
+          if (!["clear", "settings"].includes(value?.action) || (value.action === "settings" && !["all", "claude"].includes(value.scope))) return sendJson(response, 400, { error: "传输记录操作无效。" });
+          if (!log) return sendJson(response, 503, { ok: false, error: "当前后台不支持传输记录。" });
+          if (value.action === "settings") {
+            try { return sendJson(response, 200, { ok: true, ...await log.setScope(value.scope) }); }
+            catch { return sendJson(response, 500, { ok: false, error: "无法保存记录范围。" }); }
+          }
+          try { await log.clear(); return sendJson(response, 200, { ok: true, cleared: true, ...await log.list({ limit: 3 }) }); }
+          catch { return sendJson(response, 500, { ok: false, error: "无法清空本机传输记录。" }); }
+        }
         // 本地代理扫描：列出本机可借用的 FlClash / Clash Verge 等端口（只读，不改它们的设置）。
         if (pathname === "/__checkcc/net-core/local-proxies") {
           if (request.method !== "GET") return sendJson(response, 405, { error: "扫描仅允许 GET。" });
@@ -311,7 +360,7 @@ export function createGateway({ upstreamBase = "https://api.anthropic.com", prof
             return sendJson(response, 200, { ok: true, ...result, ...await kernelPayload() });
           } catch (error) { return sendJson(response, 400, { ok: false, reason: error.message, ...await kernelPayload() }); }
         }
-        // 出站模式：rule / global / claude / direct。切换后由运行时重建配置。
+        // 出站模式：rule / global / direct。切换后由运行时重建配置。
         if (pathname === "/__checkcc/net-core/mode") {
           if (request.method !== "POST") return sendJson(response, 405, { error: "出站模式仅允许 POST。" });
           if (!netCore || typeof netCore.setMode !== "function") return sendJson(response, 200, { ok: false, reason: "本次启动未接入网络内核。" });
@@ -360,7 +409,10 @@ export function createGateway({ upstreamBase = "https://api.anthropic.com", prof
           if (!names.length) return sendJson(response, 400, { error: "请提供要检测的节点名称。" });
           try {
             const exits = await netCore.probeNodeExits(names);
-            return sendJson(response, 200, { ok: true, exits, ...await kernelPayload() });
+            const probed = Object.values(exits ?? {});
+            // 全部节点都没拿到 IP 时明确说失败：只显示「未测得」会让人分不清是节点问题还是程序问题。
+            const reason = probed.length && probed.every((entry) => !entry?.ip) ? "所有节点都未返回出口 IP；请检查节点连通性或稍后重试。" : undefined;
+            return sendJson(response, 200, { ok: !reason, exits, ...(reason ? { reason } : {}), ...await kernelPayload() });
           } catch (error) { return sendJson(response, 200, { ok: false, exits: {}, reason: error.message }); }
         }
         // 订阅刷新：手动触发或按间隔自动触发；失败不影响现有节点。
@@ -572,9 +624,31 @@ export function createGateway({ upstreamBase = "https://api.anthropic.com", prof
         method: request.method, endpoint: target.pathname.startsWith("/v1/") ? target.pathname.split("/").slice(0, 3).join("/") : "other",
         profileUpdatedAt: profile?.updatedAt ?? null, status: null, elapsedMs: null, tls: null,
       };
+      // 请求日志仅来自此 HTTP 转发链；不解密 TUN 内的其他 HTTPS，也不保存 URL/query/正文。
+      const requestLog = !isSimulation ? netCore?.connectionLog : null;
+      const requestId = await requestLog?.beginRequest?.({ method: request.method, endpoint: target.pathname, host: target.hostname, port: Number(target.port || (target.protocol === "https:" ? 443 : 80)) }).catch(() => null);
+      let requestFinished = false, uploaded = 0, downloaded = 0, requestError = null;
+      let lastProgress = 0;
+      const progress = (force = false) => {
+        if (!requestId || requestFinished || (!force && Date.now() - lastProgress < 1000)) return;
+        lastProgress = Date.now();
+        void requestLog.updateRequest?.(requestId, { status: record.status, upload: uploaded, download: downloaded }).catch(() => {});
+      };
+      const finishRequest = () => {
+        if (!requestId || requestFinished) return;
+        requestFinished = true;
+        void requestLog.finishRequest(requestId, { status: record.status, upload: uploaded, download: downloaded, error: requestError }).catch(() => {});
+      };
+      if (requestId) {
+        request.on("data", chunk => { uploaded += chunk.length; progress(); });
+        response.on("finish", finishRequest);
+        response.on("close", () => { if (!response.writableFinished && !requestError) requestError = "CLIENT_ABORTED"; finishRequest(); });
+      }
       if (!isSimulation && profile && cloaked.enabled) rewrites += 1;
       const proxy = transportRequest(target, { method: request.method, headers: outbound, signal: AbortSignal.timeout(120000) }, (upstreamResponse) => {
         record.status = upstreamResponse.statusCode ?? null;
+        progress(true);
+        if (requestId) upstreamResponse.on("data", chunk => { downloaded += chunk.length; progress(); });
         record.elapsedMs = Date.now() - started;
         record.tls = target.protocol === "https:" ? { authorized: upstreamResponse.socket.authorized === true, protocol: upstreamResponse.socket.getProtocol?.() ?? null } : null;
         if (isClaudeRequest) { lastRequest = record; lastFailure = null; lastClues = extractClientClues(request.headers); }
@@ -582,16 +656,17 @@ export function createGateway({ upstreamBase = "https://api.anthropic.com", prof
         const hopHeaders = String(responseHeaders.connection ?? "").toLowerCase().split(",").map((key) => key.trim());
         for (const key of ["transfer-encoding", "connection", "keep-alive", "upgrade", "proxy-authenticate", "proxy-authorization", "te", "trailer", ...hopHeaders]) delete responseHeaders[key];
         response.writeHead(upstreamResponse.statusCode || 502, responseHeaders);
-        upstreamResponse.on("error", () => response.destroy());
+        upstreamResponse.on("error", () => { requestError = "STREAM_ERROR"; response.destroy(); });
         upstreamResponse.pipe(response);
       });
       proxy.on("error", (error) => {
+        requestError = "UPSTREAM_ERROR";
         if (isClaudeRequest) lastFailure = { at: new Date().toISOString(), error: error.code ?? "UPSTREAM_ERROR" };
         if (!response.headersSent) sendJson(response, 502, { error: `网关无法连接上游：${error.code ?? "UPSTREAM_ERROR"}` });
         else response.destroy();
       });
       request.pipe(proxy);
-      request.on("aborted", () => proxy.destroy());
+      request.on("aborted", () => { requestError = "CLIENT_ABORTED"; proxy.destroy(); finishRequest(); });
       response.on("close", () => { if (!response.writableEnded) proxy.destroy(); });
     } catch {
       if (!response.headersSent) sendJson(response, 500, { error: "网关诊断或转发失败，请稍后重试。" });

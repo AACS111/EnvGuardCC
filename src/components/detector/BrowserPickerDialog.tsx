@@ -30,8 +30,9 @@ export function BrowserPickerDialog({ locale, busy, onClose, onSaved, onLink }: 
   useEffect(() => {
     const element = dialog.current;
     if (!element) return;
+    const previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
     if (!element.open) element.showModal();
-    return () => { if (element.open) element.close(); };
+    return () => { if (element.open) element.close(); if (previousFocus?.isConnected) previousFocus.focus({ preventScroll: true }); };
   }, []);
 
   useEffect(() => {

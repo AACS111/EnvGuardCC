@@ -17,11 +17,12 @@ import { fileURLToPath } from "node:url";
 import { createNetCore } from "../net-core.mjs";
 import { findPortOwner, processCommandLine, processName } from "./ports.mjs";
 import { createFirewallGuard } from "./firewall.mjs";
+import { disableSystemIpv6, restoreSystemIpv6 } from "./system-ipv6.mjs";
 import { assertStrictKernelConfig } from "./config.mjs";
 import os from "node:os";
 
 export const HOST_TOKEN_HEADER = "x-envguardcc-host-token";
-const ACTIONS = new Set(["start", "stop", "restart", "heartbeat", "guard-status", "guard-block", "guard-activate", "guard-release"]);
+const ACTIONS = new Set(["start", "stop", "restart", "heartbeat", "guard-status", "guard-block", "guard-activate", "guard-release", "ipv6"]);
 
 function tokenMatches(expected, received) {
   if (typeof received !== "string" || !received) return false;
@@ -69,6 +70,7 @@ export function createKernelHost({ token, binary, stateDir, apiPort = 39090, hos
   const killOwner = ports.kill ?? ((pid) => { try { process.kill(pid, "SIGKILL"); return true; } catch { return false; } });
 
   let core = null;
+  let ipv6State = null;
   let closing = false;
   let leaseAt = 0;
   let leaseTimer;
@@ -107,6 +109,25 @@ export function createKernelHost({ token, binary, stateDir, apiPort = 39090, hos
     throw new Error(`已尝试结束遗留内核 ${pid}，但端口 ${apiPort} 仍被占用（${await ownerName(pid).catch(() => null) ?? "未知进程"}）。`);
   }
 
+  /** 由特权宿主执行 IPv6 系统开关：enabled=true 表示恢复系统 IPv6，false 表示关闭。 */
+  async function applyIpv6(enabled) {
+    if (enabled) {
+      const state = ipv6State;
+      ipv6State = null;
+      if (!state) return { enabled: true, changed: false };
+      try {
+        const changed = await restoreSystemIpv6(state);
+        return { enabled: true, changed, service: state.service };
+      } catch (error) {
+        ipv6State = state;
+        throw error;
+      }
+    }
+    if (ipv6State) return { enabled: false, ...ipv6State };
+    ipv6State = await disableSystemIpv6({ platform: process.platform });
+    return { enabled: false, ...ipv6State };
+  }
+
   async function start(configPath, strict = false, guardRevision = null) {
     if (!strict && firewall.status().armed) throw new Error("系统断流保护仍在生效，请先明确解除严格模式。");
     if (core) await core.stop();
@@ -138,6 +159,7 @@ export function createKernelHost({ token, binary, stateDir, apiPort = 39090, hos
     const leftover = await clearLeftoverKernel();
     if (leftover) logger(`[host] 停止时清理了遗留内核 ${leftover}。`);
     if (privateHome) { await rm(privateHome, { recursive: true, force: true }); privateHome = null; }
+    await applyIpv6(true).catch((error) => logger(`[host] 恢复 IPv6 失败：${error.message}`));
     return { running: false, clearedLeftover: leftover };
   }
 
@@ -159,7 +181,7 @@ export function createKernelHost({ token, binary, stateDir, apiPort = 39090, hos
     }
     const url = new URL(request.url ?? "/", "http://127.0.0.1");
     if (request.method === "GET" && url.pathname === "/health") {
-      send(response, 200, { ok: true, running: Boolean(core?.state().running), apiPort, requiresAdmin, guard: firewall.status(), hostProtocol: 2 });
+      send(response, 200, { ok: true, running: Boolean(core?.state().running), apiPort, requiresAdmin, guard: firewall.status(), hostProtocol: 2, capabilities: ["ipv6"] });
       return;
     }
     if (request.method !== "POST" || url.pathname !== "/kernel") {
@@ -184,6 +206,7 @@ export function createKernelHost({ token, binary, stateDir, apiPort = 39090, hos
     }
 
     try {
+      if (action === "ipv6") { send(response, 200, { ok: true, ...await applyIpv6(value.enabled === true) }); return; }
       if (action === "guard-status") { send(response, 200, { ok: true, guard: await firewall.inspect() }); return; }
       if (action === "guard-block") { send(response, 200, { ok: true, guard: await firewall.block() }); return; }
       if (action === "guard-release") { send(response, 200, { ok: true, guard: await firewall.release() }); return; }

@@ -38,7 +38,7 @@ export const LOCAL_DNS_PROXY = "ENVGUARD-LOCAL-DNS";
 export const LOCAL_DIRECT_PROXY = "ENVGUARD-LOCAL-DIRECT";
 export const DEFAULT_FAKE_IP_RANGE = "198.18.0.1/16";
 export const DEFAULT_FINAL_RULE = "MATCH,DIRECT";
-export const EGRESS_MODES = ["claude", "rule", "global", "direct"];
+export const EGRESS_MODES = ["rule", "global", "direct"];
 
 /**
  * 入口归组：节点可能共用同一个入口服务器（实测：37 个节点 = 1 个入口 IP + 22 个端口）。
@@ -139,7 +139,7 @@ export function buildKernelConfig({
   domains = CLAUDE_DOMAINS,
   extraRules = [],
   finalRule = DEFAULT_FINAL_RULE,
-  egressMode = "claude",
+  egressMode = "rule",
   dns = {},
   // 境外域名的公共 DNS：必须与出口地区一致（见 public-dns.mjs）。不传时退回 anycast DoH。
   publicDns = ANYCAST_DOH,
@@ -247,7 +247,7 @@ export function buildKernelConfig({
   // direct 模式不阻断（那就是“什么都不接管”）。
   const stunRules = blockStun && egressMode !== "direct" ? STUN_PORTS.map((port) => `AND,((NETWORK,udp),(DST-PORT,${port})),REJECT`) : [];
   if (!EGRESS_MODES.includes(egressMode)) throw new Error(`未知出站模式：${egressMode}`);
-  // 出站模式：claude=只代理 Claude；rule=海外走节点；global=全部走节点；direct=全部直连。
+  // 出站模式：rule=海外走节点；global=全部走节点；direct=除固定 Claude 出口外全部直连。
   // 规则模式：局域网 + 国内域名直连，其余（海外）统一走节点。
   // 不依赖 Geo 数据，避免首次启动卡在下 GeoSite.dat。
   const modeRules = egressMode === "rule"
@@ -255,9 +255,9 @@ export function buildKernelConfig({
     : [];
   // 显式 finalRule 仍可覆盖模式默认值（测试与特殊部署用）。
   // 兜底不直接绑 Claude 专用组：rt 类流量需要故障转移，否则单节点掉线即全断。
-  const finalFromMode = egressMode === "claude" || egressMode === "direct" ? "MATCH,DIRECT" : "MATCH," + autoGroupName;
+  const finalFromMode = egressMode === "direct" ? "MATCH,DIRECT" : "MATCH," + autoGroupName;
   const modeFinal = finalRule && finalRule !== DEFAULT_FINAL_RULE ? finalRule : finalFromMode;
-  // 只有兜底规则真的引用自动组时才生成它，避免 claude/direct 模式下多出无用的健康检查。
+  // 只有兜底规则真的引用自动组时才生成它，避免 direct 模式下多出无用的健康检查。
   const usesAutoGroup = modeFinal === "MATCH," + autoGroupName;
   // 共享入口时故障转移是空转：入口挂了全部节点一起挂，切端口没有任何冗余价值。
   const ingress = ingressSummary(nodes, { hosts });
@@ -490,7 +490,7 @@ export function assertKernelConfig(config, { groupName = DEFAULT_GROUP, domains 
     if (last !== `MATCH,${autoGroupName}`) throw new Error(`${egressMode} 模式的兜底规则必须是 MATCH,${autoGroupName}，不能绑定单个节点或 Claude 专用组。`);
     if (!autoGroup) throw new Error(`缺少自动出口组 ${autoGroupName}。`);
   }
-  if ((egressMode === "claude" || egressMode === "direct") && last !== "MATCH,DIRECT") throw new Error(`${egressMode} 模式的兜底规则必须是 MATCH,DIRECT。`);
+  if (egressMode === "direct" && last !== "MATCH,DIRECT") throw new Error(`${egressMode} 模式的兜底规则必须是 MATCH,DIRECT。`);
   const seen = new Set();
   for (const rule of rules) {
     if (seen.has(rule)) throw new Error(`重复规则：${rule}`);

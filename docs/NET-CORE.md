@@ -39,7 +39,7 @@ scripts/net-core/kernel-manifest.json 版本与各平台产物清单
 5. Claude 出口组固定 `type: select`，禁止 `url-test` —— 自动测速切换会让出口 IP 漂移。
 6. 非 Claude 流量的兜底组（`AUTO-PROXY`）必须是 `fallback` / `url-test`，带 `url` + `interval`
    健康检查，且成员覆盖**全部**节点 —— 兜底绑单节点时，节点一抖全部境外流量就 fail-closed 中断。
-7. 最后一条规则必须是 `MATCH`：rule/global 模式为 `MATCH,AUTO-PROXY`，claude/direct 模式为
+7. 最后一条规则必须是 `MATCH`：rule/global 模式为 `MATCH,AUTO-PROXY`，direct 模式为
    `MATCH,DIRECT`；且不允许重复规则。
 
 `pnpm test:netcore` 覆盖以上全部约束；运行时 `writeConfig()` 也会在写盘前调用
@@ -97,6 +97,12 @@ Reality 握手失败（实测日志 `REALITY authentication failed`），启动�
 - `probeSelectedExit()` 不再调用 `probeExitsParallel`，`check-kernel-lifecycle.cjs` 用注入的 `createCore` 计数锁定「探测不另起内核」。
 
 `probeExitsParallel` 仍保留给「按节点逐个测出口」；拿不到并行结果时退回串行（会短暂切换选中节点）。
+
+回退链路有三个必须保持的细节（否则界面只会显示「未测得」）：
+
+- TUN 开启时并行探测只试一轮（临时内核的节点连接必然被主 TUN 截获），不重复三轮超时；
+- 所有探测请求都失败时必须**抛出**，不能返回全 `null` 假装探测完成——否则串行回退永远不会执行；
+- 失败结果不写入 10 分钟出口缓存，否则「重试检测」在缓存期内会直接返回旧失败；严格模式串行回退使用带认证的混合入口。
 
 ## Claude 支持地区校验
 
@@ -185,11 +191,17 @@ src/detection/claude-regions.mjs   # 官方清单 + 判定函数（前后端共�
 
 ## 保护开关、内核与退出（三者关系必须一致）
 
-- **内核随应用启动**（`desktop/backend.mjs`），与保护开关无关；有内核就有 TUN 接管。
-- **保护开关只切 TUN，不停内核**（`Detector.toggleProtection` → `net-core action=tunnel` → `runtime.setTunnel()`）：
-  关闭保护 → 写 `tun.enable=false` 并热加载（内核继续跑，节点仍可测速/切换，本机 39080 仍可当代理）→ 再恢复环境配置。
-  这与 FlClash 一致：应用开着内核就在，开关代理只是接管与否。界面上内核停止（`state=idle`）只在「退出应用」或「手动停内核」后出现。
+- **内核随应用启动**（`desktop/backend.mjs`），与保护开关无关；有内核就有接管能力。
+- **保护关闭不等于退出接管**（`Detector.toggleProtection` → 保护会话 `stop` → `runtime.setUnprotectedGuard(true)`）：
+  关闭保护后环境配置照常恢复，但 TUN 保持接管，并在配置里把 Claude 域名加入 `REJECT`；
+  已建立的 Claude 连接会被断开。其他域名不追加拒绝规则，但系统流量仍按当前出站规则经过内核转发，不会自动退回直连。
+  开启保护时 `beforeActivate` 先调用 `setUnprotectedGuard(false)` 解除阻断，再验证隧道并应用适配。
+  这与 FlClash 的“应用开着内核就在”一致；区别是保护关闭时 Claude 被拒绝，而不是退回直连。
+  界面上内核停止（`state=idle`）只在「退出应用」或「手动停内核」后出现；停止内核会同时解除未保护阻断。
+- **阻断失败必须可见**：没有内核、无 TUN 权限或隧道未接管时，`/protection` 报告返回
+  `unprotectedBlock.error`，界面显示真实原因，不声称 Claude 已被阻断。
 - **退出即全部关闭**：`closeServices` 依次停掉订阅刷新/公共 DNS 同步定时器、网关、站点与内核；
+  退出前 `afterStop({ shutdown: true })` 解除未保护阻断并关闭 TUN，应用退出后不再保留阻断状态。
   开发服（`scripts/dev.mjs`）同样处理。
 
 ### 宿主跟丢内核时的兜底
@@ -382,21 +394,21 @@ pnpm kernel:host:uninstall  # 卸载
 $env:CHECKCC_NET_CORE_TUN="1"; pnpm dev
 ```
 
-## 出站模式（规则 / 全局 / 直连 / 仅 Claude）
+## 出站模式（规则 / 全局 / 直连）
 
 | 模式 | 行为 | 典型用途 |
 |---|---|---|
 | `rule`（默认） | 局域网 + 内置国内域名直连，**其余海外流量走 `AUTO-PROXY` 故障转移组** | 日常使用：既上网又优化环境 |
 | `global` | 内网豁免之外的非 Claude 流量走 `AUTO-PROXY` | 需要更大代理范围 |
 | `direct`（界面：其他直连） | Claude 仍走固定组，其他流量直连 | 保留固定出口并缩小代理范围 |
-| `claude` | 只代理 Claude 家族域名 | 最小化代理范围 |
 
 - Claude 家族域名在**所有模式**下都置顶走专用组，并拒绝其 QUIC（UDP/443）。
 - 非 Claude 流量在 rule/global 模式下由 `AUTO-PROXY` 兜底：单节点掉线时自动转移到下一个可用节点，
-  不再出现「一个节点挂了、国外整体没网」。claude/direct 模式不生成该组，兜底为 `MATCH,DIRECT`。
+  不再出现「一个节点挂了、国外整体没网」。direct 模式不生成该组，兜底为 `MATCH,DIRECT`。
 - 规则模式**不依赖 GeoIP/GeoSite 数据文件**：使用内置国内域名清单（`CN_DIRECT_DOMAINS`），
   因此离线可用、启动不会被"下载 GeoSite.dat"卡住。未收录的国内站点会走节点（更慢但不会泄漏）。
-- 切换模式会重建配置并重启内核；模式持久化在 `<state>/net-core-mode.json`。
+- 切换模式会重建配置并热加载，保持内核、TUN 与固定出口选择；失败时恢复原模式，模式持久化在 `<state>/net-core-mode.json`。
+- 路径示意图按内核当前连接显示“代理出口”和“直连”；代理出口合并展示 Claude 与其他国内外代理连接，计数按实际代理链汇总。数量来自真实代理链，实线与主机标签来自新鲜的连接采样，淡光点是路径示意装饰；不按“全局”配置制造流量，也不把直连等同于国内流量。短连接可能在两次采样之间结束，图中不提供累计流量或目的地国家统计。
 - 内核提供本机代理端口（默认 `127.0.0.1:39080`），可直接作为系统代理使用；TUN 模式下则自动接管。
 
 ## 内网豁免配置（界面与接口）
@@ -419,7 +431,7 @@ $env:CHECKCC_NET_CORE_TUN="1"; pnpm dev
 |---|---|---|
 | 域名识别 | `sniffer.enable` + `override-destination` + HTTP/TLS/QUIC 端口 | 必须开启且 override-destination，否则纯 IP 连接只能按 IP 分流 |
 | TLS 握手特征 | 节点级 `client-fingerprint`（默认 `chrome`） | 所有做 TLS 握手的节点（vless/vmess/trojan/hysteria*/tuic 且 `tls !== false`）必须带指纹；用户显式值优先 |
-| WebRTC 泄漏 | `AND,((NETWORK,udp),(DST-PORT,3478|5349|19302|19303)),REJECT` | rule/global/claude 模式必须存在；direct 模式不阻断 |
+| WebRTC 泄漏 | `AND,((NETWORK,udp),(DST-PORT,3478|5349|19302|19303)),REJECT` | rule/global 模式必须存在；direct 模式不阻断 |
 
 - `buildKernelConfig({ sniffer, blockStun, clientFingerprint })` 可显式关闭；关闭时
   `assertKernelConfig(config, { sniffer:false, blockStun:false, requireTlsFingerprint:false })`
@@ -444,3 +456,58 @@ $env:CHECKCC_NET_CORE_TUN="1"; pnpm dev
 - 关闭模拟保护时全部原样转发。
 
 `/__checkcc/status` 的 `headerAlignment` 给出 `{ platform, hintPlatform, major, hintMajor, aligned }`，`aligned=false` 表示声明面仍自相矛盾。
+
+
+## IPv6 能力探测与系统开关（macOS）
+
+TUN 目前只接管 IPv4；系统 IPv6 若保持开启，会绕过隧道直连，Claude 可能因此看到中国 IPv6 并拒绝登录。保护启动时按以下顺序处理：
+
+1. 用临时内核（`ipv6: true`）经当前节点请求 IPv6-only 端点（`api6.ipify.org`、`ipv6.icanhazip.com`），结果缓存 10 分钟；切换节点后重新探测。
+2. 结果写入状态接口的 `ipv6` 字段：`supported`、`node`、`checkedAt`、`reason`、`system`。
+3. **不支持/探测失败**：通过特权宿主关闭当前默认路由网卡的 IPv6；停止保护或退出应用时恢复原设置。界面显示“IPv6 能力探测未通过（原因）：已关闭系统 IPv6，Claude 走 IPv4 专线”。
+4. 宿主不可用或旧版宿主时，回退到本机 `networksetup`；仍失败则界面提示手动在系统设置中关闭当前网卡的 IPv6。
+5. **支持 IPv6** 的节点：当前版本仍关闭系统 IPv6（IPv6-in-TUN 保护尚未启用），界面明确提示；后续可在 `ipv6: true`、TUN IPv6 地址/路由、IPv6 fake-IP 全部验证通过后开启。
+
+特权宿主新增 `ipv6` 动作（`{ enabled: false }` 关闭、`{ enabled: true }` 恢复），由 root 执行 `networksetup`；宿主停止时自动恢复。该动作只在 macOS 生效，Windows 仍按平台策略处理。
+
+手动恢复 IPv6：
+
+```bash
+networksetup -setv6automatic "Wi-Fi"
+```
+
+## 传输记录
+
+网络页的「传输记录」展示经过本机内核的连接元数据。卡片显示活动数、保留期内总数和最近 3 条连接；打开后可按主机/IP、仅 Claude、是否走代理出口筛选，分页查看并展开详情，也可一键清空。
+
+- 数据只存放在本机，不会上传。卡片、弹窗顶部和详情均固定标注。
+- 每秒轮询内核 `/connections`，按连接 `id` 合并字节计数；连续两次**成功采样**未出现才标记结束。网络请求失败不当成连接已结束。
+- 仅保存 `id`、主机、目的 IP/端口、代理链、命中规则、上下行字节、开始/结束时间、是否 Claude、是否走代理出口。不会保存正文、URL query、请求头或进程路径。代理链和规则中的查询参数也会去掉。
+- 活动连接仅在内存；连接结束或内核正常停止时写入 `<state>/net-core-connections.json`。强制杀进程可能丢失尚在内存中的活动记录。
+- 已结束记录保留 48 小时；活动与结束记录合计最多 2 万条 / 5 MiB（界面简写为 5 MB）。超过限制先丢最旧，启动、采样和查询时均修剪。
+- 写入使用同目录临时文件、0600 权限与原子 rename；采样、写盘和清空串行化。清空删除记录文件并使未完成的旧采样失效；之后的新采样重新记录。
+- 结束时间取首次未观察到连接的采样时间，是估算值；短于 1 秒的连接可能完全落在两次采样之间。此功能是连接采样记录，不是逐包抓取或累计带宽计量。
+- 路径图中的代理出口连接包含 Claude 及国内外其他代理目的地，不通过域名推断目的地国家；是否走代理出口取自真实代理链，指定内网网卡仍归为直连。
+
+接口沿用本机诊断接口的 Origin、Host 与 `X-CheckCC-Client: gateway-ui` 校验：
+
+```text
+GET  /__checkcc/net-core/connections?host=example&claude=true&viaExit=true&offset=0&limit=50
+POST /__checkcc/net-core/connections  {"action":"clear"}
+```
+
+GET 返回分页 `items`、筛选后的 `total`、全量 `stats` 和最近 3 条 `recent`。`claude`、`viaExit` 可省略；每页最多 100 条。内核未启动时仍可查询保留的历史，无历史则返回正常空结果。运行时提供 `connectionLog.list/clear/snapshot`，采样器随内核启动和停止。
+
+P0、P1、P2 均已实现：
+
+- 可见页面的路径图每 4 秒刷新，每个标记对应一条真实活动连接，显示 host；每条活动连接均显示一个粒子，不做图上数量截断。默认不显示文字，悬停或键盘聚焦时显示主机信息并暂停运动以便查看；点击粒子打开单条详情。Claude 与其他代理共用同一条代理出口路径。点击“代理出口”或“直连”图标打开对应的活动连接集合，点击“代理网关”打开保留期内的已拦截记录；弹窗可切换路径与活动/已结束/全部状态，并支持查看历史。过期采样移除实际连接标记；内核运行时保留柔和的装饰光点，图下注明光效仅为路径示意。系统“减少动态效果”偏好下关闭光点动效，保留静态、可点击的实际连接标签。记录范围为仅 Claude 时图中也会标注。
+- 请求层只记录经应用 HTTP 网关转发的请求，不解密 TUN 中其他 HTTPS。记录 `method / endpoint / status / elapsedMs` 和字节、起止时间；耗时覆盖完整响应流。上游失败、客户端中断也会收尾；本地模拟请求不记录。
+- endpoint 只保留受支持的 API 路由模板，例如 `/v1/messages`、`/v1/messages/count_tokens`、`/v1/models/:id`，其他路径归为 `/other`；query、动态模型标识、正文、凭证不保存。请求没有关联到真实内核链时，出口保持“未知”，不会根据代理配置猜测为已走出口。
+- 连接与请求使用不同 `kind`，分别记录；卡片的记录条数包括两类，不代表独立 TCP 连接数。请求字节按 HTTP 正文计数，连接字节取自内核，两者不能相加当作总带宽。
+- 弹窗可导出当前筛选的完整 JSON/CSV，导出不受分页限制，直接下载至本机；CSV 处理公式前缀。导出的字段仍经过隐私白名单过滤。
+- 48 小时回放可拖动到任意秒，播放支持 1× / 60× / 600×。按连接/请求起止时间还原当时活动记录；字节是最后采样的累计值，不是那个时刻的速率，也不是数据包回放。
+- 设置 → 网络 → 传输记录可选择“全部 / 仅 Claude”；选择仅 Claude 会移除其他历史并过滤新连接，偏好保存到本机 `<state>/net-core-connection-settings.json`。清空传输记录不会重置偏好。
+
+新增查询参数：`kind=connection|request|all`、`detailId=<id>`、`at=<ISO timestamp>`、`format=json|csv`。`detailId` 独立于列表筛选和分页，以便图上连接结束或列表翻页后仍能查看同一记录。`GET ?view=settings` 读取范围；`POST {"action":"settings","scope":"all|claude"}` 保存范围。导出、回放和设置共用原有本机访问校验。
+
+路径集合使用 `route=proxied|direct|blocked|unknown|all` 与 `state=active|ended|all` 筛选，导出沿用相同条件。拦截集合按实际 `REJECT/REJECT-DROP` 代理链筛选，直连集合不会混入拦截记录。瞬间被拒绝且未出现在内核快照中的连接仍可能无法采样到。

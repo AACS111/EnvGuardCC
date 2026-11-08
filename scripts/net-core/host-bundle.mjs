@@ -7,7 +7,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 
 const execute = promisify(execFile);
-const FILES = ["scripts/net-core/host.mjs", "scripts/net-core.mjs", "scripts/net-core/config.mjs", "scripts/net-core/public-dns.mjs", "scripts/net-core/ports.mjs", "scripts/net-core/guardian.cjs", "scripts/net-core/firewall.mjs"];
+const FILES = ["scripts/net-core/host.mjs", "scripts/net-core.mjs", "scripts/net-core/config.mjs", "scripts/net-core/public-dns.mjs", "scripts/net-core/ports.mjs", "scripts/net-core/guardian.cjs", "scripts/net-core/firewall.mjs", "scripts/net-core/system-ipv6.mjs"];
 
 export function protectedHostRoot(platform = process.platform) {
   if (platform === "darwin") return "/Library/PrivilegedHelperTools/com.envguardcc.kernelhost.bundle";

@@ -25,6 +25,10 @@ export type NetCoreRouting = {
   state: "verified" | "violation" | "unknown";
   total: number; claude: number; pinned: number; direct: number;
   sampledAt?: string; group?: string;
+  /** 非 Claude 的当前连接，按内核真实代理链分类；不推断目的地国家。 */
+  traffic?: { proxied: number; direct: number; blocked: number; unknown: number };
+  /** 路径图按真实路由合并所有连接（含 Claude）。 */
+  paths?: { proxied: number; direct: number; blocked: number; unknown: number };
   violations: Array<{ host: string; chains: string[]; rule?: string | null; rulePayload?: string | null }>;
   pinnedHosts?: string[]; groups?: string[];
 };
@@ -67,8 +71,13 @@ export type NetCoreReport = {
   networkGeneration?: number; lastHealthAt?: string | null;
   capabilities?: { independentProxy: boolean; systemKillSwitch: boolean; strictTravel: boolean };
   strictMode?: boolean;
+  /** 节点 IPv6 能力探测：supported=false 时应用会关闭系统 IPv6，避免绕过 IPv4 TUN。 */
+  ipv6?: { supported: boolean | null; ip?: string | null; node: string | null; checkedAt: string | null; reason: string | null; protected?: boolean; system?: string } | null;
   /** 区域锁定：固定出口在 Claude 不支持地区时，内核直接 REJECT Claude 域名。 */
   regionLock?: { locked: boolean; type?: "region" | "network"; reason?: string | null; countryCode?: string | null; ip?: string | null; at?: string } | null;
+  /** 未保护阻断：保护关闭时仍保持 TUN 接管并拒绝 Claude 域名。 */
+  unprotectedGuard?: { active: boolean; at?: string | null; reason?: string | null } | null;
+  claudeBlocked?: boolean;
   takeover?: { phase: "idle" | "checking" | "quitting" | "waiting" | "ready" | "blocked"; closed: string[]; reason: string | null; checkedAt: string | null };
   guard?: { provider: string | null; supported: boolean; armed: boolean; phase: string; checkedAt: string | null; reason: string | null } | null;
   binary?: string; apiPort?: number;
@@ -77,11 +86,86 @@ export type NetCoreReport = {
   activeId?: string | null;
   version?: string; restarts?: number;
   routing?: NetCoreRouting;
+  connectionLog?: ConnectionLogSnapshot | null;
   source?: { mode: "url" | "content" | "manual"; url?: string; updatedAt?: string; intervalHours?: number } | null;
   localProxy?: string | null;
-  mode?: "claude" | "rule" | "global" | "direct";
+  mode?: "rule" | "global" | "direct";
   elevation?: { elevated: boolean; platform: string; instruction: string };
 };
+
+export type ConnectionRecord = {
+  kind?: "connection" | "request";
+  id: string; host: string; ip: string | null; port: number | null;
+  chains: string[]; rule: string; rulePayload: string; upload: number; download: number;
+  startedAt: string; endedAt: string | null; isClaude: boolean;
+  route: "proxied" | "direct" | "blocked" | "unknown"; viaExit: boolean | null;
+  method?: string; endpoint?: string; status?: number | null; elapsedMs?: number | null; error?: string | null;
+};
+export type ConnectionLogSnapshot = { available: boolean; sampledAt: string | null; active: ConnectionRecord[]; activeTotal: number; scope: "all" | "claude" };
+export type ConnectionsResult = {
+  ok: boolean; available: boolean; storageError: boolean; retentionHours: number;
+  stats: { active: number; ended: number; total: number }; total: number; offset: number; limit: number;
+  items: ConnectionRecord[]; recent: ConnectionRecord[];
+  sampledAt?: string | null; active?: ConnectionRecord[]; activeTotal?: number; scope?: "all" | "claude";
+  detailId?: string | null; selected?: ConnectionRecord | null; at?: string | null;
+};
+export type ConnectionRouteFilter = "all" | "proxied" | "direct" | "blocked" | "unknown";
+export type ConnectionStateFilter = "all" | "active" | "ended";
+export type ConnectionsQuery = { host?: string; claude?: boolean; viaExit?: boolean | null; offset?: number; limit?: number; kind?: "all" | "connection" | "request"; at?: string | null; detailId?: string; route?: ConnectionRouteFilter; state?: ConnectionStateFilter };
+
+function connectionParams(query: ConnectionsQuery) {
+  const params = new URLSearchParams();
+  for (const key of ['host', 'kind', 'at', 'detailId', 'route', 'state'] as const) if (query[key]) params.set(key, query[key]!);
+  if (query.claude) params.set("claude", "true");
+  if (typeof query.viaExit === "boolean") params.set("viaExit", String(query.viaExit));
+  params.set("offset", String(query.offset ?? 0));
+  params.set("limit", String(query.limit ?? 50));
+  return params;
+}
+
+export async function readConnections(query: ConnectionsQuery = {}, signal?: AbortSignal): Promise<ConnectionsResult> {
+  const params = connectionParams(query);
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  if (signal?.aborted) abort();
+  else signal?.addEventListener("abort", abort, { once: true });
+  const timeout = setTimeout(abort, 6000);
+  try {
+    const response = await fetch(`${gatewayUrl}/__checkcc/net-core/connections?${params}`, {
+      headers: { "X-CheckCC-Client": "gateway-ui" }, cache: "no-store", signal: controller.signal,
+    });
+    const value = await response.json();
+    if (!response.ok || !value.ok) throw new Error(value.error ?? `HTTP ${response.status}`);
+    return value as ConnectionsResult;
+  } finally { clearTimeout(timeout); signal?.removeEventListener("abort", abort); }
+}
+
+export async function clearConnections(): Promise<ConnectionsResult> {
+  const response = await fetch(`${gatewayUrl}/__checkcc/net-core/connections`, {
+    method: "POST", headers: { "X-CheckCC-Client": "gateway-ui", "Content-Type": "application/json" },
+    body: JSON.stringify({ action: "clear" }), cache: "no-store", signal: AbortSignal.timeout(6000),
+  });
+  const value = await response.json();
+  if (!response.ok || !value.ok) throw new Error(value.error ?? `HTTP ${response.status}`);
+  return value as ConnectionsResult;
+}
+
+export async function exportConnections(query: ConnectionsQuery, format: "json" | "csv"): Promise<Blob> {
+  const params = connectionParams(query); params.set("format", format);
+  const response = await fetch(`${gatewayUrl}/__checkcc/net-core/connections?${params}`, { headers: { "X-CheckCC-Client": "gateway-ui" }, cache: "no-store", signal: AbortSignal.timeout(15000) });
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  return response.blob();
+}
+
+export async function connectionLogSettings(scope?: "all" | "claude"): Promise<{ scope: "all" | "claude" }> {
+  const response = await fetch(`${gatewayUrl}/__checkcc/net-core/connections${scope ? '' : '?view=settings'}`, {
+    method: scope ? "POST" : "GET", headers: { "X-CheckCC-Client": "gateway-ui", "Content-Type": "application/json" },
+    ...(scope ? { body: JSON.stringify({ action: "settings", scope }) } : {}), cache: "no-store", signal: AbortSignal.timeout(6000),
+  });
+  const value = await response.json();
+  if (!response.ok || !value.ok) throw new Error(value.error ?? `HTTP ${response.status}`);
+  return value;
+}
 
 export type GatewayReport = {
   version: 1; upstream: string; platform: string; profileError: string | null;
@@ -504,9 +588,9 @@ export async function measureNetCoreDelay(names: string[], { force = false } = {
   return value as NetCoreDelayResult;
 }
 
-export type NetCoreEgressMode = "claude" | "rule" | "global" | "direct";
+export type NetCoreEgressMode = "rule" | "global" | "direct";
 
-// 切换出站模式：rule=海外走节点，global=全部走节点，claude=只代理 Claude，direct=全直连。
+// 切换出站模式：rule=海外走节点，global=全部走节点，direct=除固定 Claude 出口外全直连。
 export async function setNetCoreMode(mode: NetCoreEgressMode): Promise<{ ok: boolean; reason?: string; mode?: NetCoreEgressMode; netCore?: NetCoreReport | null }> {
   const response = await fetch(`${gatewayUrl}/__checkcc/net-core/mode`, {
     method: "POST",

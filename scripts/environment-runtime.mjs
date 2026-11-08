@@ -43,7 +43,7 @@ async function removeDocumentScript(client, identifier, sessionId) {
 }
 
 class DebugConnection {
-  pending = new Map(); listeners = new Set(); counter = 0;
+  pending = new Map(); listeners = new Set(); counter = 0; closed = false;
   constructor(write, close) { this.write = write; this.closeTransport = close; }
   receive(raw) {
     const message = JSON.parse(raw);
@@ -61,7 +61,13 @@ class DebugConnection {
       catch (error) { clearTimeout(timer); this.pending.delete(id); reject(error); }
     });
   }
-  disconnect() { for (const task of this.pending.values()) { clearTimeout(task.timer); task.reject(new Error("环境连接已关闭")); } this.pending.clear(); this.closeTransport(); }
+  disconnect() {
+    if (this.closed) return;
+    this.closed = true;
+    for (const task of this.pending.values()) { clearTimeout(task.timer); task.reject(new Error("环境连接已关闭")); }
+    this.pending.clear();
+    this.closeTransport();
+  }
 }
 
 async function unusedPort() {
@@ -105,6 +111,7 @@ async function clearStaleManaged(pidFile) {
 export class EnvironmentRuntime {
   clients = new Map(); policy = {}; loaded = false; enabled = true;
   constructor({ stateDir, browserPath, browserPathProvider, headless = false, networkProxy }) { this.stateDir = stateDir; this.browserPath = browserPath; this.browserPathProvider = browserPathProvider; this.headless = headless; this.networkProxy = networkProxy; }
+  // macOS 的浏览器清单给的是 .app bundle；直接 spawn bundle 会 EACCES。接入时解析到真正的可执行文件。
   // 受管浏览器由偏好决定：provider 优先，其次显式路径，最后才回退到默认候选。
   async managedBrowser() {
     const value = this.browserPathProvider ? await this.browserPathProvider() : (this.browserPath ?? await findBrowser());
@@ -112,6 +119,9 @@ export class EnvironmentRuntime {
     const browser = typeof value === "string" ? { id: null, path: value } : value;
     // Windows Chrome 对含空格的正斜杠程序路径解析异常，会把路径和开关当成网址。
     // 在启动边界统一为原生路径，同时覆盖清单、显式路径及 provider。
+    if (process.platform === "darwin" && browser.path.endsWith(".app")) {
+      browser.path = path.join(browser.path, "Contents", "MacOS", path.basename(browser.path, ".app"));
+    }
     return process.platform === "win32" ? { ...browser, path: path.normalize(browser.path) } : browser;
   }
   async load() {
@@ -125,6 +135,7 @@ export class EnvironmentRuntime {
     return `(() => { const u = new URL(location.href); if (u.hostname === 'claude.ai' || u.hostname.endsWith('.claude.ai') || u.origin === ${JSON.stringify(origin)} || u.protocol === 'file:') return ${install}; return null; })()`;
   }
   async launch(kind, origin) {
+    const startPage = this.headless ? "about:blank" : "https://www.google.com/";
     const profile = path.join(this.stateDir, `protected-${kind}`);
     await mkdir(profile, { recursive: true });
     // 同 profile 的旧实例会委托接管本次启动，并把命令行当成 URL 打开（会刷出一堆垃圾标签页）。
@@ -142,9 +153,10 @@ export class EnvironmentRuntime {
     const chosen = kind === "web" ? await this.managedBrowser() : null;
     // 受管实例默认是干净配置：只补一份书签，登录态/扩展/Cookie 一律不复制。
     if (chosen) { try { await seedManagedProfile({ browserId: chosen.id, profileDir: profile }); } catch { /* 书签是附加项，失败不影响接入 */ } }    // headless 走 pipe（实测稳定）；Windows 上 headful 必须走 port，因为 Chrome 自我重启时管道会断。
-    const usePortChannel = kind !== "web" || (process.platform === "win32" && !this.headless);
+    // headful 的 Chrome 可能重执行/脱离管道；macOS 的 headful 必须走固定调试端口，只有 headless 用 pipe 才稳定。
+    const usePortChannel = kind !== "web" || !this.headless;
     if (!usePortChannel) {
-      child = spawn(chosen.path, [`--user-data-dir=${profile}`, "--remote-debugging-pipe", "--no-first-run", "--no-default-browser-check", ...networkArgs, ...(this.headless ? ["--headless=new", "--disable-gpu"] : []), "about:blank"], { windowsHide: this.headless, stdio: ["ignore", "ignore", "ignore", "pipe", "pipe"] });
+      child = spawn(chosen.path, [`--user-data-dir=${profile}`, "--remote-debugging-pipe", "--no-first-run", "--no-default-browser-check", ...networkArgs, ...(this.headless ? ["--headless=new", "--disable-gpu"] : []), startPage], { windowsHide: this.headless, stdio: ["ignore", "ignore", "ignore", "pipe", "pipe"] });
       child.on("error", (error) => { spawnError = error; });
       client = new DebugConnection((text) => child.stdio[3].write(text + "\0"), () => child.stdio[3].end());
       let buffer = "";
@@ -156,7 +168,7 @@ export class EnvironmentRuntime {
       const executable = kind === "web" ? chosen.path : await findDesktop();
       // 受管实例是全新 profile：不带 --no-first-run 会打开首次运行页（Windows 上那个页面会自动下载 Chrome 安装包，
       // 表现就是每点一次接入多一个 chrome (N).exe）。桌面上启动 Claude 时这些开关无害。
-      child = spawn(executable, [`--user-data-dir=${profile}`, `--remote-debugging-port=${port}`, "--remote-debugging-address=127.0.0.1", "--no-first-run", "--no-default-browser-check", ...networkArgs, ...(this.headless ? ["--headless=new", "--disable-gpu"] : []), "about:blank"], { windowsHide: this.headless, stdio: "ignore" });
+      child = spawn(executable, [`--user-data-dir=${profile}`, `--remote-debugging-port=${port}`, "--remote-debugging-address=127.0.0.1", "--no-first-run", "--no-default-browser-check", ...networkArgs, ...(this.headless ? ["--headless=new", "--disable-gpu"] : []), startPage], { windowsHide: this.headless, stdio: "ignore" });
       child.on("error", (error) => { spawnError = error; });
       child.unref();
       let endpoint;
@@ -213,10 +225,9 @@ export class EnvironmentRuntime {
         }
         throw new Error("无法在页面首次脚本运行前安装环境保护。");
       };
-      await createPage(origin);
-      if (!this.headless) {
-        await createPage("https://claude.ai/");
-      }
+      // 只有 headless 测试实例需要本地验证页；用户可见的受管浏览器只保留启动页（Google），
+      // 不再额外打开 EnvGuardCC 本地页和 Claude 验证页。
+      if (this.headless) await createPage(origin);
     }
     return instance;
   }
@@ -251,6 +262,13 @@ export class EnvironmentRuntime {
       try {
         if (!["web", "desktop"].includes(kind)) throw new Error("不支持的执行环境");
         let existing = this.clients.get(kind);
+        // 上一次启动失败/浏览器已退出时，clients 里可能留下死实例；不清理会让后续每次重试都报“环境连接已关闭”。
+        if (existing && (existing.client.closed || existing.child.exitCode !== null)) {
+          try { existing.client.disconnect(); } catch { /* 已断开 */ }
+          await stopManagedProcess(existing.child).catch(() => {});
+          this.clients.delete(kind);
+          existing = undefined;
+        }
         const proxy = this.networkProxy === undefined ? selectedProxy() : this.networkProxy;
         if (existing && existing.networkKey !== (proxy?.url.href || null)) {
           await stopManagedProcess(existing.child);

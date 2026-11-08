@@ -157,14 +157,22 @@ test('真实内核控制器要求密钥，热加载保持原选择', { timeout: 
   } finally { await core.stop(); await fs.rm(directory, {recursive:true,force:true}); }
 });
 
-test('固定出口探测使用明确节点，不借普通流量组的出口冒充', { timeout:30000 }, async t => {
+test('真实内核保持固定出口，并采样国内网站的代理连接与结束字节', { timeout:30000 }, async t => {
   try { await fs.access(binary); } catch { t.skip('当前平台未准备内核'); return; }
   const http = require('node:http');
   const { createKernelRuntime } = await import('./net-core/runtime.mjs');
   const { fetchTextViaProxy } = await import('./net-core/subscription.mjs');
   async function proxy(ip, countryCode) {
     const body = JSON.stringify({ip,country_code:countryCode,success:true});
-    const server = http.createServer((_, response) => response.end(body));
+    const finishTransfers = new Set();
+    const server = http.createServer((request, response) => {
+      if (request.url.includes('/connection-log-fixture')) {
+        response.writeHead(200, { 'Content-Type': 'text/plain' });
+        response.write('x'.repeat(2048));
+        finishTransfers.add(() => response.end());
+      } else response.end(body);
+    });
+    server.finishTransfers = () => { for (const finish of finishTransfers) finish(); finishTransfers.clear(); };
     const sockets = new Set();
     server.on('connection', socket => { sockets.add(socket); socket.once('close', () => sockets.delete(socket)); });
     server.destroyConnections = () => { for (const socket of sockets) socket.destroy(); };
@@ -175,7 +183,10 @@ test('固定出口探测使用明确节点，不借普通流量组的出口冒�
         received += chunk.toString();
         if (received.includes('\r\n\r\n')) {
           socket.removeListener('data', respond);
-          socket.end(`HTTP/1.1 200 OK\r\nContent-Length: ${Buffer.byteLength(body)}\r\nConnection: close\r\n\r\n${body}`);
+          if (received.includes('/connection-log-fixture')) {
+            socket.write(`HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n800\r\n${'x'.repeat(2048)}\r\n`);
+            finishTransfers.add(() => socket.end('0\r\n\r\n'));
+          } else socket.end(`HTTP/1.1 200 OK\r\nContent-Length: ${Buffer.byteLength(body)}\r\nConnection: close\r\n\r\n${body}`);
         }
       };
       socket.on('data', respond);
@@ -193,8 +204,9 @@ test('固定出口探测使用明确节点，不借普通流量组的出口冒�
   const endpoint = 'http://203.0.113.77/';
   // 固定出口探测必须复用主内核（FlClash 式入站），不能为了一次探测再起临时内核。
   let cores = 0;
+  let mainCore;
   const { createNetCore } = await import('./net-core.mjs');
-  const runtime = await createKernelRuntime({stateDir:directory, createCore: (...args) => { cores += 1; return createNetCore(...args); }, env:{
+  const runtime = await createKernelRuntime({stateDir:directory, createCore: (...args) => { cores += 1; mainCore = createNetCore(...args); return mainCore; }, env:{
     CHECKCC_NET_CORE_BINARY:binary,CHECKCC_NET_CORE_TUN:'0',CHECKCC_NET_CORE_DNS:'https://192.0.2.53/dns-query',
     CHECKCC_NET_CORE_API_PORT:String(apiPort),CHECKCC_NET_CORE_MIXED_PORT:String(mixedPort),CHECKCC_NET_CORE_EXIT_PROBE_URL:endpoint,
   }});
@@ -209,9 +221,143 @@ test('固定出口探测使用明确节点，不借普通流量组的出口冒�
     assert.equal(selected.countryCode,'KR');
     assert.equal(cores, 1, '固定出口探测不得另起临时内核');
     assert.equal((await runtime.report()).selected,'b');
+    const pid = mainCore.state().pid;
+    for (const mode of ['global', 'direct', 'rule']) {
+      await runtime.setMode(mode);
+      const report = await runtime.report();
+      assert.equal(report.state, 'running');
+      assert.equal(report.mode, mode);
+      assert.equal(report.selected, 'b');
+      assert.equal(mainCore.state().pid, pid, '代理范围切换不能重启真实内核');
+      assert.equal(cores, 1);
+      const exit = await runtime.probeSelectedExit();
+      assert.equal(exit.ip, '203.0.113.2', '所有模式都应保留固定出口');
+      const rules = await mainCore.request('/rules');
+      assert.equal(rules.rules.at(-1).proxy, mode === 'direct' ? 'DIRECT' : 'AUTO-PROXY');
+    }
+    await runtime.setMode('global');
+    // 内核 DNS 也只用隔离测试数据，不访问真实国内站点或公共 DNS。
+    const { parse, stringify } = await import('yaml');
+    const localConfig = parse(await fs.readFile(path.join(directory, 'net-core/config.yaml'), 'utf8'));
+    localConfig.hosts = { ...localConfig.hosts, 'www.baidu.com': '203.0.113.78' };
+    await mainCore.reload(stringify(localConfig));
+    const transfer = fetchTextViaProxy('http://www.baidu.com/connection-log-fixture', { proxy: `http://127.0.0.1:${mixedPort}`, timeoutMs: 10000 });
+    void transfer.catch(() => {});
+    let observed;
+    for (let i = 0; i < 40; i++) {
+      await runtime.connectionLog.tick();
+      observed = (await runtime.connectionLog.list({ host: 'www.baidu.com' })).items[0];
+      if (observed?.download >= 2048) break;
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
+    assert.ok(observed, '真实国内网站连接应进入传输记录');
+    assert.equal(observed.viaExit, true);
+    assert.equal(observed.endedAt, null);
+    assert.ok(observed.download >= 2048);
+    for (const server of [a, b]) server.finishTransfers();
+    assert.equal((await transfer).length, 2048);
+    // 等内核释放结束的套接字，再用两个成功快照确认收尾。
+    for (let i = 0; i < 40; i++) {
+      await runtime.connectionLog.tick();
+      const record = (await runtime.connectionLog.list({ host: 'www.baidu.com' })).items[0];
+      if (record?.endedAt) { observed = record; break; }
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
+    assert.ok(observed.endedAt);
+    assert.ok(observed.upload > 0);
+    const persisted = JSON.parse(await fs.readFile(path.join(directory, 'net-core-connections.json'), 'utf8'));
+    assert.ok(persisted.records.some(record => record.id === observed.id && record.endedAt));
   } finally {
     await runtime.stop();
     for(const server of [a,b]) await new Promise(resolve=>{server.destroyConnections();server.closeAllConnections();server.close(resolve);});
     await fs.rm(directory,{recursive:true,force:true});
+  }
+});
+
+test('临时内核探测全部失败时退回串行，逐节点返回真实出口', { timeout: 30000 }, async t => {
+  try { await fs.access(binary); } catch { t.skip('当前平台未准备内核'); return; }
+  const http = require('node:http');
+  const { createKernelRuntime } = await import('./net-core/runtime.mjs');
+  const { createNetCore } = await import('./net-core.mjs');
+  // 假出口节点：主内核经它访问探测地址时返回固定 IP。
+  async function exitProxy(ip) {
+    const body = JSON.stringify({ ip, country_code: 'KR', success: true });
+    const server = http.createServer((_, response) => response.end(body));
+    const sockets = new Set();
+    server.on('connection', socket => { sockets.add(socket); socket.once('close', () => sockets.delete(socket)); });
+    server.destroyConnections = () => { for (const socket of sockets) socket.destroy(); };
+    server.on('connect', (_, socket, head) => {
+      socket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+      // CONNECT 的 head 可能已带完整请求；必须等隧道内的请求到达再回应，否则连接会被提前关掉。
+      let received = head.toString();
+      const respond = chunk => {
+        received += chunk.toString();
+        if (!received.includes('\r\n\r\n')) return;
+        socket.removeListener('data', respond);
+        socket.end(`HTTP/1.1 200 OK\r\nContent-Length: ${Buffer.byteLength(body)}\r\nConnection: close\r\n\r\n${body}`);
+      };
+      socket.on('data', respond);
+      socket.on('error', () => {});
+      socket.setTimeout(5000, () => socket.destroy());
+      respond(Buffer.alloc(0));
+    });
+    await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+    return server;
+  }
+  const a = await exitProxy('203.0.113.1'), b = await exitProxy('203.0.113.2');
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'checkcc-probe-fallback-'));
+  const apiPort = await freePort(), mixedPort = await freePort();
+  const endpoint = 'http://203.0.113.77/';
+  let cores = 0, mainCore;
+  /*
+   * 模拟 TUN 下的真实故障：临时内核能启动、入站端口也可连，但经它出去必然失败。
+   * 旧实现会把「全部失败」当成完成并返回全 null，串行回退永远不会执行。
+   */
+  function fakeProbeCore(options) {
+    let running = false;
+    const servers = [], sockets = new Set();
+    const stop = async () => {
+      running = false;
+      for (const socket of sockets) socket.destroy();
+      await Promise.all(servers.splice(0).map(server => new Promise(resolve => server.close(resolve))));
+    };
+    return {
+      state: () => ({ running }),
+      async start() {
+        const text = await fs.readFile(options.configPath, 'utf8');
+        const section = text.split(/^listeners:/m)[1]?.split(/^\S/m)[0] ?? '';
+        const ports = [...section.matchAll(/^\s+port:\s*(\d+)/gm)].map(match => Number(match[1]));
+        assert.ok(ports.length, '探测配置必须包含入站端口');
+        await Promise.all(ports.map(port => new Promise((resolve, reject) => {
+          const server = net.createServer(socket => { sockets.add(socket); socket.once('close', () => sockets.delete(socket)); socket.destroy(); });
+          server.once('error', reject);
+          server.listen(port, '127.0.0.1', () => { servers.push(server); resolve(); });
+        })));
+        running = true;
+      },
+      stop,
+    };
+  }
+  const runtime = await createKernelRuntime({ stateDir: directory, createCore: options => {
+    if (options?.apiPort === apiPort) { cores += 1; mainCore = createNetCore(options); return mainCore; }
+    return fakeProbeCore(options);
+  }, env: {
+    CHECKCC_NET_CORE_BINARY: binary, CHECKCC_NET_CORE_TUN: '0', CHECKCC_NET_CORE_DNS: 'https://192.0.2.53/dns-query',
+    CHECKCC_NET_CORE_API_PORT: String(apiPort), CHECKCC_NET_CORE_MIXED_PORT: String(mixedPort), CHECKCC_NET_CORE_EXIT_PROBE_URL: endpoint,
+  } });
+  try {
+    await runtime.importNodes([
+      { name: 'a', type: 'http', server: '127.0.0.1', port: a.address().port },
+      { name: 'b', type: 'http', server: '127.0.0.1', port: b.address().port },
+    ], { selected: 'b' });
+    const exits = await runtime.probeNodeExits(['a', 'b']);
+    assert.equal(exits.a?.ip, '203.0.113.1', '并行失败后必须退回串行并测到节点 a 的真实出口');
+    assert.equal(exits.b?.ip, '203.0.113.2');
+    assert.equal(cores, 1, '串行回退不得影响主内核');
+    assert.equal((await runtime.report()).selected, 'b', '探测后必须还原选中节点');
+  } finally {
+    await runtime.stop();
+    for (const server of [a, b]) await new Promise(resolve => { server.destroyConnections(); server.closeAllConnections(); server.close(resolve); });
+    await fs.rm(directory, { recursive: true, force: true });
   }
 });

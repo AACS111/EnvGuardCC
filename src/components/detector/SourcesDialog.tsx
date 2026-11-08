@@ -79,8 +79,9 @@ export function SourcesDialog({ locale, initialView = "list", sources, activeId,
   useEffect(() => {
     const element = dialog.current;
     if (!element) return;
+    const previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
     if (!element.open) element.showModal();
-    return () => { if (element.open) element.close(); };
+    return () => { if (element.open) element.close(); if (previousFocus?.isConnected) previousFocus.focus({ preventScroll: true }); };
   }, []);
 
   // 只清表单字段：错误/提示由调用方决定何时清，避免「操作成功」的提示被返回列表时抹掉。

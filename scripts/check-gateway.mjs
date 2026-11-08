@@ -548,3 +548,121 @@ test("声明面：UA 与 Client Hints 只归一化矛盾，不伪造平台也不
   // 诊断事实：UA 与 hints 矛盾时必须报 aligned=false。
   assert.equal(headerConsistency({ "user-agent": winUa, "sec-ch-ua-platform": '"macOS"' }).aligned, false);
 });
+
+test('传输记录接口只允许本机 UI，支持分页/筛选与显式清空，未启动内核返回空记录', async () => {
+  const { createConnectionLog } = await import('./net-core/connection-log.mjs');
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'checkcc-connection-api-'));
+  const log = await createConnectionLog({ stateDir: directory });
+  await log.sample([
+    { id: 'claude', metadata: { host: 'api.anthropic.com', destinationIP: '203.0.113.1', destinationPort: 443, processPath: 'SECRET_PATH' }, chains: ['node', 'CLAUDE-PIN'], upload: 123, download: 456 },
+    { id: 'domestic', metadata: { host: 'www.baidu.com' }, chains: ['node', 'AUTO-PROXY'] },
+    { id: 'direct', metadata: { host: 'local.example' }, chains: ['DIRECT'] },
+    { id: 'blocked', metadata: { host: 'blocked.example' }, chains: ['REJECT'] },
+  ]);
+  const server = createGateway({ netCore: { connectionLog: log }, collect: async () => ({}) });
+  const url = await listen(server);
+  const route = url + '/__checkcc/net-core/connections';
+  try {
+    assert.equal((await fetch(route)).status, 403);
+    assert.equal((await fetch(route, { headers: { ...ui, Origin: 'https://untrusted.example' } })).status, 403);
+    assert.equal((await fetch(route, { method: 'DELETE', headers: ui })).status, 405);
+    for (const query of ['?viaExit=maybe', '?offset=-1', '?limit=bad', '?claude=maybe']) assert.equal((await fetch(route + query, { headers: ui })).status, 400);
+    const filtered = await (await fetch(route + '?claude=true&viaExit=true&host=anthropic&limit=1', { headers: ui })).json();
+    assert.equal(filtered.total, 1); assert.equal(filtered.stats.total, 4);
+    assert.equal(filtered.items[0].download, 456);
+    assert.doesNotMatch(JSON.stringify(filtered), /SECRET_PATH|processPath/);
+    for (const value of ['proxied','direct','blocked']) {
+      const collection = await (await fetch(route + '?route=' + value + '&state=active&kind=connection', { headers: ui })).json();
+      assert.ok(collection.items.length > 0);
+      assert.ok(collection.items.every(record => record.route === value && !record.endedAt));
+    }
+    for (const query of ['?route=invalid','?state=invalid']) assert.equal((await fetch(route + query,{headers:ui})).status,400);
+    const page = await (await fetch(route + '?limit=1&offset=1', { headers: ui })).json();
+    assert.equal(page.items.length, 1); assert.equal(page.offset, 1);
+    const invalid = await fetch(route, { method: 'POST', headers: ui, body: '{}' });
+    assert.equal(invalid.status, 400);
+    assert.equal((await log.list()).total, 4);
+    await log.stop();
+    const result = await (await fetch(route, { method: 'POST', headers: { ...ui, 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'clear' }) })).json();
+    assert.equal(result.cleared, true); assert.equal(result.total, 0);
+    await assert.rejects(readFile(path.join(directory, 'net-core-connections.json')), { code: 'ENOENT' });
+  } finally { await log.stop(); await close(server); await rm(directory, { recursive: true, force: true }); }
+  const emptyServer = createGateway({ collect: async () => ({}) });
+  const emptyUrl = await listen(emptyServer);
+  try {
+    const empty = await (await fetch(emptyUrl + '/__checkcc/net-core/connections', { headers: ui })).json();
+    assert.equal(empty.ok, true); assert.equal(empty.available, false); assert.deepEqual(empty.items, []);
+  } finally { await close(emptyServer); }
+});
+
+test('真实 HTTP 网关保存请求状态/耗时与计数字节，导出与回放不泄露 query/正文，记录范围可保存', async () => {
+  const { createConnectionLog } = await import('./net-core/connection-log.mjs');
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'checkcc-request-log-'));
+  const log = await createConnectionLog({ stateDir: directory });
+  const upstream = http.createServer((request, response) => {
+    request.resume();
+    request.on('end', () => { response.writeHead(201, { 'Content-Type': 'application/json' }); response.end('{"result":"SECRET_RESPONSE"}'); });
+  });
+  const base = await listen(upstream);
+  const server = createGateway({ upstreamBase: base, profileFile: path.join(directory, 'missing-profile.json'), netCore: { connectionLog: log }, collect: async () => ({}) });
+  const url = await listen(server);
+  const route = url + '/__checkcc/net-core/connections';
+  try {
+    const forwarded = await fetch(url + '/v1/messages?token=SECRET_QUERY', { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: 'Bearer SECRET_AUTH' }, body: '{"message":"SECRET_BODY"}' });
+    assert.equal(forwarded.status, 201); await forwarded.text();
+    const listed = await (await fetch(route + '?kind=request', { headers: ui })).json();
+    assert.equal(listed.total, 1);
+    const record = listed.items[0];
+    assert.equal(record.method, 'POST'); assert.equal(record.endpoint, '/v1/messages'); assert.equal(record.status, 201);
+    assert.ok(record.endedAt); assert.ok(record.elapsedMs >= 0); assert.ok(record.upload > 0); assert.ok(record.download > 0);
+    assert.equal(record.viaExit, null, '请求层不能冒充已验证内核代理链');
+    assert.doesNotMatch(JSON.stringify(listed), /SECRET_|Authorization|authorization/);
+    const detail = await (await fetch(route + '?host=absent&detailId=' + record.id, { headers: ui })).json();
+    assert.equal(detail.total, 0); assert.equal(detail.selected.id, record.id);
+    const replay = await (await fetch(route + '?at=' + encodeURIComponent(record.startedAt), { headers: ui })).json();
+    assert.equal(replay.total, 1);
+    const exported = await fetch(route + '?format=csv&limit=1&kind=request', { headers: ui });
+    assert.match(exported.headers.get('content-type'), /text\/csv/);
+    assert.match(exported.headers.get('content-disposition'), /attachment/);
+    const csv = await exported.text(); assert.match(csv, /\/v1\/messages/); assert.doesNotMatch(csv, /SECRET_/);
+    const json = await (await fetch(route + '?format=json', { headers: ui })).json();
+    assert.equal(json.records.length, 1); assert.doesNotMatch(JSON.stringify(json), /SECRET_/);
+    const settings = await (await fetch(route, { method: 'POST', headers: { ...ui, 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'settings', scope: 'claude' }) })).json();
+    assert.equal(settings.scope, 'claude');
+    assert.equal((await (await fetch(route + '?view=settings', { headers: ui })).json()).scope, 'claude');
+    for (const query of ['?kind=bad', '?format=html', '?at=bad', '?detailId=../private']) assert.equal((await fetch(route + query, { headers: ui })).status, 400);
+    assert.equal((await fetch(route, { method: 'POST', headers: ui, body: '{"action":"settings","scope":"invalid"}' })).status, 400);
+  } finally { await close(server); await close(upstream); await log.stop(); await rm(directory, { recursive: true, force: true }); }
+});
+
+test('上游连接失败和客户端中断也会结束请求记录，错误不含敏感 URL', async () => {
+  const { createConnectionLog } = await import('./net-core/connection-log.mjs');
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'checkcc-aborted-log-'));
+  const log = await createConnectionLog({ stateDir: directory });
+  const probeServer = http.createServer(); const closedBase = await listen(probeServer); await close(probeServer);
+  const server = createGateway({ upstreamBase: closedBase, profileFile: path.join(directory, 'missing.json'), netCore: { connectionLog: log } });
+  const url = await listen(server);
+  try {
+    const response = await fetch(url + '/v1/messages?token=SECRET', { method: 'POST', body: 'SECRET_BODY' });
+    assert.equal(response.status, 502); await response.text();
+    const record = (await log.list({ kind: 'request' })).items[0];
+    assert.equal(record.error, 'UPSTREAM_ERROR'); assert.equal(record.status, null); assert.ok(record.endedAt);
+    assert.doesNotMatch(await log.export(), /SECRET/);
+  } finally { await close(server); }
+  const streaming = http.createServer((request, response) => { request.resume(); response.writeHead(200); response.write('streaming'); });
+  const upstream = await listen(streaming);
+  const next = createGateway({ upstreamBase: upstream, profileFile: path.join(directory, 'missing.json'), netCore: { connectionLog: log } });
+  const nextUrl = await listen(next);
+  try {
+    const controller = new AbortController();
+    const response = await fetch(nextUrl + '/v1/messages', { method: 'POST', body: '{}', signal: controller.signal });
+    await response.body.getReader().read(); controller.abort();
+    let record;
+    for (let i = 0; i < 30; i++) {
+      record = (await log.list({ kind: 'request' })).items.find(item => item.status === 200);
+      if (record?.endedAt) break;
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    assert.equal(record.error, 'CLIENT_ABORTED'); assert.ok(record.endedAt);
+  } finally { await close(next); await close(streaming); await log.stop(); await rm(directory, { recursive: true, force: true }); }
+});

@@ -6,7 +6,7 @@
 //   - 导入节点后必须重建配置并重启内核，否则界面会显示旧节点；
 //   - 导入失败不覆盖已有节点配置。
 
-import { access, mkdir, readFile, writeFile, rename, rm } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, writeFile, rename, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { randomBytes } from "node:crypto";
@@ -21,6 +21,7 @@ import { findPortOwner } from "./ports.mjs";
 import { loadVerifiedNodeHosts, resolveNodeHosts } from "./node-dns.mjs";
 import { createNetCore } from "../net-core.mjs";
 import { createNetworkTakeover } from "./takeover.mjs";
+import { createConnectionLog } from "./connection-log.mjs";
 import { assertClaudeSupportedExit, claudeRegionSupport } from "../../src/detection/claude-regions.mjs";
 import { isHostingExit } from "../../src/detection/exit-quality.mjs";
 import { disableSystemIpv6, restoreSystemIpv6 } from "./system-ipv6.mjs";
@@ -271,13 +272,14 @@ export async function createKernelRuntime({ stateDir, env = process.env, root, l
   // 生命周期内共享给配置与控制器；不放进 report、环境变量或日志。
   const controllerSecret = randomBytes(32).toString("hex");
   // 本机代理端口：内核启动后对外提供 HTTP/SOCKS 混合代理，不再依赖 FlClash 之类的系统代理。
-  // 出站模式：rule=海外走节点（默认），global=全部走节点，claude=只代理 Claude，direct=全直连。
+  // 出站模式：rule=海外走节点（默认），global=全部走节点，direct=除固定 Claude 出口外全直连。
   const modeFile = path.join(stateDir, "net-core-mode.json");
   let egressMode = env.CHECKCC_NET_CORE_MODE || null;
   if (!egressMode) {
     try { egressMode = JSON.parse(await readFile(modeFile, "utf8"))?.mode ?? null; } catch { /* 首次运行没有存档 */ }
   }
-  egressMode = ["claude", "rule", "global", "direct"].includes(egressMode) ? egressMode : "rule";
+  // 旧版本可能保存过已移除的「仅 Claude」模式：统一迁移到 rule。
+  egressMode = ["rule", "global", "direct"].includes(egressMode) ? egressMode : "rule";
   const mixedPort = Number(env.CHECKCC_NET_CORE_MIXED_PORT || 39080);
   // 固定出口探测：在主内核里给探测主机加一条钉死专用组的路由，探测走已有的混合入口，
   // 由主内核自己的 dialer 拨号（TUN 下已绑定物理网卡），不再另起临时内核。
@@ -318,12 +320,17 @@ export async function createKernelRuntime({ stateDir, env = process.env, root, l
   // 区域锁定只保留在本次运行内：出口落回 Claude 不支持地区后，配置里直接 REJECT
   // Claude 域名。应用彻底退出时不留下任何锁定状态，下次启动按当前出口重新检测。
   let regionLock = null;
+  // 未保护阻断：保护关闭时仍保持 TUN 接管，只对 Claude 域名 REJECT。
+  // 与区域锁不同，它不是网络故障状态，只能由「开启保护」显式解除。
+  let unprotectedLock = null;
+  const claudeBlocked = () => Boolean(regionLock || unprotectedLock);
   // 关闭保护只关 TUN（内核继续跑，节点延迟/切换仍然可用）；显式 null 表示跟随默认。
   let tunOverride = null;
   const configPath = path.join(stateDir, "net-core", "config.yaml");
   const homeDir = path.join(stateDir, "net-core");
   let core = null;
-  let ipv6State = null;
+  let ipv6Guard = null;
+  let ipv6Probe = null;
   let hostHeartbeat = null;
   let lastError = null;
   let operation = Promise.resolve();
@@ -336,6 +343,10 @@ export async function createKernelRuntime({ stateDir, env = process.env, root, l
   let networkKey = "";
   let lastHealthAt = null;
   let lastTunnelCaptured = null;
+  const connectionLog = await createConnectionLog({ stateDir, logger,
+    readConnections: () => core?.state().running ? core.request("/connections") : null,
+  });
+  const stopConnectionLog = () => connectionLog.stop().catch(() => logger("[connection-log] 传输记录保存失败；不影响内核停止。"));
   function connectionState() {
     const fresh = lastHealthAt && Date.now() - Date.parse(lastHealthAt) < 15000;
     const guardFresh = hostGuard?.armed === true && Date.now() - Date.parse(hostGuard.checkedAt ?? "") < 15000;
@@ -345,6 +356,7 @@ export async function createKernelRuntime({ stateDir, env = process.env, root, l
       reason: regionLock?.reason || lastError || (state === "verified" ? null : state === "proxy" ? "本机代理运行中，但未接管系统流量。" : "系统隧道尚未验证或证据已过期。"),
       systemKillSwitch: Boolean(guardFresh), strictTravel: Boolean(strictEnabled && guardFresh && state === "verified"), strictEnabled,
       regionLocked: Boolean(regionLock), regionLock: regionLock ? { ...regionLock } : null,
+      claudeBlocked: claudeBlocked(), unprotectedGuard: unprotectedLock ? { ...unprotectedLock } : null,
     };
   }
   const serialize = (action, mutating = true) => (...args) => {
@@ -385,7 +397,7 @@ export async function createKernelRuntime({ stateDir, env = process.env, root, l
       lastTunnelCaptured = null;
       if (strictEnabled) await hostAction("guard-block");
       // 网络接口变化（Wi-Fi/有线切换、断网重连）时先阻断 Claude，验证通过后再自动放行。
-      if (tunEnabled && !regionLock) await lockRegion(null, { type: "network", reason: "网络接口变化，Claude 流量已暂时阻断；网络恢复并复检通过后自动解除。" });
+      if (tunEnabled && !regionLock && !unprotectedLock) await lockRegion(null, { type: "network", reason: "网络接口变化，Claude 流量已暂时阻断；网络恢复并复检通过后自动解除。" });
     }
     try {
       if (strictEnabled) {
@@ -406,7 +418,7 @@ export async function createKernelRuntime({ stateDir, env = process.env, root, l
           if (exit.ip !== strictBaselineIp) { await hostAction("guard-block"); throw new Error("固定出口 IP 已变化，需要关闭严格模式后明确确认新出口。"); }
           if (claudeRegionSupport(exit.countryCode) !== "supported" && !regionLock) await lockRegion(exit);
         }
-      } else if (tunEnabled && Date.now() - lastExitCheck > 30000) {
+      } else if (tunEnabled && !unprotectedLock && Date.now() - lastExitCheck > 30000) {
         // 非严格模式也要盯住出口：故障转移/网络波动都可能把出口换到封禁地区或无法验证。
         lastExitCheck = Date.now();
         const exit = await probeSelectedExit().catch((error) => { logger(`[net-core] 出口复检失败：${error.message}`); return null; });
@@ -423,7 +435,8 @@ export async function createKernelRuntime({ stateDir, env = process.env, root, l
       await core.status();
       lastTunnelCaptured = tunEnabled ? (await core.tunnelStatus()).active : null;
       if (tunEnabled && !lastTunnelCaptured) {
-        await lockRegion(null, { type: "network", reason: "隧道接管失效，Claude 流量已阻断，等待恢复。" });
+        // 未保护阻断已开启时不再叠加区域锁：两条规则都拦 Claude，错误原因会互相覆盖。
+        if (!unprotectedLock) await lockRegion(null, { type: "network", reason: "隧道接管失效，Claude 流量已阻断，等待恢复。" });
         throw new Error("隧道接管失效。");
       }
       lastHealthAt = new Date().toISOString();
@@ -562,23 +575,23 @@ export async function createKernelRuntime({ stateDir, env = process.env, root, l
         // 订阅域名直连：机场按来源 IP 放行，走节点会被 403。放在 MATCH 之前即可生效。
         ...directHosts.map((host) => `DOMAIN-SUFFIX,${host},DIRECT`),
       ],
-      blockClaude: Boolean(regionLock),
+      blockClaude: claudeBlocked(),
     });
     // 生成即校验：配置一旦不再满足置顶/select/故障转移的不变量，就在这里拒绝启动，
     // 而不是让内核带着“兜底单节点”跑起来、等节点掉线才暴露成境外全断。
-    assertKernelConfig(config, { egressMode, strictRoute: localNetwork.strictRoute ?? true, blockClaude: Boolean(regionLock) });
+    assertKernelConfig(config, { egressMode, strictRoute: localNetwork.strictRoute ?? true, blockClaude: claudeBlocked() });
     // 开发者默认不接管系统路由；显式设置 CHECKCC_NET_CORE_TUN=1 才启用。
     config.tun.enable = tunEnabled;
-    const effective = strictEnabled ? strictKernelConfig(config, { blockClaude: Boolean(regionLock) }) : config;
+    const effective = strictEnabled ? strictKernelConfig(config, { blockClaude: claudeBlocked() }) : config;
     await mkdir(homeDir, { recursive: true });
     await writeFile(configPath, serializeKernelConfig(effective), { mode: 0o600 });
   }
 
-  async function hostAction(action) {
+  async function hostAction(action, extra = {}) {
     const response = await (fetchImpl ?? globalThis.fetch)(`${hostUrl}/kernel`, {
       method: "POST",
       headers: { "Content-Type": "application/json", "X-EnvGuardCC-Host-Token": hostToken },
-      body: JSON.stringify({ action, configPath, strict: strictEnabled, guardRevision: hostGuard?.releaseId ?? null }),
+      body: JSON.stringify({ action, configPath, strict: strictEnabled, guardRevision: hostGuard?.releaseId ?? null, ...extra }),
       signal: AbortSignal.timeout(30000),
     });
     const value = await response.json().catch(() => null);
@@ -596,24 +609,95 @@ export async function createKernelRuntime({ stateDir, env = process.env, root, l
 
   // TUN 只接管 IPv4：开启接管时关闭系统 IPv6，避免 IPv6 直连泄漏；停止/退出时恢复。
   async function enableIpv6Guard() {
-    if (ipv6State || !tunEnabled || !hostMode) return;
+    if (ipv6Guard || !tunEnabled) return;
+    if (hostMode) {
+      try {
+        await hostAction("ipv6", { enabled: false });
+        ipv6Guard = { mode: "host" };
+        logger("[net-core] 已通过特权宿主关闭系统 IPv6，避免绕过隧道。");
+        return;
+      } catch (error) {
+        logger(`[net-core] 宿主关闭 IPv6 失败（${error.message}），尝试本机权限。`);
+      }
+    }
     try {
-      ipv6State = await systemIpv6.disable({ platform });
-      if (ipv6State?.changed) logger(`[net-core] 已关闭系统 IPv6（${ipv6State.service}，原 ${ipv6State.previous}），避免绕过隧道。`);
-      else if (ipv6State?.reason) logger(`[net-core] 系统 IPv6 未变更：${ipv6State.reason}`);
+      const state = await systemIpv6.disable({ platform });
+      if (state?.changed) { ipv6Guard = { mode: "local", state }; logger(`[net-core] 已关闭系统 IPv6（${state.service}，原 ${state.previous}）。`); }
+      else if (state?.reason) logger(`[net-core] 系统 IPv6 未变更：${state.reason}`);
     } catch (error) {
-      ipv6State = null;
+      ipv6Guard = null;
       logger(`[net-core] 关闭系统 IPv6 失败：${error.message}`);
     }
   }
   async function restoreIpv6Guard() {
-    if (!ipv6State) return;
-    const state = ipv6State;
-    ipv6State = null;
+    const guard = ipv6Guard;
+    ipv6Guard = null;
+    if (!guard) return;
     try {
-      if (await systemIpv6.restore(state)) logger("[net-core] 已恢复系统 IPv6。");
+      if (guard.mode === "host") await hostAction("ipv6", { enabled: true });
+      else await systemIpv6.restore(guard.state);
+      logger("[net-core] 已恢复系统 IPv6。");
     } catch (error) {
       logger(`[net-core] 恢复系统 IPv6 失败：${error.message}`);
+    }
+  }
+
+  /** 用一个临时内核 + IPv6-only 端点判断当前节点能否承载 IPv6；结果缓存 10 分钟。 */
+  async function probeSelectedNodeIpv6() {
+    try {
+      return await probeSelectedNodeIpv6Inner();
+    } catch (error) {
+      ipv6Probe = { supported: false, ip: null, node: nodes.selected ?? null, checkedAt: new Date().toISOString(), reason: `探测失败：${error.message}` };
+      return ipv6Probe;
+    }
+  }
+
+  async function probeSelectedNodeIpv6Inner() {
+    const list = Array.isArray(nodes.proxies) ? nodes.proxies : [];
+    let name = nodes.selected;
+    if (core?.state().running) {
+      const actual = await core.request("/proxies").catch(() => null);
+      name = actual?.proxies?.[DEFAULT_GROUP]?.now ?? name;
+    }
+    const node = list.find((item) => item?.name === name) ?? list[0];
+    if (!node) {
+      ipv6Probe = { supported: false, ip: null, node: name ?? null, checkedAt: new Date().toISOString(), reason: "没有可探测的节点" };
+      return ipv6Probe;
+    }
+    const now = Date.now();
+    if (ipv6Probe && ipv6Probe.node === node.name && now - Date.parse(ipv6Probe.checkedAt) < 10 * 60 * 1000) return ipv6Probe;
+    const { buildProbeConfig } = await import("./config.mjs");
+    const { pickPortBlock } = await import("./ports.mjs");
+    const dir = await mkdtemp(path.join(os.tmpdir(), "checkcc-ipv6-"));
+    const basePort = await pickPortBlock(2, { start: 39581 });
+    const mixedPort = basePort - 2, probeApiPort = basePort - 1;
+    const secret = randomBytes(32).toString("hex");
+    const config = buildProbeConfig({ proxies: list, names: [node.name], basePort, mixedPort, secret, hosts: nodeHostsCache, proxyServerDns: Array.isArray(nodes.proxyServerDns) ? nodes.proxyServerDns : [], ipv6: true });
+    config.dns.ipv6 = true;
+    const configPath = path.join(dir, "probe.yaml");
+    await writeFile(configPath, serializeKernelConfig(config), { mode: 0o600 });
+    const probeCore = createCore({ binary, homeDir: dir, configPath, apiPort: probeApiPort, secret, manageProcess: true, spawn, fetchImpl, logger });
+    let reason = null;
+    try {
+      await probeCore.start();
+      for (const url of ["https://api6.ipify.org", "https://ipv6.icanhazip.com"]) {
+        try {
+          const body = (await fetchTextViaProxy(url, { proxy: `http://127.0.0.1:${basePort}`, userAgent: "EnvGuardCC/1.0", timeoutMs: 9000 })).trim();
+          if (body.includes(":") && /^[0-9a-f:]+$/i.test(body)) {
+            ipv6Probe = { supported: true, ip: body, node: node.name, checkedAt: new Date().toISOString(), reason: null };
+            return ipv6Probe;
+          }
+          reason = "IPv6-only 端点返回的内容不是 IPv6 地址。";
+        } catch (error) { reason = error.message; }
+      }
+      ipv6Probe = { supported: false, ip: null, node: node.name, checkedAt: new Date().toISOString(), reason };
+      return ipv6Probe;
+    } catch (error) {
+      ipv6Probe = { supported: false, ip: null, node: node.name, checkedAt: new Date().toISOString(), reason: `探测内核启动失败：${error.message}` };
+      return ipv6Probe;
+    } finally {
+      await probeCore.stop().catch(() => {});
+      await rm(dir, { recursive: true, force: true }).catch(() => {});
     }
   }
 
@@ -644,7 +728,10 @@ export async function createKernelRuntime({ stateDir, env = process.env, root, l
         throw new Error(`TUN 需要更高权限：${privilege.instruction} 如果暂时只需要本机代理，可用 CHECKCC_NET_CORE_TUN=0 启动（代理端口 ${localProxy}）。`);
       }
     }
-    if (tunEnabled && hostMode) await enableIpv6Guard();
+    if (tunEnabled) {
+      await probeSelectedNodeIpv6().catch((error) => logger(`[net-core] IPv6 能力探测失败：${error.message}`));
+      await enableIpv6Guard();
+    }
     if (hostMode) {
       // 宿主可能还挂着一台它自己认为「没在跑」的遗留内核，先让它收掉再启动。
       await hostAction("stop").catch(() => {});
@@ -654,8 +741,10 @@ export async function createKernelRuntime({ stateDir, env = process.env, root, l
     } else if (tunEnabled) await networkTakeover.prepare({ ports: [apiPort, mixedPort], proxyPort: mixedPort });
     core = createCore({ binary, homeDir, configPath, apiPort, secret: controllerSecret, verifyTunnel: () => tunEnabled && !strictEnabled && env.CHECKCC_NET_CORE_VERIFY_TUN !== "0", manageProcess: !hostMode, spawn, fetchImpl, lookup, logger });
     await core.start();
+    connectionLog.start();
     // 启动时就检查一次出口地区：配置已经落盘，但出口可能刚被故障转移到封禁地区。
-    if (!strictEnabled) {
+    // 未保护阻断已经覆盖 Claude 时不需要再叠加区域锁。
+    if (!strictEnabled && !unprotectedLock) {
       const exit = await probeSelectedExit().catch((error) => { logger(`[net-core] 启动后出口复检失败：${error.message}`); return null; });
       lastExitCheck = Date.now();
       if (!exit) await lockRegion(null, { type: "network" });
@@ -703,6 +792,8 @@ export async function createKernelRuntime({ stateDir, env = process.env, root, l
   async function stop() {
     lastHealthAt = null;
     lastTunnelCaptured = null;
+    // 停止内核即停止接管：未保护阻断随内核一起结束，下次启动由保护服务重新建立。
+    unprotectedLock = null;
     clearInterval(hostHeartbeat);
     hostHeartbeat = null;
     stopPublicDnsSync();
@@ -717,11 +808,13 @@ export async function createKernelRuntime({ stateDir, env = process.env, root, l
       const still = await findPortOwner(apiPort).catch(() => null);
       if (still) throw new Error(`端口 ${apiPort} 仍被进程 ${still} 占用：内核未真正停止。`);
       core = null;
+      await stopConnectionLog();
       await restoreIpv6Guard();
       return;
     }
-    if (!core) return;
+    if (!core) { await stopConnectionLog(); return; }
     await core.stop();
+    await stopConnectionLog();
     // 停成功后不能继续握着已停止的实例：否则 report() 会去读它的 /version，
     // 把「已停止」误报成「状态不可读」。
     core = null;
@@ -730,6 +823,7 @@ export async function createKernelRuntime({ stateDir, env = process.env, root, l
 
   /** 把内存状态里的某条来源设为当前：proxies / selected / source 三个派生字段一起换。 */
   function applyActive(id) {
+    ipv6Probe = null;
     const active = pickActive(nodes.sources ?? [], id);
     nodes = {
       ...nodes,
@@ -925,8 +1019,12 @@ export async function createKernelRuntime({ stateDir, env = process.env, root, l
       sources: publicSources(nodes.sources, nodes.activeId),
       activeId: nodes.activeId ?? null,
       localProxy,
+      connectionLog: await connectionLog.snapshot().catch(() => null),
       networkGeneration, lastHealthAt,
+      ipv6: ipv6Probe ? { ...ipv6Probe, protected: false, system: ipv6Guard ? "disabled" : "unknown" } : null,
       regionLock: regionLock ? { ...regionLock } : { locked: false },
+      claudeBlocked: claudeBlocked(),
+      unprotectedGuard: unprotectedLock ? { ...unprotectedLock } : null,
       strictMode: strictEnabled, guard: hostGuard,
       takeover: networkTakeover.status(),
       capabilities: { independentProxy: true, systemKillSwitch: connectionState().systemKillSwitch, strictTravel: connectionState().strictTravel },
@@ -1057,9 +1155,12 @@ export async function createKernelRuntime({ stateDir, env = process.env, root, l
       socket.once("error", () => resolve(false));
     });
     let lastError = null;
+    // 主内核 TUN 开启时，临时内核的节点连接会被主 TUN 再次截获（见 docs/NET-CORE.md），
+    // 必然全部失败；只试一次就交给串行回退，不让用户先干等三轮超时。
+    const attempts = tunEnabled ? 1 : 3;
     try {
       // 端口段会撞上 Windows 保留区间（实测直接 RST），所以按块申请并在就绪后实测可连。
-      for (let attempt = 0; attempt < 3; attempt += 1) {
+      for (let attempt = 0; attempt < attempts; attempt += 1) {
         const basePort = await pickPortBlock(wanted.length + 2, { start: 39481 + attempt * 200 });
         const mixedPort = basePort - 2;
         const apiPort = basePort - 1;
@@ -1081,8 +1182,9 @@ export async function createKernelRuntime({ stateDir, env = process.env, root, l
             } catch { return [listener.proxy, "__retry__"]; }
           }));
           const failed = results.filter(([, value]) => value === "__retry__").length;
-          // 大面积失败通常不是节点问题而是端口段被系统占用：换一段再试。
-          if (failed && failed === results.length && attempt < 2) { lastError = new Error("探测请求全部失败"); continue; }
+          // 全部失败时不能返回全 null 假装探测完成：必须继续，让循环结束后抛出，
+          // 调用方才能退回串行探测。大面积失败也可能是端口段被系统占用，换一段再试。
+          if (failed && failed === results.length) { lastError = new Error("探测请求全部失败"); continue; }
           return Object.fromEntries(results.map(([name, value]) => [name, value === "__retry__" ? null : value]));
         } catch (error) { lastError = error; } finally { await probeCore.stop().catch(() => {}); }
       }
@@ -1101,27 +1203,30 @@ export async function createKernelRuntime({ stateDir, env = process.env, root, l
     // 并行优先：不切主内核的选中节点，出口 IP 不会抖动，几十个节点几秒完成。
     try {
       const parallel = await probeExitsParallel(requested);
-      for (const [name, value] of Object.entries(parallel)) exitCache.set(name, { value, at: Date.now() });
+      // 只缓存成功结果：把 null 也缓存 10 分钟会让「重试检测」在缓存期内直接返回旧失败。
+      for (const [name, value] of Object.entries(parallel)) if (value?.ip) exitCache.set(name, { value, at: Date.now() });
       return parallel;
     } catch (error) {
       logger(`[net-core] 并行出口探测不可用（${error.message}），退回串行。`);
     }
+    // 串行回退会短暂切换主内核的选中节点；严格模式只有一个固定出口，必须用带认证的入口。
+    const probeProxy = strictEnabled ? strictProxy : localProxy;
     const wanted = requested;
     const original = await core.request("/proxies").then((value) => value?.proxies?.[DEFAULT_GROUP]?.now ?? nodes.selected).catch(() => nodes.selected);
     const result = {};
     try {
       for (const name of wanted) {
         const hit = exitCache.get(name);
-        if (hit && Date.now() - hit.at < EXIT_CACHE_TTL_MS) { result[name] = hit.value; continue; }
+        if (hit?.value?.ip && Date.now() - hit.at < EXIT_CACHE_TTL_MS) { result[name] = hit.value; continue; }
         try {
           await core.selectProxy(DEFAULT_GROUP, name);
-          const text = await fetchTextViaProxy("https://ipwho.is/", { proxy: localProxy, userAgent: "EnvGuardCC/1.0", timeoutMs: 5000 });
+          const text = await fetchTextViaProxy(exitProbeUrl, { proxy: probeProxy, userAgent: "EnvGuardCC/1.0", timeoutMs: 5000 });
           const data = JSON.parse(text);
           const value = data?.success === false ? null : exitFields(data);
-          exitCache.set(name, { value, at: Date.now() });
+          if (value?.ip) exitCache.set(name, { value, at: Date.now() });
           result[name] = value;
-        } catch {
-          exitCache.set(name, { value: null, at: Date.now() });
+        } catch (error) {
+          logger(`[net-core] 节点 ${name} 出口探测失败：${error.message}`);
           result[name] = null;
         }
       }
@@ -1164,6 +1269,8 @@ export async function createKernelRuntime({ stateDir, env = process.env, root, l
     if (typeof enabled !== "boolean") throw new Error("隧道开关必须是布尔值。");
     const next = enabled;
     if (strictEnabled && !next) throw new Error("请先明确关闭严格模式，再关闭系统接管。");
+    // 保护关闭时 Claude 已被阻断；直接关 TUN 会绕过阻断，必须先开启保护或退出应用。
+    if (unprotectedLock && !next) throw new Error("保护未开启时 Claude 已被阻断；请先开启环境防护，或退出应用后再关闭系统接管。");
     // 应用内刚装好宿主时必须重新探测；否则内核还停在本机模式，TUN 永远建不起来。
     if (next) await refreshHost();
     if (next && (!core || !core.state().running)) {
@@ -1184,7 +1291,10 @@ export async function createKernelRuntime({ stateDir, env = process.env, root, l
     }
     if (next === tunEnabled && tunOverride !== null) {
       if (next && !(await core.tunnelStatus()).active) throw new Error("隧道未接管，不能复用旧的开启状态。");
-      if (next) await enableIpv6Guard(); else await restoreIpv6Guard();
+      if (next) {
+        if (!ipv6Probe) await probeSelectedNodeIpv6().catch((error) => logger(`[net-core] IPv6 能力探测失败：${error.message}`));
+        await enableIpv6Guard();
+      } else await restoreIpv6Guard();
       lastTunnelCaptured = next ? true : null;
       lastHealthAt = new Date().toISOString();
       return { tunEnabled, changed: false };
@@ -1201,8 +1311,11 @@ export async function createKernelRuntime({ stateDir, env = process.env, root, l
         try { await launch(); } catch (error) { lastError = `隧道回滚后重启失败：${error.message}`; }
       };
       try {
-        // 开启前先关 IPv6；关闭后等 TUN 退出再恢复，避免切换窗口内的 IPv6 泄漏。
-        if (next) await enableIpv6Guard();
+        // 开启前先探测节点 IPv6 能力并关系统 IPv6；关闭后等 TUN 退出再恢复。
+        if (next) {
+          if (!ipv6Probe) await probeSelectedNodeIpv6().catch((error) => logger(`[net-core] IPv6 能力探测失败：${error.message}`));
+          await enableIpv6Guard();
+        }
         await writeConfig();
         // 热加载而非重启：切换 TUN 不该把节点选择、连接状态全部重置。
         await core.reloadFromFile();
@@ -1235,17 +1348,35 @@ export async function createKernelRuntime({ stateDir, env = process.env, root, l
     return { tunEnabled, changed };
   }
 
-  /** 切换出站模式：写盘后重建配置；内核在跑时重启使其生效。 */
+  /** 切换出站模式只热加载规则，保留现有内核、隧道及选择器。 */
   async function setMode(mode) {
     if (strictEnabled) throw new Error("严格模式下全部流量使用固定出口；请先关闭严格模式再切换代理范围。");
-    if (!["claude", "rule", "global", "direct"].includes(mode)) throw new Error(`未知出站模式：${mode}`);
+    if (!["rule", "global", "direct"].includes(mode)) throw new Error(`未知出站模式：${mode}`);
     if (mode === egressMode) return { mode };
     const previous = egressMode;
     const running = Boolean(core);
     const original = await readFile(modeFile, "utf8").catch(error => { if (error.code === "ENOENT") return null; throw error; });
+    const applyMode = async reason => {
+      if (!running) return;
+      // 内核确实退出时才走恢复；正常切换不能停掉 TUN 后重新争用自己的端口。
+      if (!core?.state().running) return reloadKernel(reason);
+      lastHealthAt = null;
+      lastTunnelCaptured = null;
+      await writeConfig();
+      await core.reloadFromFile({ removedSelectors: egressMode === "direct" ? [DEFAULT_AUTO_GROUP] : [] });
+      if (!core.state().running) throw new Error("内核在切换代理范围后退出。");
+      await core.status();
+      if (tunEnabled) {
+        const tunnel = await core.tunnelStatus({ waitMs: 4000 });
+        if (!tunnel.active) throw new Error("切换代理范围后隧道未接管，请复检连接。");
+        lastTunnelCaptured = true;
+      }
+      lastHealthAt = new Date().toISOString();
+      lastError = null;
+    };
     try {
       egressMode = mode;
-      if (running) await reloadKernel("切换代理范围");
+      await applyMode("切换代理范围");
       await mkdir(stateDir, { recursive: true });
       const temporary = `${modeFile}.${process.pid}.tmp`;
       try {
@@ -1257,7 +1388,7 @@ export async function createKernelRuntime({ stateDir, env = process.env, root, l
       try {
         if (original === null) await rm(modeFile, { force: true });
         else await writeFile(modeFile, original, { mode: 0o600 });
-        if (running) await reloadKernel("回滚代理范围");
+        await applyMode("回滚代理范围");
       } catch (rollback) { lastError = `${error.message}；回滚失败：${rollback.message}`; throw new Error(lastError, { cause: error }); }
       throw error;
     }
@@ -1269,6 +1400,7 @@ export async function createKernelRuntime({ stateDir, env = process.env, root, l
     if (!core) return false;
     await core.selectProxy(DEFAULT_GROUP, name);
     nodes.selected = name;
+    ipv6Probe = null;
     exitCountryCache = { code: null, at: 0 };
     // 记住当前供应商选的节点：切换供应商再切回来时恢复，而不是回到第一个节点。
     nodes.sources = (nodes.sources ?? []).map((source) => source.id === nodes.activeId ? { ...source, selected: name } : source);
@@ -1420,6 +1552,48 @@ export async function createKernelRuntime({ stateDir, env = process.env, root, l
   }
 
   /**
+   * 未保护阻断：保护关闭时保持 TUN 接管，只对 Claude 域名 REJECT。
+   * 关闭保护不再退回直连；要恢复 Claude 必须先开启保护。失败必须抛出，不能假装已阻断。
+   */
+  async function setUnprotectedGuard(enabled) {
+    if (typeof enabled !== "boolean") throw new Error("未保护阻断开关必须是布尔值。");
+    if (enabled) {
+      const previousTunnel = tunEnabled;
+      const reason = "保护未开启：Claude 已被阻断，开启环境防护后才能继续使用 Claude。";
+      unprotectedLock = { active: true, at: new Date().toISOString(), reason };
+      try {
+        // 没有真实的系统接管时，配置里的 REJECT 不会作用于系统流量。
+        await setTunnel(true);
+        if (!core) throw new Error("网络内核未运行，Claude 阻断未生效。");
+        await writeConfig();
+        await core.reloadFromFile();
+        await closeClaudeConnections();
+        lastTunnelCaptured = await core.tunnelStatus().then(value => value.active).catch(() => null);
+        if (lastTunnelCaptured !== true) throw new Error("系统流量接管未建立，Claude 阻断未生效。");
+        lastHealthAt = new Date().toISOString();
+      } catch (error) {
+        unprotectedLock = null;
+        // 本次为了阻断才打开的 TUN 要退回原状态，避免留下「没拦 Claude 却接管了流量」。
+        try { if (tunEnabled !== previousTunnel) await setTunnel(previousTunnel); }
+        catch { /* 回滚失败由 report 的隧道状态如实反映 */ }
+        try { await writeConfig(); await core?.reloadFromFile(); } catch { /* 保留原始错误 */ }
+        throw error;
+      }
+      logger("[net-core] 未开启保护，已阻断 Claude 域名");
+      notifyClaude("EnvGuardCC：Claude 已阻断", reason);
+      return report();
+    }
+    if (!unprotectedLock) return report();
+    unprotectedLock = null;
+    if (core) {
+      await writeConfig();
+      await core.reloadFromFile();
+    }
+    logger("[net-core] 未保护阻断已解除");
+    return report();
+  }
+
+  /**
    * 出口地区变了（手动切节点 / 自动故障转移 / 订阅换节点）就把公共 DNS 换成新地区的，
    * 热加载生效，不重启内核、不断连接。
    */
@@ -1526,6 +1700,7 @@ export async function createKernelRuntime({ stateDir, env = process.env, root, l
   return {
     enabled: !disabledReason(), reason: disabledReason(),
     start: serialize(start),
+    connectionLog,
     stop: serialize(async () => { stopHealthMonitor(); stopAutoRefresh(); stopPublicDnsSync(); await stop(); }),
     report, connectionState, verifyConnection: serialize(verifyConnection, false), select: serialize(select), delay, setMode: serialize(setMode), network,
     saveNetwork: serialize(saveNetwork), verifyDomain: serialize(verifyDomain), importNodes: serialize((...args) => nodeTransaction(() => importNodes(...args))),
@@ -1551,7 +1726,7 @@ export async function createKernelRuntime({ stateDir, env = process.env, root, l
       } finally { await rm(temporary, { force: true }); }
       return result;
     }),
-    probeNodeExits: serialize(probeNodeExits), probeSelectedExit: serialize(probeSelectedExit), unlockRegion: serialize(unlockRegion), refreshHost: serialize(refreshHost), installHost: serialize(installHost),
+    probeNodeExits: serialize(probeNodeExits), probeSelectedExit: serialize(probeSelectedExit), unlockRegion: serialize(unlockRegion), setUnprotectedGuard: serialize(setUnprotectedGuard), refreshHost: serialize(refreshHost), installHost: serialize(installHost),
     setStrictMode: serialize(async enabled => {
       if (typeof enabled !== "boolean") throw new Error("严格模式开关必须是布尔值。");
       await refreshHost();

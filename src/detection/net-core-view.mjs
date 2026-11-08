@@ -93,7 +93,7 @@ export function netCoreView(report, { locale = "zh", exitHistory = null } = {}) 
   const baseMetrics = [];
   const source = report.source && typeof report.source === "object" ? report.source : null;
   const localProxy = typeof report.localProxy === "string" ? report.localProxy : null;
-  const mode = ["claude", "rule", "global", "direct"].includes(report.mode) ? report.mode : null;
+  const mode = ["rule", "global", "direct"].includes(report.mode) ? report.mode : null;
   const elevated = report.elevation && typeof report.elevation.elevated === "boolean" ? report.elevation.elevated : null;
   const stability = exitHistory && Number.isFinite(exitHistory.changes)
     ? { changes: exitHistory.changes, windowHours: exitHistory.windowHours ?? 48, stable: exitHistory.changes === 0, current: exitHistory.current ?? null }
@@ -188,6 +188,15 @@ export function netCoreView(report, { locale = "zh", exitHistory = null } = {}) 
       title: t("Claude 流量已阻断", "Claude traffic blocked"),
       detail: report.regionLock.reason || t("固定出口未通过复检，Claude 域名已被拒绝。", "The pinned exit failed recheck; Claude domains are rejected."),
     };
+  } else if (report.unprotectedGuard?.active === true) {
+    // 保护关闭即阻断：隧道仍然接管着流量，只是 Claude 域名被拒绝。
+    tone = "danger";
+    label = t("已阻断", "Blocked");
+    conclusion = {
+      tone,
+      title: t("Claude 已阻断", "Claude blocked"),
+      detail: report.unprotectedGuard.reason || t("环境防护未开启，Claude 域名已被拒绝；开启环境防护后恢复。", "Environment protection is off; Claude domains are rejected until protection is enabled."),
+    };
   }
   if (state === "running" && !tunEnabled) {
     // 宿主模式下 TUN 关闭是「关闭保护 / 暂停接管」的正常态，不是故障：
@@ -266,4 +275,28 @@ export function netCoreView(report, { locale = "zh", exitHistory = null } = {}) 
 export function visibleViolations(view, limit = 20) {
   const list = Array.isArray(view?.violations) ? view.violations : [];
   return { items: list.slice(0, limit), hidden: Math.max(0, list.length - limit) };
+}
+
+/** 图上合并实际代理连接；Claude 审计仍使用独立字段。旧后台或过期采样不冒充实测。 */
+export function trafficFlowSamples(report, { now = Date.now() } = {}) {
+  const routing = report?.routing;
+  const age = now - Date.parse(routing?.sampledAt ?? "");
+  const sampled = report?.state === "running" && report?.demo !== true && age >= -5000 && age <= 45000;
+  const count = value => sampled && Number.isSafeInteger(value) && value >= 0 ? value : null;
+  const ordinary = count(routing?.traffic?.proxied), pinned = count(routing?.pinned);
+  return {
+    proxied: count(routing?.paths?.proxied ?? (ordinary !== null && pinned !== null ? ordinary + pinned : undefined)),
+    direct: count(routing?.paths?.direct ?? routing?.traffic?.direct),
+    blocked: count(routing?.paths?.blocked ?? routing?.traffic?.blocked),
+    unknown: count(routing?.paths?.unknown ?? routing?.traffic?.unknown),
+    pinned: count(routing?.pinned),
+  };
+}
+
+export function activeFlowConnections(report, { now = Date.now() } = {}) {
+  const snapshot = report?.connectionLog;
+  const age = now - Date.parse(snapshot?.sampledAt ?? "");
+  if (report?.state !== "running" || report.demo || !snapshot?.available || !(age >= -5000 && age <= 10000)) return { records: [], hidden: 0 };
+  const records = (Array.isArray(snapshot.active) ? snapshot.active : []).filter(record => record?.id && record.kind !== "request" && !record.endedAt);
+  return { records, hidden: Math.max(0, (Number(snapshot.activeTotal) || records.length) - records.length) };
 }

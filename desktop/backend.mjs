@@ -46,6 +46,7 @@ const closeRuntime = createShutdown({ restore: () => helper?.closeRuntime(), clo
     kernel?.stopPublicDnsSync?.();
     // 内核未确认退出时保留页面与控制接口，允许用户查看错误并重试退出。
     await kernel?.stop();
+    // kernel.stop() 同时停止采样并保存已结束的本机传输记录。
     await closeServer(helper?.server);
     await closeServer(gateway);
     await closeServer(site);
@@ -96,6 +97,7 @@ try {
   });
   if (kernel.enabled) {
     if (!await kernel.start()) console.error('[net-core] 内核未能启动，页面会显示未启用原因。');
+    else kernel.connectionLog?.start();
     kernel.startAutoRefresh?.();
     kernel.startPublicDnsSync?.();
   } else {
@@ -113,8 +115,9 @@ try {
     origin = `http://127.0.0.1:${site.address().port}`;
     headers.Origin = origin;
   }
-  const protection = await report();
-  if (protection.phase === 'idle') {
+  // 每次启动都执行启动策略：已有会话要 resume 重新应用（退出时已恢复系统时区），不能只看状态。
+  await report();
+  {
     const response = await fetch(helper.url + '/session?tokenOnly=1', { headers });
     const session = await response.json();
     const configured = await fetch(helper.url + '/protection', { method: 'POST', headers: { ...headers, 'Content-Type': 'application/json', 'X-CheckCC-Token': session.token }, body: JSON.stringify({ action: 'startup', enabled: settings.autoStartProtection }), signal: AbortSignal.timeout(120000) });

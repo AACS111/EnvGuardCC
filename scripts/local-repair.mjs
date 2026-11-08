@@ -227,7 +227,11 @@ const server = http.createServer(async (req, res) => {
     finally { changing = false; }
   }
   if (req.url === "/protection") {
-    if (req.method === "GET") return send(200, protection.report());
+    if (req.method === "GET") {
+      const report = protection.report();
+      if (timezoneSupported(process.platform)) report.systemTimezone = await currentZone();
+      return send(200, report);
+    }
     if (req.method !== "POST") return send(405, { error: "仅支持 GET/POST。" });
     if (!authenticated(req.headers["x-checkcc-token"])) return send(403, { error: "会话已失效。" });
     if (!req.headers["content-type"]?.startsWith("application/json")) return send(415, { error: "必须使用 JSON。" });
@@ -235,7 +239,20 @@ const server = http.createServer(async (req, res) => {
       const body = await parseBody(req);
       if (body.action === "observe") return send(200, protection.observe(body));
       if (body.action === "monitor") return send(200, await protection.monitor(body.enabled, body.intervalMs));
-      if (body.action === 'startup') return send(200, await protection.startupPreference(body.enabled));
+      if (body.action === 'startup') {
+        const current = protection.report();
+        if (!body.enabled) {
+          if (current.enabled || current.desiredEnabled) return send(200, await protection.stop(origin));
+          // 保护未开启时也要先建立 Claude 阻断；失败原因随报告返回，由界面如实展示。
+          return send(200, await protection.ensureUnprotectedBlock());
+        }
+        // 退出保护时系统时区会被恢复；启动时只读取“已开启”状态而不重新 apply，会让时区/浏览器配置与出口失配。
+        if (current.enabled) return send(200, await protection.resume(origin, { background: true }));
+        // 自动启动没有页面参与：启动后立即补一轮后台检测，否则首轮得分要等到下一个检测间隔才出现。
+        const started = await protection.start(origin);
+        void protection.retest().catch(() => {});
+        return send(200, started);
+      }
       if (body.action === 'test') {
         if (changing || protectionChanging) return send(409, { error: "配置正在执行，请稍后检测。" });
         return send(200, await protection.retest());

@@ -1,8 +1,8 @@
-// 从内核 /connections 快照提取 Claude 路由证据。
+// 从内核 /connections 快照提取 Claude 路由证据及普通流量路径计数。
 // 这是本产品与"靠 dig 或 STUN 推测"的关键差异：内核直接告诉我们每条连接的真实代理链，
 // 证据仅覆盖内核观察到的连接，不能用来断言系统内核外的流量零直连。
 
-import { CLAUDE_DOMAINS, DEFAULT_GROUP } from "./config.mjs";
+import { CLAUDE_DOMAINS, DEFAULT_GROUP, LOCAL_DIRECT_PROXY, LOCAL_DNS_PROXY } from "./config.mjs";
 
 const DIRECT_CHAINS = new Set(["DIRECT", "REJECT", "REJECT-DROP", "PASS"]);
 
@@ -25,6 +25,15 @@ export function isClaudeHost(host, { domains = CLAUDE_DOMAINS } = {}) {
 function chainOf(connection) {
   const chains = Array.isArray(connection?.chains) ? connection.chains.filter((item) => typeof item === "string" && item) : [];
   return chains;
+}
+
+/** 实际代理链分类，内网指定网卡仍是直连，不能当作代理出口。 */
+export function connectionRoute(connection) {
+  const chains = chainOf(connection);
+  if (chains.some(name => name === "REJECT" || name === "REJECT-DROP")) return "blocked";
+  if (chains.some(name => ["DIRECT", LOCAL_DIRECT_PROXY, LOCAL_DNS_PROXY].includes(name))) return "direct";
+  if (!chains.length || chains.includes("PASS")) return "unknown";
+  return "proxied";
 }
 
 function hostOf(connection) {
@@ -56,6 +65,16 @@ export function routingEvidence(payload, { group = DEFAULT_GROUP, domains = CLAU
   const groups = new Set();
   let pinned = 0;
   let direct = 0;
+  // 普通流量按真实代理链统计，不按域名或 IP 猜测目的地国家。
+  // 保留 Claude 独立审计，不能把普通代理连接算作专用出口已验证。
+  const traffic = { proxied: 0, direct: 0, blocked: 0, unknown: 0 };
+  const paths = { proxied: 0, direct: 0, blocked: 0, unknown: 0 };
+  for (const connection of connections) {
+    const route = connectionRoute(connection);
+    paths[route]++;
+    if (isClaudeHost(hostOf(connection), { domains })) continue;
+    traffic[route]++;
+  }
 
   for (const connection of claude) {
     const host = hostOf(connection);
@@ -87,6 +106,8 @@ export function routingEvidence(payload, { group = DEFAULT_GROUP, domains = CLAU
     claude: claude.length,
     pinned,
     direct,
+    traffic,
+    paths,
     violations,
     pinnedHosts: [...pinnedHosts],
     groups: [...groups],

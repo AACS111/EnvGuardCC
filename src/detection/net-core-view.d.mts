@@ -39,3 +39,7 @@ export type NetCoreView = {
 export function netCoreView(report: unknown, options?: { locale?: string; exitHistory?: unknown }): NetCoreView;
 export function dedupeViolations(violations: unknown): Array<{ host: string; chains: string[]; count: number }>;
 export function visibleViolations(view: NetCoreView | null | undefined, limit?: number): { items: NetCoreViolation[]; hidden: number };
+export function trafficFlowSamples(report: unknown, options?: { now?: number }): {
+  proxied: number | null; direct: number | null; blocked: number | null; unknown: number | null; pinned: number | null;
+};
+export function activeFlowConnections(report: unknown, options?: { now?: number }): { records: import('./gateway-check').ConnectionRecord[]; hidden: number };

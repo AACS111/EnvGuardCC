@@ -70,7 +70,7 @@ test('后台检测不改变检测按钮文案，不禁用保护和网络模式�
     const html = workspace('active', { report, checking, busy: false });
     assert.doesNotMatch(button('active', { report, checking, busy: false }), /disabled=""/);
     const modes = html.match(/<button[^>]*class="netcore-mode"[^>]*>/g) ?? [];
-    assert.equal(modes.length, 4);
+    assert.equal(modes.length, 3);
     for (const mode of modes) assert.doesNotMatch(mode, /disabled=""/);
     if (checking) assert.match(html, /disabled="" aria-busy="true"[^>]*>检测中…<\/button>/);
     else { assert.match(html, />检测<\/button>/); assert.doesNotMatch(html, /检测中…/); }
@@ -307,11 +307,85 @@ test('工作台不显示连接、代理选择或时区服务管理面板', () =>
 });
 
 
-test('保护配置包含桌面行为开关，网页模式不冒充可修改系统登录项', () => {
-  const html = workspace('active');
-  assert.doesNotMatch(html, /关闭窗口后保持后台运行/);
+test('桌面行为开关集中在设置弹窗，网页模式不冒充可修改系统登录项', () => {
+  assert.doesNotMatch(workspace('active'), /开机自启动|启动后自动开启保护|workspace-preferences/);
+  const {WorkspaceSettingsDialog} = require(path.join(root, 'src/components/detector/WorkspaceSettingsDialog.tsx'));
+  const html = renderToStaticMarkup(React.createElement(WorkspaceSettingsDialog, { locale: 'zh', connected: true, busy: false, report: { enabled: true, monitoring: true, intervalMs: 300000 }, network: { locale: 'zh', report: null, busy: false }, dismissedNoticeCount: 0 }));
+  assert.doesNotMatch(html, /关闭窗口后保持后台运行|settings-panel-browser|选择浏览器/);
   for (const label of ['开机自启动', '启动后自动开启保护']) {
     assert.ok(html.includes(label));
     assert.ok(html.includes('aria-label="' + label + '" disabled'));
   }
+});
+
+test('网络配置集中到设置，保护占用隧道时仍禁止单独切换接管', () => {
+  const {NetCoreSettings} = require(path.join(root, 'src/components/detector/NetCoreSettings.tsx'));
+  const props = { locale: 'zh', busy: false, tunnelLocked: true, report: { enabled: true, state: 'running', nodes: ['node'], tunEnabled: true, elevation: { platform: 'darwin', elevated: true } }, onTunnelChange: () => {}, onStrictChange: () => {}, onManageSources: () => {}, onAddSource: () => {}, onOpenNetworkConfig: () => {}, onStart: () => {}, onStop: () => {}, onRestart: () => {} };
+  const html = renderToStaticMarkup(React.createElement(NetCoreSettings, props));
+  assert.match(html, /管理配置/); assert.match(html, /内网直连/);
+  const tunnel = html.match(/<button[^>]*role="switch"[^>]*>关闭接管<\/button>/)?.[0];
+  assert.ok(tunnel); assert.match(tunnel, /disabled/);
+  assert.match(html, /环境防护正在使用隧道/);
+  assert.doesNotMatch(workspace('active'), />管理配置<|诊断与高级操作|aria-label="自动检测间隔"/);
+  assert.match(workspace('active'), />选择浏览器</);
+});
+
+test('已开启的严格模式在平台或节点不可用时仍可从设置恢复联网', () => {
+  const {NetCoreSettings} = require(path.join(root, 'src/components/detector/NetCoreSettings.tsx'));
+  const props = { locale: 'zh', busy: false, tunnelLocked: false, report: { state: 'unavailable', nodes: [], strictMode: true, guard: { armed: true, phase: 'blocked' }, elevation: { platform: 'win32', elevated: false } }, onStrictChange: () => {} };
+  const html = renderToStaticMarkup(React.createElement(NetCoreSettings, props));
+  const recovery = html.match(/<button[^>]*role="switch"[^>]*>关闭严格模式并恢复联网<\/button>/)?.[0];
+  assert.ok(recovery); assert.doesNotMatch(recovery, /disabled/);
+  assert.match(html, /退出应用或异常崩溃后仍保留阻断/);
+  assert.match(html, /使用效果/);
+  assert.doesNotMatch(html, /出差时让 EGCC|Keep EGCC running/);
+  const busy = renderToStaticMarkup(React.createElement(NetCoreSettings, { ...props, busy: true }));
+  assert.match(busy.match(/<button[^>]*role="switch"[^>]*>关闭严格模式并恢复联网<\/button>/)?.[0] ?? '', /disabled/);
+});
+
+test('应用启动自动开启保护后立即补一轮检测，首屏不会停在尚未检测', () => {
+  const source = fs.readFileSync(path.join(root, 'scripts/local-repair.mjs'), 'utf8');
+  const startup = source.slice(source.indexOf("if (body.action === 'startup')"), source.indexOf("if (body.action === 'test')"));
+  assert.match(startup, /protection\.start\(origin\)/, '启动策略必须真正开启保护');
+  assert.match(startup, /protection\.retest\(\)/, '自动启动没有页面参与，必须补一轮检测才能产生得分');
+});
+
+test('传输记录卡片与详情固定说明本机存储，支持空状态与真实元数据', () => {
+  const { TransferLogCard, TransferRecordDetails, TransferLogDialog } = require(path.join(root, 'src/components/detector/TransferLog.tsx'));
+  const record = {id:'conn-a',host:'api.anthropic.com',ip:'203.0.113.4',port:443,chains:['Seoul','CLAUDE-PIN'],rule:'DomainSuffix',rulePayload:'anthropic.com',upload:123,download:4567,startedAt:'2026-11-08T00:00:00Z',endedAt:'2026-11-08T00:00:05Z',isClaude:true,route:'proxied',viaExit:true};
+  const data = {ok:true,available:true,storageError:false,retentionHours:48,stats:{active:0,ended:1,total:1},items:[record],recent:[record],total:1,offset:0,limit:50};
+  const render = (Component, props) => renderToStaticMarkup(React.createElement(Component, {locale:'zh',...props}));
+  const card = render(TransferLogCard,{data,onOpen:()=>{}});
+  assert.match(card,/传输记录/); assert.match(card,/数据只存放在本机，不会上传/);
+  assert.match(card,/活动 0 条 · 48 小时 1 条/); assert.match(card,/最近 3 条/);
+  assert.match(card,/api\.anthropic\.com/); assert.match(card,/已结束/);
+  const empty = render(TransferLogCard,{data:null,onOpen:()=>{}});
+  assert.match(empty,/暂无传输记录/); assert.doesNotMatch(empty,/role="alert"/);
+  const details = render(TransferRecordDetails,{record});
+  for (const field of ['数据只存放在本机，不会上传','连接详情','123 B','4567 B','是否 Claude','是否走出口','已走代理出口','命中规则','开始时间','结束时间']) assert.ok(details.includes(field),field);
+  assert.doesNotMatch(details,/processPath|authorization|token=/);
+  const dialog = render(TransferLogDialog,{data,selected:record,host:'',claude:false,viaExit:'all',offset:0,clearing:false,error:'',onHost:()=>{},onClaude:()=>{},onExit:()=>{},onPage:()=>{},onSelect:()=>{},onClear:()=>{},onClose:()=>{}});
+  assert.match(dialog,/仅 Claude/); assert.match(dialog,/清空记录/); assert.match(dialog,/上一页/);
+  assert.equal((dialog.match(/数据只存放在本机，不会上传/g)??[]).length,2);
+  for (const [route,heading] of [['proxied','代理出口连接'],['direct','直连连接'],['blocked','已拦截连接']]) {
+    const collection = render(TransferLogDialog,{data,selected:null,host:'',claude:false,route,recordState:route==='blocked'?'all':'active',offset:0,clearing:false,error:'',onHost:()=>{},onClaude:()=>{},onPage:()=>{},onSelect:()=>{},onClear:()=>{},onClose:()=>{}});
+    assert.match(collection,new RegExp('>'+heading+'</h2>'));
+    assert.match(collection,/连接路径/); assert.match(collection,/连接状态/);
+  }
+  const en = render(TransferLogCard,{locale:'en',data,onOpen:()=>{}});
+  assert.match(en,/Transfer log/); assert.match(en,/never uploaded/);
+});
+
+test('请求详情、导出和回放提供真实元数据与覆盖边界，设置包含仅 Claude/全部', () => {
+  const { TransferRecordDetails, TransferLogDialog } = require(path.join(root, 'src/components/detector/TransferLog.tsx'));
+  const { ConnectionLogSettings } = require(path.join(root, 'src/components/detector/ConnectionLogSettings.tsx'));
+  const record = { id:'request-a',kind:'request',host:'api.anthropic.com',ip:null,port:443,chains:[],rule:'',rulePayload:'',upload:123,download:456,startedAt:'2026-11-08T00:00:00Z',endedAt:'2026-11-08T00:00:01Z',isClaude:true,route:'unknown',viaExit:null,method:'POST',endpoint:'/v1/messages',status:201,elapsedMs:1000,error:null };
+  const details = renderToStaticMarkup(React.createElement(TransferRecordDetails, { record,locale:'zh' }));
+  for (const content of ['POST','/v1/messages','201','1000 ms','HTTP 网关','不解密','未知']) assert.ok(details.includes(content),content);
+  const at = '2026-11-08T00:00:00.500Z';
+  const data = {available:false,stats:{active:0,ended:1,total:1},total:1,offset:0,limit:50,items:[record],recent:[record],at};
+  const dialog = renderToStaticMarkup(React.createElement(TransferLogDialog, { locale:'zh',data,selected:record,host:'',claude:false,viaExit:'all',offset:0,clearing:false,error:'',kind:'request',at,replayBase:Date.parse('2026-11-08T00:01:00Z'),replayPosition:172740,playing:false,onHost:()=>{},onClaude:()=>{},onExit:()=>{},onPage:()=>{},onSelect:()=>{},onClear:()=>{},onClose:()=>{} }));
+  for (const content of ['导出 JSON','导出 CSV','回放时间轴','当时活动 1 条','不解密','最后采样的累计值']) assert.ok(dialog.includes(content),content);
+  const settings = renderToStaticMarkup(React.createElement(ConnectionLogSettings,{locale:'zh'}));
+  assert.match(settings,/仅 Claude/); assert.match(settings,/>全部</); assert.match(settings,/数据只存放在本机，不会上传/);
 });

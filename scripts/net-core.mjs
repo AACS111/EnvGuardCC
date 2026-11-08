@@ -357,14 +357,17 @@ export function createNetCore({
    * 热加载磁盘上的配置，并恢复各选择器原来的节点。
    * mihomo 重载会把 select 组重置成第一个节点，不恢复的话「换了 DNS」会顺手把出口也换掉。
    */
-  async function reloadFromFile() {
+  async function reloadFromFile({ removedSelectors = [] } = {}) {
     // 读不到当前选择时不得把默认选择当成原选择继续重载。
     const before = await request("/proxies");
     const selections = Object.entries(before?.proxies ?? {})
       .filter(([group, value]) => group !== "GLOBAL" && value?.type === "Selector" && typeof value.now === "string" && value.now)
       .map(([group, value]) => [group, value.now]);
     const candidate = parseYaml(await readFile(configPath, "utf8"));
-    for (const [group, name] of selections) {
+    // 调用方可明确移除不再使用的组（例如其他直连模式的 AUTO-PROXY）；
+    // 仍存在的组必须保持原节点，不能借此忽略选择器损坏。
+    const retained = selections.filter(([group]) => !removedSelectors.includes(group) || candidate?.["proxy-groups"]?.some(item => item?.name === group));
+    for (const [group, name] of retained) {
       if (group === "GLOBAL") continue; // 内核自动生成的虚拟组，不属于用户配置。
       const selector = candidate?.["proxy-groups"]?.find(item => item?.name === group && item.type === "select");
       if (!selector || !selector.proxies?.includes(name)) throw new Error(`拒绝重载：选择器 ${group} 的原节点 ${name} 已不存在，请显式选择新出口。`);
@@ -373,7 +376,7 @@ export function createNetCore({
     }
     const payload = stringifyYaml(candidate);
     await request("/configs?force=true", { method: "PUT", body: { payload } });
-    for (const [group, name] of selections) {
+    for (const [group, name] of retained) {
       if (group === "GLOBAL") continue;
       // 重载是异步完成的，选择器列表可能还没就绪，按 selectProxy 的经验重试几次。
       let restored = false;
@@ -387,8 +390,8 @@ export function createNetCore({
         throw new Error(`配置重载后选择器 ${group} 未保持原出口，拒绝报告成功。`);
       }
     }
-    logger(`内核配置已热加载，选择器恢复 ${selections.length} 个。`);
-    return selections.length;
+    logger(`内核配置已热加载，选择器恢复 ${retained.length} 个。`);
+    return retained.length;
   }
 
   function state() {
