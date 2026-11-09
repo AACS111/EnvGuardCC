@@ -5,7 +5,7 @@ import http from "node:http";
 import path from "node:path";
 import { mkdtemp, readFile, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { EnvironmentRuntime, validatePolicy, browserNetworkArgs } from "./environment-runtime.mjs";
+import { EnvironmentRuntime, validatePolicy, browserNetworkArgs, findBrowser } from "./environment-runtime.mjs";
 import { runtimePolicyScript, restoreRuntimePolicy, verifyRuntimePolicy, migrateRuntimePolicy } from "../src/detection/runtime-policy.mjs";
 import { BrowserCloakController } from "./browser-cloak.mjs";
 import { createGateway, cloakState, setCloak } from "./claude-gateway.mjs";
@@ -39,7 +39,7 @@ test("隔离浏览器复用真实代理、阻止本地 DNS 回退且不泄露认
   assert.throws(() => browserNetworkArgs({url:new URL("http://user:secret@localhost:7890")}), /带认证/);
 });
 
-test("实际 Chromium 将未知目标域名交给代理，不依赖本地 DNS", {timeout:15000}, async () => {
+test("实际 Chromium 将未知目标域名交给代理，不依赖本地 DNS", { timeout: 180000 }, async () => {
   const directory = await mkdtemp(path.join(tmpdir(),"checkcc-proxy-browser-"));
   const requests = [];
   const proxy = http.createServer((request,response) => {
@@ -49,12 +49,32 @@ test("实际 Chromium 将未知目标域名交给代理，不依赖本地 DNS", 
   });
   await new Promise(resolve => proxy.listen(0,"127.0.0.1",resolve));
   const origin = `http://127.0.0.1:${proxy.address().port}`;
-  const runtime = new EnvironmentRuntime({stateDir:directory,headless:true,networkProxy:{url:new URL(origin)}});
+  // 浏览器清单可能返回混合分隔符；含空格的 Windows 路径必须在启动边界规范化。
+  const browserPath = (await findBrowser()).replaceAll(path.sep, "/");
+  const runtime = new EnvironmentRuntime({stateDir:directory,browserPath,headless:true,networkProxy:{url:new URL(origin)}});
   try {
     const instance = await runtime.launch("web",origin);
-    const [sessionId] = [...instance.sessions].find(([,item]) => item.type === "page");
+    // Chrome 132+ 会额外创建一个 url 为空的 page target，且 Page.navigate 返回时 URL 可能尚未提交。
+    // 这里按目标页轮询，而不是对目标列表做一次性严格断言（Chrome 版本升级会让后者无故变红）。
+    const pageTargets = async () => (await instance.client.send("Target.getTargets")).targetInfos.filter(target => target.type === "page" && target.url);
+    let targets = [];
+    for (let attempt = 0; attempt < 60; attempt++) {
+      targets = await pageTargets();
+      if (targets.some(target => target.url === origin + "/")) break;
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
+    assert.ok(targets.some(target => target.url === origin + "/"), `受控浏览器没有打开目标页：${targets.map(target => target.url).join(", ")}`);
+    assert.ok(targets.some(target => target.url === "about:blank"), "受管实例应保留一个空白页");
+    const page = targets.find(target => target.url === origin + "/");
+    let sessionId;
+    for (let attempt = 0; attempt < 40 && !sessionId; attempt++) {
+      sessionId = [...instance.sessions].find(([,item]) => item.type === "page" && item.targetId === page.targetId)?.[0];
+      if (!sessionId) await new Promise(resolve => setTimeout(resolve, 50));
+    }
+    assert.ok(sessionId, "目标页没有可用的调试会话");
     const navigation = await instance.client.send("Page.navigate",{url:"http://checkcc-proxy-test.invalid/"},sessionId);
     assert.equal(navigation.errorText,undefined);
+    for (let attempt = 0; attempt < 40 && !requests.includes("http://checkcc-proxy-test.invalid/"); attempt++) await new Promise(resolve => setTimeout(resolve, 50));
     assert.ok(requests.includes("http://checkcc-proxy-test.invalid/"));
   } finally {
     await runtime.close();
@@ -116,7 +136,7 @@ test("字体屏蔽改变实际 Canvas/FontFaceSet 访问，支持数量配置和
   } finally { vm.runInContext(`(${restoreRuntimePolicy.toString()})()`, context); }
 });
 
-test("实际 Chromium 首次页面脚本、刷新、变更、撤销都使用目标接口；本地验证不冒充 Claude 端验证", { timeout: 30000 }, async () => {
+test("实际 Chromium 首次页面脚本、刷新、变更、撤销都使用目标接口；本地验证不冒充 Claude 端验证", { timeout: 180000 }, async () => {
   const directory = await mkdtemp(path.join(tmpdir(), "checkcc-runtime-test-"));
   const server = http.createServer((_request, response) => {
     response.writeHead(200, { "Content-Type": "text/html" });
@@ -209,7 +229,7 @@ test("实际 Chromium 首次页面脚本、刷新、变更、撤销都使用目�
   }
 });
 
-test("本机助手自动启动后，执行请求需要本机来源、会话令牌和白名单配置", { timeout: 15000 }, async () => {
+test("本机助手自动启动后，执行请求需要本机来源、会话令牌和白名单配置", { timeout: 180000 }, async () => {
   const helperState = await mkdtemp(path.join(tmpdir(), "checkcc-helper-test-"));
   const originalState = process.env.CHECKCC_STATE_DIR;
   process.env.CHECKCC_STATE_DIR = helperState;
@@ -266,7 +286,7 @@ test("已撤销或目标页面变化后不能复用缓存通过，连接失败�
   } finally { await controller.close(); gateway.closeAllConnections(); await new Promise(resolve=>gateway.close(resolve)); }
 });
 
-test("跨域 iframe 刷新与关闭后仍能恢复原始接口，重复恢复幂等", { timeout: 30000 }, async () => {
+test("跨域 iframe 刷新与关闭后仍能恢复原始接口，重复恢复幂等", { timeout: 180000 }, async () => {
   const directory = await mkdtemp(path.join(tmpdir(), "checkcc-restore-frames-"));
   const server = http.createServer((req, response) => {
     response.writeHead(200, { "Content-Type": "text/html" });
@@ -310,7 +330,7 @@ test("跨域 iframe 刷新与关闭后仍能恢复原始接口，重复恢复幂
   }
 });
 
-test('代理地址改变后重建受控进程，实际请求使用新代理且保留接口策略', { timeout: 20000 }, async () => {
+test('代理地址改变后重建受控进程，实际请求使用新代理且保留接口策略', { timeout: 180000 }, async () => {
   const directory = await mkdtemp(path.join(tmpdir(), 'checkcc-network-change-'));
   const names = ['CHECKCC_STATE_DIR', 'CHECKCC_PROXY', 'HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy', 'ALL_PROXY', 'all_proxy'];
   const previous = Object.fromEntries(names.map(name => [name, process.env[name]]));

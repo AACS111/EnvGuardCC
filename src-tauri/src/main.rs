@@ -559,11 +559,11 @@ fn main() {
             )?;
             power::start(app.handle().clone());
             let show_item =
-                MenuItem::with_id(app, "show", "显示主窗口 / Show window", true, None::<&str>)?;
+                MenuItem::with_id(app, "show", "显示主界面", true, None::<&str>)?;
             let quit_item = MenuItem::with_id(
                 app,
                 "quit",
-                "退出并恢复配置 / Quit and restore",
+                "退出",
                 true,
                 None::<&str>,
             )?;

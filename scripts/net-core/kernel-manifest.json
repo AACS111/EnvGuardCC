@@ -1,0 +1,51 @@
+{
+  "version": "v1.19.33",
+  "source": "https://github.com/MetaCubeX/mihomo",
+  "license": "GPL-3.0",
+  "note": "sha256 为 null 表示尚未固定，vendorKernel 会拒绝安装。首次固定请运行 pinKernel 并在评审后提交。",
+  "platforms": {
+    "win32-x64": {
+      "file": "mihomo.exe",
+      "archive": "mihomo-windows-amd64-compatible-v1.19.33.zip",
+      "url": "https://github.com/MetaCubeX/mihomo/releases/download/v1.19.33/mihomo-windows-amd64-compatible-v1.19.33.zip",
+      "sha256": "926bfea2ce48a247d6a7ce4cf641980e416202d5e40fe4ee5c949089ace0e197",
+      "size": 61304320
+    },
+    "win32-arm64": {
+      "file": "mihomo.exe",
+      "archive": "mihomo-windows-arm64-v1.19.33.zip",
+      "url": "https://github.com/MetaCubeX/mihomo/releases/download/v1.19.33/mihomo-windows-arm64-v1.19.33.zip",
+      "sha256": null,
+      "size": null
+    },
+    "darwin-arm64": {
+      "file": "mihomo",
+      "archive": "mihomo-darwin-arm64-v1.19.33.gz",
+      "url": "https://github.com/MetaCubeX/mihomo/releases/download/v1.19.33/mihomo-darwin-arm64-v1.19.33.gz",
+      "sha256": "f3e8ae41397c08cbf900ce1f7c8a168285d29954e9bca5d84d69a2b2561adfe9",
+      "size": 56810034,
+      "archiveSha256": "060b64b0f2c9a310831db0fe4adb2878de67bfa606c311813c1f13966aa504b6"
+    },
+    "darwin-x64": {
+      "file": "mihomo",
+      "archive": "mihomo-darwin-amd64-compatible-v1.19.33.gz",
+      "url": "https://github.com/MetaCubeX/mihomo/releases/download/v1.19.33/mihomo-darwin-amd64-compatible-v1.19.33.gz",
+      "sha256": null,
+      "size": null
+    },
+    "linux-x64": {
+      "file": "mihomo",
+      "archive": "mihomo-linux-amd64-compatible-v1.19.33.gz",
+      "url": "https://github.com/MetaCubeX/mihomo/releases/download/v1.19.33/mihomo-linux-amd64-compatible-v1.19.33.gz",
+      "sha256": null,
+      "size": null
+    },
+    "linux-arm64": {
+      "file": "mihomo",
+      "archive": "mihomo-linux-arm64-v1.19.33.gz",
+      "url": "https://github.com/MetaCubeX/mihomo/releases/download/v1.19.33/mihomo-linux-arm64-v1.19.33.gz",
+      "sha256": null,
+      "size": null
+    }
+  }
+}

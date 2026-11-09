@@ -4,6 +4,9 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createGateway } from "./claude-gateway.mjs";
 import { startRepairHelper } from "./local-repair.mjs";
+import { createKernelRuntime } from "./net-core/runtime.mjs";
+import { ensureKernel } from "./net-core/vendor.mjs";
+import { createClaudeProxySettings } from "./claude-proxy-settings.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const require = createRequire(import.meta.url);
@@ -14,9 +17,9 @@ async function closeServer(server) {
   await new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
 }
 
-export async function startGateway(port = 3010) {
+export async function startGateway(port = 3010, { netCore = null } = {}) {
   const url = `http://127.0.0.1:${port}`;
-  const server = createGateway({ upstreamBase: process.env.CHECKCC_UPSTREAM || "https://api.anthropic.com" });
+  const server = createGateway({ upstreamBase: process.env.CHECKCC_UPSTREAM || "https://api.anthropic.com", netCore });
   try {
     await new Promise((resolve, reject) => {
       server.once("error", reject);
@@ -46,13 +49,28 @@ export async function startDev(args = process.argv.slice(2), { handleSignals = t
   if (process.env.CHECKCC_GATEWAY_PORT && process.env.CHECKCC_GATEWAY_PORT !== "3010") {
     throw new Error("npm run dev 使用网关端口 3010，请移除 CHECKCC_GATEWAY_PORT 后重试。");
   }
-  let gateway, helper, next;
+  let gateway, helper, next, kernel;
   try {
-    gateway = await startGateway();
-    helper = await startRepairHelper();
+    if (process.env.CHECKCC_NET_CORE !== "0" && !process.env.CHECKCC_NET_CORE_BINARY) await ensureKernel();
+    // 内核先启动：网关诊断接口需要读取它的状态；未配置节点时明确报“未启用”。
+    const stateDir = process.env.CHECKCC_STATE_DIR || path.join(root, "node_modules", ".checkcc-local");
+    kernel = await createKernelRuntime({
+      stateDir,
+      claudeProxy: createClaudeProxySettings({ stateDir }),
+      root,
+      logger: (line) => process.stderr.write(`[net-core] ${line}\n`),
+    });
+    if (kernel.enabled) {
+      if (!await kernel.start()) process.stderr.write("[net-core] 内核未能启动，页面会显示未启用原因。\n");
+    } else {
+      process.stderr.write(`[net-core] 未启用：${kernel.reason}\n`);
+    }
+    gateway = await startGateway(3010, { netCore: kernel });
+    helper = await startRepairHelper(undefined, { netCore: kernel });
   } catch (error) {
     // Release only listeners this launcher acquired; reused services stay untouched.
     try { await closeServer(gateway?.server); } catch { /* Preserve the startup error. */ }
+    try { await kernel?.stop(); } catch { /* Preserve the startup error. */ }
     throw error;
   }
   process.stdout.write(`[dev] 本机助手 ${helper.url}\n`);
@@ -94,6 +112,11 @@ export async function startDev(args = process.argv.slice(2), { handleSignals = t
       await attempt("关闭网关", () => closeServer(gateway.server));
       await attempt("关闭 Next", stopNext);
       await attempt("关闭本机助手", () => closeServer(helper.server));
+      await attempt("关闭网络内核", async () => {
+        kernel?.stopAutoRefresh?.();
+        kernel?.stopPublicDnsSync?.();
+        await kernel?.stop();
+      });
       process.exitCode = failures.length ? (code || 1) : code;
       if (failures.length) throw new Error(failures.join("；"));
     })();

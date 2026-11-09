@@ -4,7 +4,9 @@ import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { projectRoot as root, tauriCli, buildEnvironment } from './tauri-tools.mjs';
 import { buildTimezoneService } from './build-timezone-service.mjs';
+import { ensureKernel } from './net-core/vendor.mjs';
 
+if (process.env.CHECKCC_NET_CORE !== '0' && !process.env.CHECKCC_NET_CORE_BINARY) await ensureKernel();
 if (process.platform === 'darwin') await buildTimezoneService();
 // Resource declarations must also resolve during development; production packaging replaces this directory.
 const stage = path.join(root, 'node_modules/.checkcc-tauri-backend');

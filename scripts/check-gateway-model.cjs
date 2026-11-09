@@ -9,9 +9,150 @@ const root = path.resolve(__dirname, '..');
 const nativeResolve = Module._resolveFilename;
 Module._resolveFilename = function(id, parent, ...rest) { return nativeResolve.call(this, id.startsWith('@/') ? path.join(root,'src',id.slice(2)) : id, parent, ...rest); };
 require.extensions['.ts'] = (module, filename) => module._compile(ts.transpileModule(fs.readFileSync(filename,'utf8'), {compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2020}}).outputText,filename);
-require.extensions['.tsx'] = (module, filename) => module._compile(ts.transpileModule(fs.readFileSync(filename,'utf8'), {compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2020,jsx:ts.JsxEmit.ReactJSX}}).outputText,filename);
+require.extensions['.tsx'] = (module, filename) => module._compile(ts.transpileModule(fs.readFileSync(filename,'utf8'), {compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2020,jsx:ts.JsxEmit.ReactJSX,esModuleInterop:true}}).outputText,filename);
 const {buildGatewayCheck} = require(path.join(root,'src/detection/gateway-check.ts'));
 const {signalConfig} = require(path.join(root,'src/detection/config/signals.ts'));
+test('节点及供应商切换等待后台完成，避免请求超时后实际已切换', async t => {
+  const { controlNetCore, netCoreSourceAction } = require(path.join(root, 'src/detection/gateway-check.ts'));
+  const timeouts = [];
+  t.mock.method(AbortSignal, 'timeout', milliseconds => {
+    timeouts.push(milliseconds);
+    return new AbortController().signal;
+  });
+  t.mock.method(globalThis, 'fetch', async () => ({ ok: true, json: async () => ({ ok: true }) }));
+  await controlNetCore('select', 'test-node');
+  await netCoreSourceAction('activate', 'src_test');
+  await netCoreSourceAction('refresh', 'src_test');
+  assert.deepEqual(timeouts, [180000, 180000, 180000]);
+});
+
+test('节点延迟颜色区分低、中、高、超时与未测量', async () => {
+  const { nodeLatencyTone } = await import('../src/detection/net-core-view.mjs');
+  for (const [delay, tone] of [[0, 'ok'], [199, 'ok'], [200, 'warn'], [499, 'warn'], [500, 'danger'], [null, 'danger'], [undefined, 'muted'], [-1, 'muted'], [Infinity, 'muted']]) {
+    assert.equal(nodeLatencyTone(delay), tone);
+  }
+});
+
+test('节点测量标识随供应商和配置更新时间变化，改名不影响测量归属', async () => {
+  const { nodeMeasurementScope } = await import('../src/detection/net-core-view.mjs');
+  const report = { activeId: 'src_a', source: { url: 'https://example.com/sub', updatedAt: 'first' } };
+  assert.notEqual(nodeMeasurementScope(report), nodeMeasurementScope({ ...report, activeId: 'src_b' }));
+  assert.notEqual(nodeMeasurementScope(report), nodeMeasurementScope({ ...report, source: { ...report.source, updatedAt: 'second' } }));
+  assert.equal(nodeMeasurementScope(report), nodeMeasurementScope({ ...report, sources: [{ id: 'src_a', name: 'renamed' }] }));
+});
+
+test('切换供应商前发出的慢轮询不得恢复旧报告及旧测速结果', async () => {
+  const { nodeMeasurementScope } = await import('../src/detection/net-core-view.mjs');
+  const source = fs.readFileSync(path.join(root, 'src/components/detector/Detector.tsx'), 'utf8');
+  const file = ts.createSourceFile('Detector.tsx', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
+  let callback;
+  const visit = node => {
+    if (ts.isVariableDeclaration(node) && node.name.getText(file) === 'refreshNetCore') callback = node.initializer.arguments[0].getText(file);
+    ts.forEachChild(node, visit);
+  };
+  visit(file);
+  assert.ok(callback);
+  const scope = { current: 'old-source' };
+  const reports = [], samples = [], pending = [];
+  const refresh = require('node:vm').runInNewContext(`(${callback})`, {
+    latestSourceScope: scope, nodeMeasurementScope,
+    readNetCore: () => new Promise(resolve => pending.push(resolve)),
+    setNetCore: report => reports.push(report), setNetCoreDelaySample: sample => samples.push(sample),
+    setExitHistory() {}, setNetCoreError() {},
+  });
+  const oldRequest = refresh();
+  scope.current = 'new-source';
+  pending.shift()({ netCore: { activeId: 'old-source', delays: { same: 1 } } });
+  await oldRequest;
+  assert.equal(reports.length, 0);
+  assert.equal(samples.length, 0);
+  const freshRequest = refresh();
+  const external = { activeId: 'external-source', delays: { same: 200 } };
+  pending.shift()({ netCore: external });
+  await freshRequest;
+  assert.equal(reports[0], external);
+  assert.equal(scope.current, nodeMeasurementScope(external));
+});
+
+test('超时按真实出口地区区分同地区备用与跨地区，未测量节点不当作可用', async () => {
+  const { nodeSelectionState, netCoreView } = await import('../src/detection/net-core-view.mjs');
+  const nodes = ['Japan 01', 'Taiwan 02', 'Taiwan 03', 'Japan 04', '未知节点', 'Japan 05'];
+  const delays = { 'Japan 01': null, 'Taiwan 02': 100, 'Taiwan 03': 200, 'Japan 04': null, '未知节点': 300 };
+  const exits = { 'Japan 01': { countryCode: 'TW' }, 'Taiwan 03': { countryCode: 'JP' } };
+  const state = nodeSelectionState({ nodes, selected: 'Japan 01', delays, exits });
+  assert.equal(state.recovery.tone, 'warn');
+  assert.deepEqual(state.recovery.sameRegion.map(node => node.name), ['Taiwan 02']);
+  assert.deepEqual(state.recovery.otherRegions.map(node => node.name), ['Taiwan 03', '未知节点']);
+  assert.equal(state.nodes.find(node => node.name === 'Taiwan 03').switchTone, 'danger');
+  assert.equal(nodeSelectionState({ nodes, selected: 'Japan 01', delays: { ...delays, 'Taiwan 02': null }, exits }).recovery.tone, 'danger');
+  assert.equal(nodeSelectionState({ nodes, selected: 'Japan 01', delays: {}, exits }).recovery, null);
+  assert.equal(netCoreView({ enabled: true, state: 'unavailable', nodes, selected: 'Japan 01' }).actions.canSelect, true);
+});
+
+test('节点卡片显示延迟色阶，超时有同地区备用时显示黄色并保留选择入口', () => {
+  const { NetCorePanel } = require(path.join(root, 'src/components/detector/NetCorePanel.tsx'));
+  const report = { enabled: true, state: 'unavailable', nodes: ['Taiwan 01', 'Taiwan 02', 'Japan 01', 'US 01'], selected: 'Taiwan 01', mode: 'rule' };
+  const props = { locale: 'zh', report, delays: { 'Taiwan 01': null, 'Taiwan 02': 100, 'Japan 01': 300, 'US 01': 700 }, onRefresh() {}, onRestart() {}, onSelectNode() {}, onMeasure() {}, onModeChange() {} };
+  const html = renderToStaticMarkup(React.createElement(NetCorePanel, props));
+  assert.doesNotMatch(html, /延迟分级|低延迟|中延迟|高延迟/);
+  assert.doesNotMatch(renderToStaticMarkup(React.createElement(NetCorePanel, { ...props, locale: 'en' })), /Latency levels|Low &lt; 200 ms|Medium 200–499 ms|High ≥ 500 ms/);
+  assert.match(html, /class="netcore-recovery" data-tone="warn"/);
+  assert.match(html, /同地区有 1 个可用备用节点/);
+  assert.match(html, /class="netcore-node__latency" data-tone="ok"[^>]*>100 ms/);
+  assert.match(html, /class="netcore-node__latency" data-tone="warn"[^>]*>300 ms/);
+  assert.match(html, /class="netcore-node__latency" data-tone="danger"[^>]*>700 ms/);
+  assert.match(html, /class="netcore-node__latency" data-tone="danger"[^>]*>超时/);
+  const cards = html.slice(html.indexOf('<ul class="netcore-nodes">'));
+  assert.doesNotMatch(cards, /disabled=""/);
+  const crossRegion = renderToStaticMarkup(React.createElement(NetCorePanel, { ...props, delays: { ...props.delays, 'Taiwan 02': null } }));
+  assert.match(crossRegion, /class="netcore-recovery" data-tone="danger"/);
+  assert.match(crossRegion, /跨地区切换需要确认/);
+});
+
+test('跨地区选择必须确认，同地区手动切换，供应商变化后旧确认失效', t => {
+  const { NetCorePanel } = require(path.join(root, 'src/components/detector/NetCorePanel.tsx'));
+  const states = [];
+  let hook = 0;
+  t.mock.method(React, 'useState', initial => {
+    const index = hook++;
+    if (!(index in states)) states[index] = initial;
+    return [states[index], value => { states[index] = value; }];
+  });
+  t.mock.method(React, 'useId', () => 'node-test');
+  const triggerRef = { current: null };
+  t.mock.method(React, 'useRef', () => triggerRef);
+  const trigger = { focus: t.mock.fn() };
+  const selected = [];
+  const report = { enabled: true, state: 'running', activeId: 'src_a', nodes: ['Taiwan 01', 'Taiwan 02', 'Japan 01'], selected: 'Taiwan 01', mode: 'rule' };
+  const props = { locale: 'zh', report, delays: { 'Taiwan 01': null, 'Taiwan 02': 100, 'Japan 01': 200 }, onRefresh() {}, onRestart() {}, onSelectNode: name => selected.push(name), onMeasure() {}, onModeChange() {} };
+  const render = (next = props) => { hook = 0; return NetCorePanel(next); };
+  const elements = tree => {
+    const result = [];
+    React.Children.forEach(tree, element => {
+      if (!React.isValidElement(element)) return;
+      result.push(element, ...elements(element.props.children));
+    });
+    return result;
+  };
+  const findCard = (tree, name) => elements(tree).find(element => element.type === 'button' && element.props.className === 'netcore-node' && elements(element.props.children).some(child => child.props.className === 'netcore-node__name' && child.props.children === name));
+  const findConfirm = tree => elements(tree).find(element => element.type === 'button' && element.props.children === '确认切换');
+  findCard(render(), 'Japan 01').props.onClick({ currentTarget: trigger });
+  assert.deepEqual(selected, []);
+  let tree = render();
+  assert.ok(elements(tree).some(element => element.props.className === 'netcore-confirm' && element.props['data-tone'] === 'danger'));
+  assert.ok(findConfirm(tree));
+  elements(tree).find(element => element.type === 'button' && element.props.children === '取消').props.onClick();
+  assert.equal(trigger.focus.mock.callCount(), 1);
+  assert.deepEqual(selected, []);
+  findCard(render(), 'Japan 01').props.onClick({ currentTarget: trigger });
+  tree = render();
+  assert.equal(findConfirm(render({ ...props, report: { ...report, activeId: 'src_b' } })), undefined);
+  findConfirm(tree).props.onClick();
+  assert.deepEqual(selected, ['Japan 01']);
+  findCard(render(), 'Taiwan 02').props.onClick({ currentTarget: trigger });
+  assert.deepEqual(selected, ['Japan 01', 'Taiwan 02']);
+});
+
 const fixtures = () => ({
   version:1,upstream:'https://api.anthropic.com/',platform:'win32',profileError:null,
   profile:{language:'ko-KR',locale:'ko-KR',timezone:'Asia/Seoul',updatedAt:'new'},
@@ -23,6 +164,79 @@ const fixtures = () => ({
   exit:{primary:{source:'test',ip:'1.2.3.4',countryCode:'KR',city:'Seoul',regionName:'Seoul',timezone:'Asia/Seoul',asn:'AS1',org:'Example'},sources:[{source:'test',countryCode:'KR'}],ipv4:'1.2.3.4',ipv6:null,consistentCountry:null,ipv6Error:'ENETUNREACH'},
 });
 const index = result => Object.fromEntries(result.signals.map(signal=>[signal.id,signal]));
+
+test('BIGLOBE 出口使用同 IP、同 ASN 的运营商情报，住宅结果不再悬置', () => {
+  const report = fixtures();
+  const primary = { ...report.exit.primary, source: 'ipwho.is', countryCode: 'JP', asn: 'AS2518', org: 'Japan Network Information Center' };
+  const secondary = { ...primary, source: 'ipapi.co', asn: '2518', org: 'BIGLOBE Inc.' };
+  report.exit = { ...report.exit, primary, sources: [primary, secondary], consistentCountry: true };
+  report.checkedAt = '2026-11-09T00:00:00Z';
+  report.testedSignals = ['exitType'];
+  const before = JSON.stringify(report);
+  for (const locale of ['zh', 'en']) {
+    const signal = index(buildGatewayCheck(report, locale)).exitType;
+    assert.equal(signal.assessment, 'ok');
+    assert.equal(signal.score, 0);
+    assert.equal(signal.contribution, 0);
+    assert.equal(signal.observation, undefined);
+    assert.equal(signal.testedAt, report.checkedAt);
+    assert.match(signal.value, locale === 'zh' ? /家庭网络（推断）/ : /Residential \(inferred\)/);
+    assert.match(signal.detail, /BIGLOBE/);
+    assert.match(signal.detail, /ipapi\.co/);
+    const { verificationSampleStatus } = require(path.join(root, 'src/detection/verification-score.ts'));
+    assert.equal(verificationSampleStatus(signal), 'passed');
+  }
+  assert.equal(JSON.stringify(report), before, 'classification must preserve raw source evidence');
+});
+
+test('组织名兜底只补充缺失或注册局名称，不混用其它出口的情报', () => {
+  const report = fixtures();
+  const primary = { ...report.exit.primary, asn: 'AS2518', org: 'Japan Network Information Center' };
+  const secondary = { ...primary, source: 'ipapi.co', org: 'BIGLOBE Inc.' };
+  report.testedSignals = ['exitType'];
+  for (const org of [null, '', '  ', 'APNIC', 'American Registry for Internet Numbers']) {
+    report.exit = { ...report.exit, primary: { ...primary, org }, sources: [secondary] };
+    assert.equal(index(buildGatewayCheck(report, 'zh')).exitType.assessment, 'ok', String(org));
+  }
+  for (const source of [
+    { ...secondary, ip: '5.6.7.8' },
+    { ...secondary, asn: 'AS999999' },
+    { ...secondary, asn: null },
+    { ...secondary, org: 'APNIC' },
+    { ...secondary, org: null },
+  ]) {
+    report.exit = { ...report.exit, primary, sources: [source] };
+    const signal = index(buildGatewayCheck(report, 'zh')).exitType;
+    assert.equal(signal.assessment, 'unknown');
+    assert.equal(signal.observation, 'inconclusive');
+    assert.equal(signal.contribution, 0);
+  }
+  report.exit = { ...report.exit, primary: { ...primary, org: 'Unknown company' }, sources: [secondary] };
+  assert.equal(index(buildGatewayCheck(report, 'zh')).exitType.assessment, 'unknown');
+  report.exit = { ...report.exit, primary: { ...primary, org: 'Cloud Hosting' }, sources: [secondary] };
+  assert.equal(index(buildGatewayCheck(report, 'zh')).exitType.assessment, 'warning');
+  report.exit = { ...report.exit, primary: null, sources: [secondary] };
+  assert.equal(index(buildGatewayCheck(report, 'zh')).exitType.assessment, 'unknown');
+});
+
+test('网关网络类型保留住宅、机房、未知三态及原有风险权重', () => {
+  for (const [org, asn, assessment, score] of [
+    ['BIGLOBE Inc.', 'AS2518', 'ok', 0],
+    ['Comcast Cable Communications', 'AS7922', 'ok', 0],
+    ['Japan Network Information Center', 'AS2518', 'unknown', 0],
+    ['Example', 'AS999999', 'unknown', 0],
+    [null, null, 'unknown', 0],
+    ['BIGLOBE Inc.', 'AS16509', 'warning', 1],
+  ]) {
+    const report = fixtures();
+    report.exit.primary = { ...report.exit.primary, org, asn };
+    const signal = index(buildGatewayCheck(report, 'zh')).exitType;
+    assert.equal(signal.assessment, assessment, String(org));
+    assert.equal(signal.score, score);
+    assert.equal(signal.contribution, score * 13);
+    if (assessment !== 'unknown') assert.ok(signal.testedAt);
+  }
+});
 
 test('49 enabled signals exclude the removed API check; offline and non-applicable are not passes',()=>{
   assert.equal(Object.values(signalConfig).filter(config=>config.enabled).length,49);
@@ -45,7 +259,8 @@ test('previews, HTTP 401/403 and DNS resolution do not manufacture successful Cl
   assert.equal(signals.requestHeaders.assessment,'unknown');
   assert.equal(signals.apiReachability,undefined);
   assert.equal(signals.dnsReview.assessment,'unknown');
-  assert.equal(signals.proxyCountry.assessment,'unknown');
+  // 只有一家情报源时无法交叉核对：显式标为「不适用」，而不是长期挂在「待处理」。
+  assert.equal(signals.proxyCountry.assessment,'not_applicable');
   assert.equal(signals.ipv4.assessment,'ok');
   assert.equal(result.verifiedRequest,false);
   assert.equal(result.geo.countryCode,'KR');
@@ -830,19 +1045,23 @@ test('verification score separates full passing credit from provisional half cre
   assert.equal(verificationPoint({...good,assessment:'not_applicable'}),null);
 });
 
-test('overview exposes recheck, monitoring choices and pass coverage without test timestamps',()=>{
+test('overview exposes recheck and pass coverage while configuration moves to settings',()=>{
   const {ProtectionWorkspace} = require(path.join(root,'src/components/detector/ProtectionWorkspace.tsx'));
   const {verificationScores} = require(path.join(root,'src/detection/verification-score.ts'));
   const props = {locale:'zh',report:{phase:'idle',enabled:false,issues:[],history:[],monitoring:true,intervalMs:300000},connected:true,busy:false,scores:verificationScores(null,null),geo:null,target:null,baseline:null,browser:[],claude:[],signals:[],cards:null,filter:'all',search:'',onFilter:()=>{},onSearch:()=>{},onToggle:()=>{},onMonitor:()=>{},onRefresh:()=>{},onSelect:()=>{}};
   const html = renderToStaticMarkup(React.createElement(ProtectionWorkspace,props));
-  assert.ok(html.includes('>重新检测</button>'));
-  assert.match(html,/aria-label="自动检测间隔"/);
-  assert.match(html,/value="300000" selected=""/);
-  assert.match(html,/每30秒/); assert.match(html,/每10分钟/);
+  // 复检入口现在落在顶部「检测」与出口环境「刷新」两处；文案变更后仍必须可见。
+  assert.ok(html.includes('>检测</button>'));
+  assert.ok(html.includes('>刷新</button>'));
+  assert.doesNotMatch(html,/自动检测间隔|开机自启动|workspace-preferences/);
+  assert.match(html,/aria-haspopup="dialog"[^>]*>[\s\S]*?设置/);
   assert.doesNotMatch(html,/最近检测|下次检测|异常分/);
-  assert.match(html,/验证得分/); assert.doesNotMatch(html,/暂计|汇总得分|workspace-score-note/); assert.match(html,/环境风险估计/);
+  assert.doesNotMatch(html,/查看防护状态和待处理事项/);
+  assert.match(html,/环境检测得分/); assert.match(html,/满分 100/); assert.match(html,/未判定项暂计半分/); assert.match(html,/环境风险估计/);
+  assert.doesNotMatch(html,/aria-valuenow=/,'without samples, provisional credit is not displayed as a measured score');
   const english = renderToStaticMarkup(React.createElement(ProtectionWorkspace,{...props,locale:'en'}));
-  assert.doesNotMatch(english,/Provisional|Total score|workspace-score-note/);
+  assert.doesNotMatch(english,/Review protection and items that need attention/);
+  assert.match(english,/Weighted score out of 100/); assert.match(english,/unresolved items receive half credit/);
   const busy = renderToStaticMarkup(React.createElement(ProtectionWorkspace,{...props,busy:true,checking:true}));
   assert.match(busy,/disabled=""[^>]*>检测中…/);
   const {ScoreMeter} = require(path.join(root,'src/components/detector/ScoreMeter.tsx'));
@@ -1000,3 +1219,362 @@ test('derived gateway values are measured, hosting orgs classify, and dialog sep
   assert.match(html,/未达标/);
 });
 
+
+test('网络内核面板：只给证据，不给未经证实的通过结论',()=>{
+  const {NetCorePanel}=require(path.join(root,'src/components/detector/NetCorePanel.tsx'));
+  const render=(report,locale='zh')=>renderToStaticMarkup(React.createElement(NetCorePanel,{locale,report,busy:false,onRefresh:()=>{},onRestart:()=>{},onSelectNode:()=>{},onStrictChange:()=>{}}));
+  const running={enabled:true,state:'running',tunEnabled:true,tunCaptured:true,demo:false,version:'v1.19.33',restarts:0,nodes:['住宅-东京-01','住宅-新加坡-01'],selected:'住宅-东京-01',
+    routing:{state:'verified',claude:12,pinned:12,direct:0,total:20,violations:[],sampledAt:new Date().toISOString()},detail:'12 条 Claude 连接全部命中 CLAUDE-PIN，无直连。'};
+
+  const ok=render(running);
+  assert.match(ok,/出口结论/);
+  assert.match(ok,/已观察到的 Claude 连接走专用出口/);
+  assert.match(ok,/Claude 连接/);
+  assert.match(ok,/data-tone="ok"/);
+  assert.doesNotMatch(ok,/netcore-violations/);
+  assert.match(ok,/aria-pressed="true"/);
+
+  // 无流量：不得出现通过态。
+  const unknown=render({...running,routing:{state:'unknown',claude:0,pinned:0,direct:0,total:0,violations:[]}});
+  assert.match(unknown,/未观察到 Claude 连接/);
+  assert.match(unknown, /class="netcore-conclusion" data-tone="warn"/);
+
+  // 违规：列出主机与代理链。
+  const violation=render({...running,routing:{state:'violation',claude:2,pinned:1,direct:1,total:3,violations:[{host:'api.anthropic.com',chains:['DIRECT']}]}});
+  assert.match(violation,/netcore-violations/);
+  assert.match(violation,/api\.anthropic\.com/);
+  assert.match(violation,/DIRECT/);
+  assert.match(violation,/data-tone="danger"/);
+
+  // 演示模式必须标注，且不能是 ok。
+  const demo=render({...running,demo:true});
+  assert.match(demo,/演示节点/);
+  assert.match(demo, /class="netcore-conclusion" data-tone="warn"/);
+
+  // 未配置：空态与原因，不出现任何出口结论指标。
+  const disabled=render({enabled:false,state:'disabled',reason:'尚未配置出口节点'});
+  assert.match(disabled,/尚未配置出口节点/);
+  assert.match(disabled,/先配置出口节点/);
+  assert.doesNotMatch(disabled,/netcore-strip/);
+
+  // 英文文案。
+  const en=render(running,'en');
+  assert.match(en,/Exit conclusion/);
+  assert.match(en,/Observed Claude connections use the dedicated exit/);
+  const blocked=render({...running,strictMode:true,guard:{armed:true,phase:'blocked'},capabilities:{strictTravel:false}});
+  assert.match(blocked,/严格连接尚未放行/);
+  assert.doesNotMatch(blocked, /class="netcore-conclusion" data-tone="ok"/);
+  for(const mode of blocked.match(/<button[^>]*class="netcore-mode"[^>]*>/g)??[]) assert.match(mode,/disabled=""/);
+});
+
+test('配置与供应商：列表展示名称/类型/节点数/更新时间，长链接只露域名',()=>{
+  const {SourcesDialog}=require(path.join(root,'src/components/detector/SourcesDialog.tsx'));
+  const sources=[
+    {id:'src_a',name:'首尔机场',mode:'url',url:'https://a.example.com/s.yaml',nodeCount:3,selected:'n1',updatedAt:'2026-11-05T00:00:00.000Z',intervalHours:6,active:true},
+    {id:'src_b',name:'备用机场',mode:'manual',url:null,nodeCount:1,selected:'m1',updatedAt:'2026-11-04T00:00:00.000Z',intervalHours:6,active:false},
+  ];
+  const props={locale:'zh',busy:false,sources,activeId:'src_a',onClose:()=>{},onImport:async()=>({ok:true,imported:1}),onAction:async()=>({ok:true}),onChanged:()=>{}};
+  const html=renderToStaticMarkup(React.createElement(SourcesDialog,props));
+  assert.match(html,/配置与供应商/);
+  assert.match(html,/首尔机场/);
+  assert.match(html,/备用机场/);
+  assert.match(html,/订阅链接/);
+  assert.match(html,/3 个节点/);
+  assert.match(html,/更新于/);
+  assert.match(html,/>编辑</);
+  assert.match(html,/>删除</);
+  assert.match(html,/>设为当前</);
+  // 订阅令牌只在编辑表单里出现：列表只显示域名，截图分享不会泄露完整链接。
+  assert.doesNotMatch(html,/https:\/\/a\.example\.com\/s\.yaml/);
+  assert.match(html,/a\.example\.com/);
+  const en=renderToStaticMarkup(React.createElement(SourcesDialog,{...props,locale:'en'}));
+  assert.match(en,/Configurations/);
+  assert.match(en,/In use/);
+  assert.match(en,/Use/);
+});
+
+test('添加配置表单：四种来源都可见，链接与自定义表单可渲染',()=>{
+  const {SourcesDialog}=require(path.join(root,'src/components/detector/SourcesDialog.tsx'));
+  const base={sources:[],activeId:null,busy:false,onClose:()=>{},onImport:async()=>({ok:true,imported:1,selected:'x'}),onAction:async()=>({ok:true}),onChanged:()=>{}};
+  const html=renderToStaticMarkup(React.createElement(SourcesDialog,{...base,locale:'zh',initialView:'add'}));
+  assert.match(html,/添加配置/);
+  assert.match(html,/订阅 \/ 分享链接/);
+  assert.match(html,/>链接</);
+  assert.match(html,/>本地代理</);
+  assert.match(html,/>文件</);
+  assert.match(html,/>自定义</);
+  assert.match(html,/placeholder="https:\/\/example\.com\/sub\.yaml"/);
+  assert.match(html,/导入会替换这条配置原有的节点快照/);
+  const en=renderToStaticMarkup(React.createElement(SourcesDialog,{...base,locale:'en',initialView:'add'}));
+  assert.match(en,/Add configuration/);
+  assert.match(en,/Subscription or share link/);
+});
+
+test('内网直连弹窗：字段分组、保存与重启入口、双语标题均可渲染',()=>{
+  const {NetworkExemptDialog}=require(path.join(root,'src/components/detector/NetworkExemptDialog.tsx'));
+  const html=renderToStaticMarkup(React.createElement(NetworkExemptDialog,{locale:'zh',busy:false,onClose:()=>{},onSaved:()=>{}}));
+  assert.match(html,/内网直连（VPN \/ 公司网络）/);
+  assert.match(html,/域名后缀/); assert.match(html,/IP \/ CIDR/); assert.match(html,/DNS 解析/);
+  assert.match(html,/严格路由（推荐）/);
+  assert.match(html,/>保存并重启内核</);
+  assert.match(html,/>关闭</);
+  const en=renderToStaticMarkup(React.createElement(NetworkExemptDialog,{locale:'en',busy:false,onClose:()=>{},onSaved:()=>{}}));
+  assert.match(en,/Local network direct \(VPN \/ corporate\)/);
+  assert.match(en,/Save &amp; restart kernel/);
+});
+
+test('内网直连摘要：只说人话，不泄露内核规则语法',()=>{
+  const {exemptSummary}=require(path.join(root,'src/components/detector/NetworkExemptDialog.tsx'));
+  const full=exemptSummary(true,{domains:['onmicro.ic'],addresses:['203.0.113.7'],dnsServers:['10.10.10.5#ENVGUARD-LOCAL-DNS'],directInterface:'以太网 2'});
+  assert.equal(full,'内网域名 onmicro.ic · 豁免 IP 1 个 · 内网 DNS 10.10.10.5 · 走网卡 以太网 2');
+  assert.doesNotMatch(full,/DOMAIN-SUFFIX|IP-CIDR|ENVGUARD-LOCAL/);
+  // 没有配置时给结论与下一步，而不是一排 0。
+  const empty=exemptSummary(true,{domains:[],addresses:[],dnsServers:[],directInterface:''});
+  assert.match(empty,/会被当成公网/);
+  assert.doesNotMatch(empty,/0 个/);
+  const many=exemptSummary(false,{domains:['a.example','b.example','c.example'],addresses:[],dnsServers:[],directInterface:''});
+  assert.match(many,/Internal domains a\.example, b\.example \+1/);
+  assert.match(many,/DNS follows system/);
+});
+
+test('内网直连弹窗：域名区有「测试解析」入口，且默认不暴露规则语法',()=>{
+  const {NetworkExemptDialog}=require(path.join(root,'src/components/detector/NetworkExemptDialog.tsx'));
+  const html=renderToStaticMarkup(React.createElement(NetworkExemptDialog,{locale:'zh',busy:false,onClose:()=>{},onSaved:()=>{}}));
+  assert.match(html,/>测试解析</);
+  assert.doesNotMatch(html,/DOMAIN-SUFFIX|IP-CIDR,/);
+  const en=renderToStaticMarkup(React.createElement(NetworkExemptDialog,{locale:'en',busy:false,onClose:()=>{},onSaved:()=>{}}));
+  assert.match(en,/Test resolution/);
+});
+
+test('检测项分层：环境固有与链路项不计入「异常项目」，但仍在保护范围外边列出',()=>{
+  const { signalRequirement, partitionIssues, requirementLabel } = require(path.join(root,'src/detection/signal-requirement.ts'));
+  assert.equal(signalRequirement('chineseFonts'),'environment');
+  assert.equal(signalRequirement('emojiStyle'),'environment');
+  assert.equal(signalRequirement('claudeReachability'),'link');
+  assert.equal(signalRequirement('country'),'link');
+  assert.equal(signalRequirement('language'),'rewritable');
+  assert.equal(signalRequirement('timezone'),'rewritable');
+  const parts = partitionIssues([{id:'language'},{id:'chineseFonts'},{id:'emojiStyle'},{id:'claudeReachability'}]);
+  assert.deepEqual(parts.actionable.map((item)=>item.id),['language']);
+  assert.deepEqual(parts.environment.map((item)=>item.id),['chineseFonts','emojiStyle']);
+  assert.deepEqual(parts.link.map((item)=>item.id),['claudeReachability']);
+  assert.equal(requirementLabel(true,'environment'),'环境固有限制');
+
+  const {ProtectionWorkspace} = require(path.join(root,'src/components/detector/ProtectionWorkspace.tsx'));
+  const {verificationScores} = require(path.join(root,'src/detection/verification-score.ts'));
+  const flagged = (id,label)=>({id,label,value:'命中',score:1,weight:16,contribution:16,assessment:'warning',source:'browser',testedAt:new Date().toISOString()});
+  const browserSignals=[flagged('chineseFonts','字体地区特征'),flagged('emojiStyle','Emoji 渲染风格')];
+  const html = renderToStaticMarkup(React.createElement(ProtectionWorkspace,{
+    locale:'zh',report:{phase:'idle',enabled:false,issues:[],history:[],monitoring:true,intervalMs:300000},connected:true,busy:false,
+    scores:verificationScores(null,null),geo:null,target:null,baseline:null,browser:browserSignals,claude:[],signals:browserSignals,cards:null,
+    filter:'all',search:'',onFilter:()=>{},onSearch:()=>{},onToggle:()=>{},onMonitor:()=>{},onRefresh:()=>{},onSelect:()=>{},
+  }));
+  // 两项都属于环境固有：异常项目计数为 0，但它们仍会在「保护范围外」出现。
+  assert.match(html,/workspace-heading-count">0</);
+  assert.match(html,/保护范围外 · 2/);
+  assert.match(html,/环境固有限制/);
+});
+
+test('检测项分层：出口类型与 IP 情报交叉核对属于链路项',()=>{
+  const { signalRequirement } = require(path.join(root,'src/detection/signal-requirement.ts'));
+  for (const id of ['exitType','multiSourceConsistency','asn','gatewayAsn','webrtcRegion','proxyCountry']) assert.equal(signalRequirement(id),'link',id);
+  for (const id of ['language','languageVariant','locale','timezone','timezoneOffset','webrtcLeak','dnsConsistency']) assert.equal(signalRequirement(id),'rewritable',id);
+  for (const id of ['chineseFonts','emojiStyle','vendorFonts','domesticDevice']) assert.equal(signalRequirement(id),'environment',id);
+});
+
+test('保护检测采样前自动同步浏览器环境，普通扫描保持原样，同步失败可重试', async () => {
+  const source = fs.readFileSync(path.join(root, 'src/components/detector/Detector.tsx'), 'utf8');
+  const file = ts.createSourceFile('Detector.tsx', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
+  let callback;
+  const visit = node => {
+    if (ts.isVariableDeclaration(node) && node.name.getText(file) === 'runAll') callback = node.initializer.arguments[0].getText(file);
+    ts.forEachChild(node, visit);
+  };
+  visit(file);
+  assert.ok(callback);
+  const script = ts.transpile(`const scan = ${callback}`, { target: ts.ScriptTarget.ES2022 }) + '\nscan;';
+  for (const scenario of ['protected', 'ordinary', 'failed']) {
+    const events = [];
+    const scanTask = { current: null }, scanLock = { current: false };
+    let fail = scenario === 'failed';
+    const scan = require('node:vm').runInNewContext(script, {
+      scanTask, scanLock, scanVersion: { current: 0 },
+      async synchronizeBrowserCloak() {
+        events.push('sync');
+        if (fail) throw new Error('browser sync failed');
+        await Promise.resolve();
+        events.push('synced');
+        return { enabled: true };
+      },
+      setBrowserCloak: () => events.push('report'),
+      async runBrowserScan() { events.push('scan'); return { signals: [] }; },
+      async checkGateway() { return { signals: [] }; },
+      normalizeRegion: value => value, locale: 'zh', detectorText: {},
+      crypto: { randomUUID: () => 'sample' },
+      setRunning() {}, setCheckError() {}, setBrowserScan() {}, setClaudeCheck() {},
+      setOptimization() {}, setPointResults() {}, setExitGeo() {}, setCompletedSample() {},
+    });
+    const options = scenario === 'ordinary' ? {} : { runId: 'startup-run' };
+    if (fail) {
+      await assert.rejects(scan(options), /browser sync failed/);
+      assert.deepEqual(events, ['sync']);
+      assert.equal(scanTask.current, null);
+      assert.equal(scanLock.current, false);
+      fail = false;
+      events.length = 0;
+    }
+    await scan(options);
+    assert.deepEqual(events, scenario === 'ordinary' ? ['scan'] : ['sync', 'synced', 'report', 'scan']);
+  }
+});
+
+test('浏览器迷惑层：概览里能看见状态与「启动保护浏览器」入口',()=>{
+  const {ProtectionWorkspace} = require(path.join(root,'src/components/detector/ProtectionWorkspace.tsx'));
+  const {verificationScores} = require(path.join(root,'src/detection/verification-score.ts'));
+  const props = {locale:'zh',report:{phase:'idle',enabled:false,issues:[],history:[],monitoring:true,intervalMs:300000},connected:true,busy:false,scores:verificationScores(null,null),geo:null,target:null,baseline:null,browser:[],claude:[],signals:[],cards:null,filter:'all',search:'',onFilter:()=>{},onSearch:()=>{},onToggle:()=>{},onMonitor:()=>{},onRefresh:()=>{},onSelect:()=>{}};
+  const html = renderToStaticMarkup(React.createElement(ProtectionWorkspace,props));
+  assert.match(html,/浏览器模拟保护/);
+  assert.match(html,/启动保护浏览器/);
+  // 未接入时不冒充已验证。
+  assert.match(html,/未跟随网关/);
+  const en = renderToStaticMarkup(React.createElement(ProtectionWorkspace,{...props,locale:'en'}));
+  assert.match(en,/Launch protected browser/);
+});
+
+test('本地浏览器弹窗：说明边界、列出选项、双语可渲染',()=>{
+  const {BrowserPickerDialog}=require(path.join(root,'src/components/detector/BrowserPickerDialog.tsx'));
+  const html=renderToStaticMarkup(React.createElement(BrowserPickerDialog,{locale:'zh',busy:false,onClose:()=>{},onSaved:()=>{},onLink:()=>{}}));
+  assert.match(html,/本地浏览器/);
+  // 边界必须写明：接管的是受管实例，不动正在用的窗口。
+  assert.match(html,/不会被接管，也不会被改动/);
+  assert.match(html,/正在识别本机浏览器/);
+  const en=renderToStaticMarkup(React.createElement(BrowserPickerDialog,{locale:'en',busy:false,onClose:()=>{},onSaved:()=>{},onLink:()=>{}}));
+  assert.match(en,/Local browsers/);
+  assert.match(en,/neither taken over nor modified/);
+});
+
+test('reference result table keeps failed, passing and inapplicable sides independent', () => {
+  const {SignalTable} = require(path.join(root,'src/components/detector/SignalTable.tsx'));
+  const at = '2026-11-08T00:00:00Z';
+  const language = {id:'language',label:'Language',value:'ko-KR',testedAt:at,assessment:'ok',contribution:0};
+  const timezone = {...language,id:'timezone',label:'Timezone',value:'Asia/Seoul'};
+  const html = renderToStaticMarkup(React.createElement(SignalTable, {
+    locale:'en',signals:[language,timezone],browser:[{...language,value:'zh-CN',assessment:'warning',contribution:20},timezone],claude:[language,timezone],onSelect:()=>{},
+  }));
+  assert.match(html, /zh-CN<\/span><span[^>]*data-result="failed"/);
+  assert.match(html, /ko-KR<\/span><span[^>]*data-result="passed"/);
+  assert.equal((html.match(/Asia\/Seoul/g) ?? []).length, 1, 'browser-only timezone must not acquire a client observation');
+  assert.match(html, /data-result="not_applicable"[^>]*>N\/A/);
+  assert.match(html, /aria-haspopup="dialog"/);
+});
+
+test('normalized score display preserves the original weighted measurement and empty state', () => {
+  const {ScoreMeter} = require(path.join(root,'src/components/detector/ScoreMeter.tsx'));
+  const render = value => renderToStaticMarkup(React.createElement(ScoreMeter,{value,maximum:150,normalized:true,label:'Weighted score',pending:'Not tested'}));
+  const measured = render(75);
+  assert.match(measured, /<strong>50<small> \/ 100/);
+  assert.match(measured, /aria-valuemax="150" aria-valuenow="75"/);
+  assert.match(measured, /width:50%/);
+  assert.doesNotMatch(render(null), /aria-valuenow/);
+  assert.match(render(null), /Not tested/);
+});
+
+test('manual exit probing shows IP and region even when the region matches the node name', () => {
+  const {NetCorePanel} = require(path.join(root,'src/components/detector/NetCorePanel.tsx'));
+  const report = { enabled:true, state:'running', nodes:['Japan 01','Korea 01'], selected:'Japan 01', mode:'rule', routing:{state:'unknown',claude:0,pinned:0,direct:0,total:0,violations:[]} };
+  const props = { locale:'en',report,onRefresh:()=>{},onRestart:()=>{},onSelectNode:()=>{},onMeasure:()=>{},onProbeExits:()=>{},onModeChange:()=>{},exitsAt:'2026-11-08T00:00:00Z',exits:{'Japan 01':{ip:'203.0.113.10',countryCode:'JP',country:'Japan'},'Korea 01':{ip:'203.0.113.20',countryCode:'US',country:'United States'}} };
+  const html = renderToStaticMarkup(React.createElement(NetCorePanel, props));
+  const cards = html.slice(html.indexOf('<ul class="netcore-nodes">'));
+  assert.match(cards, /Exit IP<\/span><span>203\.0\.113\.10/);
+  assert.match(cards, /Exit region<\/span><span>Japan/);
+  assert.match(cards, /Exit IP<\/span><span>203\.0\.113\.20/);
+  assert.match(cards, /Exit region<\/span><span>United States/);
+  assert.ok(html.indexOf('netcore-scope') < html.indexOf('netcore-nodes'), 'proxy scope must remain above a long node list');
+  assert.match(html, /role="tooltip"[^>]*>Measure response latency/);
+  assert.match(html, /role="tooltip"[^>]*>Query each node/);
+  const unavailable = renderToStaticMarkup(React.createElement(NetCorePanel, {...props,exits:{}}));
+  assert.equal((unavailable.match(/data-state="unavailable"/g) ?? []).length, 2);
+  assert.match(unavailable, /No exit IP was returned/);
+  const before = renderToStaticMarkup(React.createElement(NetCorePanel, {...props,exitsAt:null,exits:{}}));
+  assert.doesNotMatch(before, /class="netcore-node__exit"/);
+});
+
+test('路径图独立显示普通代理采样，不依赖 Claude 活动，也不按全局模式伪造动效', () => {
+  const {TrafficFlow} = require(path.join(root,'src/components/detector/TrafficFlow.tsx'));
+  const originalHook = React.useSyncExternalStore;
+  const originalWindow = global.window, originalDocument = global.document;
+  let reduced = false;
+  React.useSyncExternalStore = (_subscribe, snapshot) => snapshot();
+  global.window = { matchMedia: () => ({ matches: reduced }) };
+  global.document = { hidden: false };
+  const report = { state:'running',mode:'global',tunEnabled:true,tunCaptured:true,
+    routing:{state:'unknown',claude:0,pinned:0,direct:0,violations:[],sampledAt:new Date().toISOString(),traffic:{proxied:3,direct:0,blocked:0,unknown:0}},
+    connectionLog:{available:true,sampledAt:new Date().toISOString(),scope:'all',activeTotal:30,active:Array.from({length:30},(_,i)=>({id:`flow${i}`,host:`site${i}.example.com`,kind:'connection',route:'proxied',chains:['node','AUTO-PROXY'],isClaude:false,endedAt:null}))} };
+  const render = (value, locale='zh') => renderToStaticMarkup(React.createElement(TrafficFlow,{report:value,locale,onDetails:()=>{}}));
+  try {
+    const html = render(report);
+    const classifiedReport = { ...report, connectionLog: { ...report.connectionLog, active: [
+      { ...report.connectionLog.active[0], id: 'claude-proxy', host: 'api.anthropic.com', isClaude: true },
+      { ...report.connectionLog.active[1], id: 'claude-direct', host: 'claude.ai', route: 'direct', isClaude: true },
+      { ...report.connectionLog.active[2], id: 'ordinary-proxy', isClaude: false },
+    ] } };
+    const classified = render(classifiedReport);
+    assert.match(classified, /workspace-flow__connection--proxy" data-claude="true"/);
+    assert.match(classified, /workspace-flow__connection--direct" data-claude="true"/);
+    assert.match(classified, /workspace-flow__connection--proxy" data-claude="false"/);
+    assert.match(classified, /<title>Claude · api\.anthropic\.com · 代理出口<\/title>/);
+    const flowCss = fs.readFileSync(path.join(root, 'src/components/detector/workspace.css'), 'utf8');
+    assert.match(flowCss, /\.workspace-flow__caption\s*\{[^}]*text-align:\s*right/);
+    assert.match(flowCss, /--workspace-flow-claude:\s*#2d67a3\b/);
+    assert.match(flowCss, /\.workspace-flow__connection\[data-claude="true"\]\s*\{\s*fill:\s*var\(--workspace-flow-claude\)/);
+    assert.match(html, /workspace-flow__filament/);
+    assert.doesNotMatch(fs.readFileSync(path.join(root, 'src/components/detector/TrafficFlow.tsx'), 'utf8'), /\.pauseAnimations\(/);
+    assert.match(html, /代理出口 · 3 条/);
+    assert.match(html, /直连 · 0 条/);
+    assert.match(html, /workspace-flow__path--proxy" data-verified="true"/);
+    assert.doesNotMatch(html, /workspace-flow__path--overseas/);
+    assert.match(html, /workspace-flow__connection--proxy/);
+    assert.doesNotMatch(html, /workspace-flow__connection--overseas|国内直连/);
+    assert.match(html, /<title>site0\.example\.com · 代理出口<\/title>/); assert.doesNotMatch(html, /workspace-flow__more/);
+    // 每个粒子带一段名字显隐动画：离开本机后短暂显示、2 秒时隐藏；30 条连接按 10 轮错开，避免同时挤满起点。
+    assert.equal((html.match(/attributeName="opacity" values="0;0;1;1;0;0"/g) ?? []).length, 30);
+    assert.match(html, /keyTimes="0;0\.0058;0\.0083;0\.0342;0\.0392;1" dur="60s" begin="0\.00s"/);
+    assert.match(html, /网络连接流向 · 悬停查看信息，点击打开详情/);
+    assert.doesNotMatch(html, /光效为路径示意|光点离开本机时短暂显示主机名/);
+    assert.equal((html.match(/role="button"/g) ?? []).length, 30);
+    const merged = render({...report,routing:{...report.routing,state:'verified',claude:2,pinned:2,traffic:{proxied:27,direct:1,blocked:0,unknown:0},paths:{proxied:29,direct:1,blocked:0,unknown:0}},connectionLog:{...report.connectionLog,activeTotal:30,active:report.connectionLog.active.map((record,i)=>i===0?{...record,host:'claude.ai',isClaude:true,chains:['node','CLAUDE-PIN']}:record)}});
+    assert.match(merged, /代理出口 · 29 条/);
+    assert.equal((merged.match(/workspace-flow__node--proxy"/g) ?? []).length, 1);
+    assert.doesNotMatch(merged, /workspace-flow__node--overseas|workspace-flow__connection--overseas/);
+    assert.doesNotMatch(merged, /workspace-flow__more/);
+    assert.equal((merged.match(/role="button"/g) ?? []).length, 30);
+    for (const node of ['proxy','direct','gateway']) assert.match(merged, new RegExp('workspace-flow__node--' + node + '[^>]*aria-haspopup="dialog"'));
+    assert.match(merged, /点击查看已拦截连接/);
+    assert.match(merged, /claude\.ai/);
+    const stale = render({...report,connectionLog:{...report.connectionLog,sampledAt:new Date(Date.now()-60000).toISOString()},routing:{...report.routing,sampledAt:new Date(Date.now()-60000).toISOString()}});
+    assert.match(stale, /代理出口 · 待采样/);
+    assert.doesNotMatch(stale, /workspace-flow__connection--|data-verified="true"/);
+    assert.match(stale, /workspace-flow__photon--proxy/);
+    assert.match(stale, /网络连接流向 · 悬停查看信息，点击打开详情/);
+    const absent = render({...report,connectionLog:undefined,routing:{...report.routing,traffic:undefined}});
+    assert.match(absent, /代理出口 · 待采样/);
+    assert.doesNotMatch(absent, /workspace-flow__connection--/);
+    assert.match(absent, /workspace-flow__photon--direct/);
+    assert.doesNotMatch(render({...report,state:'idle'}), /animateMotion/);
+    reduced = true;
+    const stillClassified = render(classifiedReport);
+    assert.match(stillClassified, /workspace-flow__connection--proxy" data-claude="true"/);
+    assert.match(stillClassified, /workspace-flow__connection--direct" data-claude="true"/);
+    assert.doesNotMatch(stillClassified, /animateMotion/);
+    const still = render(report,'en');
+    assert.match(still, /Network connection flow · hover for info, select for details/);
+    assert.match(still, /Proxy exit · 3 conn\./);
+    assert.match(still, /data-verified="true"/);
+    assert.doesNotMatch(still, /animateMotion/);
+    assert.doesNotMatch(still, /attributeName="opacity" values="0;0;1;1;0;0"/);
+  } finally {
+    React.useSyncExternalStore = originalHook;
+    if (originalWindow === undefined) delete global.window; else global.window = originalWindow;
+    if (originalDocument === undefined) delete global.document; else global.document = originalDocument;
+  }
+});

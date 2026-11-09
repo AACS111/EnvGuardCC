@@ -2,6 +2,8 @@ name: Desktop release
 
 on:
   workflow_dispatch:
+  pull_request:
+    branches: [develop, main]
   push:
     branches: [develop]
     tags: ['v*']
@@ -31,6 +33,12 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+          fetch-depth: 0
+      - name: Verify release tag comes from main
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: node scripts/validate-release-source.mjs
       - uses: pnpm/action-setup@v4
         with:
           version: 10.34.5
@@ -61,7 +69,12 @@ jobs:
           pnpm test:tauri
           mkdir -p node_modules/.checkcc-tauri-backend
           cargo test --manifest-path src-tauri/Cargo.toml --locked
-          node --test --test-timeout=60000 scripts/check-dev.mjs scripts/check-desktop-launcher.mjs scripts/check-shutdown-restore.mjs scripts/check-protection-session.mjs scripts/check-protection-controls.cjs scripts/check-protection-reconnect.mjs scripts/check-application-paths.mjs scripts/check-macos-adapters.mjs scripts/check-windows-timezone.mjs scripts/check-timezone-service.mjs scripts/check-desktop-settings.mjs scripts/check-claude-reset.mjs
+          node --test --test-timeout=60000 scripts/check-dev.mjs scripts/check-desktop-launcher.mjs scripts/check-shutdown-restore.mjs scripts/check-protection-session.mjs scripts/check-protection-controls.cjs scripts/check-protection-reconnect.mjs scripts/check-application-paths.mjs scripts/check-macos-adapters.mjs scripts/check-windows-timezone.mjs scripts/check-timezone-service.mjs scripts/check-desktop-settings.mjs scripts/check-claude-reset.mjs scripts/check-gateway.mjs scripts/check-app-updates.mjs scripts/check-gateway-model.cjs scripts/check-network-type.cjs
+      - name: Fetch kernel and verify its lifecycle
+        shell: bash
+        run: |
+          pnpm kernel:fetch
+          pnpm test:netcore
       - name: Build app and installer
         run: pnpm desktop:installer
       - name: Verify Windows installer process guard

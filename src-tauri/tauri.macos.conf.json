@@ -1,5 +1,6 @@
 {
   "bundle": {
+    "icon": ["../desktop/envguardcc.icns", "../public/envguardcc-icon.png"],
     "macOS": { "infoPlist": "Info.plist" }
   }
 }

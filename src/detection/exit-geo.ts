@@ -16,6 +16,7 @@ export type ExitGeo = {
 };
 
 export type ExitTarget = {
+  ip?: string;
   countryCode: string | null;
   countryName: string;
   city: string | null;
@@ -23,6 +24,12 @@ export type ExitTarget = {
   windowsTimezone: string | null;
   language: string | null;
   locale: string | null;
+  /** 出口 ASN/运营商/机房属性：Claude 可能据此拒绝登录。 */
+  asn?: number | null;
+  org?: string | null;
+  isp?: string | null;
+  domain?: string | null;
+  hosting?: boolean;
 };
 
 // 出口国家/地区 -> 首选语言标签。用于在语言、Intl 区域设置中把“与出口一致”的选项排到最前。

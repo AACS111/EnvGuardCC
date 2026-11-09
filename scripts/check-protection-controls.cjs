@@ -17,10 +17,12 @@ Module._resolveFilename = function(id, parent, ...rest) {
 };
 for (const extension of ['.ts', '.tsx']) {
   require.extensions[extension] = (module, filename) => module._compile(ts.transpileModule(fs.readFileSync(filename, 'utf8'), {
-    compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020, jsx: ts.JsxEmit.ReactJSX },
+    compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020, jsx: ts.JsxEmit.ReactJSX, esModuleInterop: true },
   }).outputText, filename);
 }
 const { ProtectionWorkspace } = require(path.join(root, 'src/components/detector/ProtectionWorkspace.tsx'));
+const { AppUpdateDialog } = require(path.join(root, 'src/components/detector/AppUpdateNotice.tsx'));
+const { ReleaseNotes } = require(path.join(root, 'src/components/detector/ReleaseNotes.tsx'));
 const { verificationScores } = require(path.join(root, 'src/detection/verification-score.ts'));
 const workspace = (phase, props = {}) => {
   const html = renderToStaticMarkup(React.createElement(ProtectionWorkspace, {
@@ -32,24 +34,111 @@ const workspace = (phase, props = {}) => {
 };
 const button = (phase, props = {}) => workspace(phase, props).match(/<button[^>]*class="repair-button workspace-power"[^>]*>[^<]*<\/button>/)[0];
 
+test('侧栏提供更新入口与当前版本，未检查时不宣称已是最新或可更新', () => {
+  const html = workspace('idle');
+  assert.match(html, /class="workspace-text-link workspace-update__button" aria-haspopup="dialog"/);
+  assert.match(html, /检查更新/);
+  assert.match(html, new RegExp(`workspace-update__version">v${require('../package.json').version.replaceAll('.', '\\.')}`));
+  assert.doesNotMatch(html, /可更新|当前无需更新/);
+});
+
+test('更新弹窗仅在匹配安装包可用时提供下载，版本说明不执行 HTML', () => {
+  const report = { currentVersion: '0.1.3', latestVersion: '0.2.0', status: 'available',
+    downloadUrl: 'https://github.com/community/EnvGuardCC/releases/download/v0.2.0/EnvGuardCC-Setup-0.2.0.exe',
+    releaseUrl: 'https://github.com/community/EnvGuardCC/releases/tag/v0.2.0', notes: '<script>run()</script>',
+  };
+  const render = value => renderToStaticMarkup(React.createElement(AppUpdateDialog, { locale: 'zh', report: value, busy: false, failed: false }));
+  const html = render(report);
+  assert.match(html, /发现新版本 v0.2.0/);
+  assert.ok(html.includes(`href="${report.downloadUrl}"`));
+  assert.match(html, /等待配置恢复完成/);
+  assert.doesNotMatch(html, /<script>/);
+  for (const status of ['pending', 'unsupported', 'current', 'no-release']) {
+    assert.doesNotMatch(render({ ...report, status }), /下载新版本/);
+  }
+});
+
+test('真实发布说明渲染为标题、列表与行内代码，不再显示 Markdown 标记', () => {
+  const notes = fs.readFileSync(path.join(root, 'docs/releases/v0.1.3.md'), 'utf8');
+  const html = renderToStaticMarkup(React.createElement(ReleaseNotes, { baseUrl: 'https://github.com/AACS111/EnvGuardCC/releases/tag/v0.1.3' }, notes));
+  assert.match(html, /<h1>EnvGuardCC 0\.1\.3<\/h1>/);
+  assert.match(html, /<h2>下载与安装<\/h2>/);
+  assert.match(html, /<h2>验证范围<\/h2>/);
+  assert.match(html, /<ul>\s*<li>桌面宿主/);
+  assert.match(html, /<code>EnvGuardCC-Setup-0\.1\.3\.exe<\/code>/);
+  assert.doesNotMatch(html, /# EnvGuardCC|## 下载与安装|`EnvGuardCC-Setup/);
+});
+
+test('发布说明支持 GFM 表格、任务列表、引用、代码块和安全链接', () => {
+  const notes = '**修复**与~~旧行为~~\n\n> 升级说明\n\n1. 下载\n2. 安装\n\n- [x] 完成\n\n| 平台 | 状态 |\n| --- | --- |\n| Mac | 支持 |\n\n```sh\npnpm build\n```\n\n[反馈](../../issues/1)';
+  const html = renderToStaticMarkup(React.createElement(ReleaseNotes, { baseUrl: 'https://github.com/community/EnvGuardCC/releases/tag/v0.2.0' }, notes));
+  for (const tag of ['strong', 'del', 'blockquote', 'ol', 'table', 'th', 'td', 'pre']) assert.ok(html.includes(`<${tag}`), tag);
+  assert.match(html, /type="checkbox" disabled="" checked=""/);
+  assert.match(html, /<code class="language-sh">pnpm build\n<\/code>/);
+  assert.match(html, /href="https:\/\/github.com\/community\/EnvGuardCC\/issues\/1" target="_blank" rel="noreferrer"/);
+});
+
+test('Markdown 不执行原始 HTML，不生成危险协议链接或自动请求外部图片', () => {
+  const notes = '<script>alert(1)</script>\n\n<img src="https://tracking.example/pixel" onerror="alert(2)">\n\n[脚本](javascript:alert%281%29) [数据](data:text/html,hello) [凭据](https://user:password@example.com)\n\n![说明图](https://tracking.example/image.png)';
+  const html = renderToStaticMarkup(React.createElement(ReleaseNotes, {}, notes));
+  assert.doesNotMatch(html, /<script|<img|onerror|href="(?:javascript:|data:)|user:password|tracking\.example/);
+  assert.match(html, /说明图/);
+});
+
+test('更新检查失败与限流可见，不冒充无需更新；英文界面有对应提示', () => {
+  for (const [locale, expected] of [['zh', 'GitHub 请求受限'], ['en', 'GitHub is limiting requests']]) {
+    const html = renderToStaticMarkup(React.createElement(AppUpdateDialog, {
+      locale, report: { currentVersion: '0.1.3', status: 'error', error: 'rate-limit' }, busy: false, failed: true,
+    }));
+    assert.ok(html.includes(expected));
+    assert.match(html, /role="alert"/);
+    assert.doesNotMatch(html, /当前无需更新|No update is needed|下载新版本|Download update/);
+  }
+});
+
+test('Windows 与 IANA 时区按同一地区比较，真实不匹配仍提醒', () => {
+  const report = { phase: 'active', enabled: true, issues: [], history: [], systemTimezone: 'Korea Standard Time' };
+  assert.doesNotMatch(workspace('active', { report, target: { timezone: 'Asia/Seoul' } }), /系统时区是/);
+  assert.match(workspace('active', { report, target: { timezone: 'America/New_York' } }), /系统时区是/);
+});
+
+test('IPv6 状态放在出口结论内，区分双栈、降级及失败', () => {
+  const report = { phase: 'active', enabled: true, issues: [], history: [] };
+  const render = ipv6 => workspace('active', { report, netCore: { state: 'running', tunEnabled: true, ipv6 } });
+  const unknown = render({ supported: null, system: 'unknown', protected: false, reason: 'TLS failed' });
+  assert.match(unknown, /IPv6.*未确认/);
+  assert.doesNotMatch(unknown, /已关闭系统 IPv6/);
+  assert.equal((unknown.match(/class="workspace-alert"/g) ?? []).length, 0);
+  const conclusion = unknown.match(/class="netcore-conclusion__body">([\s\S]*?)class="netcore-conclusion__state"/);
+  assert.ok(conclusion, '出口结论卡片必须存在');
+  assert.match(conclusion[1], /class="netcore-ipv6" data-tone="danger" role="alert"/);
+  assert.match(conclusion[1], /IPv6.*未确认/);
+  const disabled = render({ supported: false, system: 'disabled', protected: false });
+  assert.match(disabled, /class="netcore-ipv6" data-tone="muted"/);
+  assert.match(disabled, /已关闭系统 IPv6/);
+  const protectedHtml = render({ supported: true, system: 'unchanged', protected: true });
+  assert.match(protectedHtml, /class="netcore-ipv6" data-tone="muted"/);
+  assert.match(protectedHtml, /IPv6.*保护隧道/);
+});
+
 test('关闭请求期间保持加载、禁用；结束后才允许再次操作', () => {
   for (const phase of ['active', 'idle']) {
     const html = button(phase, { powerAction: 'stop' });
     assert.match(html, /disabled=""/);
     assert.match(html, /aria-busy="true"/);
-    assert.match(html, />关闭保护<\/button>/);
+    assert.match(html, />关闭环境防护<\/button>/);
   }
   assert.doesNotMatch(button('idle'), /disabled=""/);
-  assert.match(button('idle'), />启动保护<\/button>/);
+  assert.match(button('idle'), />启动环境防护<\/button>/);
   assert.doesNotMatch(button('active'), /disabled=""/);
-  assert.match(button('active'), />关闭保护<\/button>/);
+  assert.match(button('active'), />关闭环境防护<\/button>/);
 });
 
 test('启停和检测分阶段显示；启停完成后自动复检期间仍禁止重复操作', () => {
   for (const powerAction of ['start', 'stop']) {
     const html = workspace('active', { powerAction, busy: true, checking: true });
     assert.doesNotMatch(html, /检测中…/);
-    assert.match(html, />重新检测<\/button>/);
+    assert.match(html, />检测<\/button>/);
   }
   for (const phase of ['starting', 'stopping']) {
     assert.doesNotMatch(workspace(phase, { checking: true }), /检测中…/);
@@ -60,20 +149,39 @@ test('启停和检测分阶段显示；启停完成后自动复检期间仍禁�
     const power = button(phase, props);
     assert.match(power, /disabled=""/);
     assert.match(power, /aria-busy="false"/);
-    assert.ok(power.includes(phase === 'active' ? '>关闭保护</button>' : '>启动保护</button>'));
+    assert.ok(power.includes(phase === 'active' ? '>关闭环境防护</button>' : '>启动环境防护</button>'));
   }
+});
+
+test('后台检测不改变检测按钮文案，不禁用保护和网络模式；主动检测仅锁本按钮', () => {
+  const report = { phase: 'active', enabled: true, testing: true, issues: [], history: [] };
+  for (const checking of [false, true]) {
+    const html = workspace('active', { report, checking, busy: false });
+    assert.doesNotMatch(button('active', { report, checking, busy: false }), /disabled=""/);
+    const modes = html.match(/<button[^>]*class="netcore-mode"[^>]*>/g) ?? [];
+    assert.equal(modes.length, 3);
+    for (const mode of modes) assert.doesNotMatch(mode, /disabled=""/);
+    if (checking) assert.match(html, /disabled="" aria-busy="true"[^>]*>检测中…<\/button>/);
+    else { assert.match(html, />检测<\/button>/); assert.doesNotMatch(html, /检测中…/); }
+  }
+});
+
+test('下降提醒使用固定文案，持续低分不因百分比变化反复播报', () => {
+  const report = { phase: 'active', enabled: true, issues: [], history: [], alarm: true };
+  assert.equal(workspace('active', { report: { ...report, scoreDropPercent: 40 } }), workspace('active', { report: { ...report, scoreDropPercent: 60 } }));
+  assert.match(workspace('active', { report }), /下降至少40%/);
 });
 
 test('节点变化后仍显示关闭保护，先关闭再启动以重新适配', () => {
   const report = { phase: 'restart_required', enabled: true, issues: [], history: [], testState: 'stale' };
-  assert.match(button('restart_required', { report }), />关闭保护<\/button>/);
+  assert.match(button('restart_required', { report }), />关闭环境防护<\/button>/);
   assert.doesNotMatch(button('restart_required', { report }), /disabled=""/);
-  assert.match(button('restart_required', { report, powerAction: 'start' }), />启动保护<\/button>/);
+  assert.match(button('restart_required', { report, powerAction: 'start' }), />启动环境防护<\/button>/);
   assert.match(button('restart_required', { report, powerAction: 'start' }), /disabled=""/);
 });
 
 test('页面从服务端读到启动或关闭阶段时仍禁用按钮并提供可访问的加载状态', () => {
-  for (const [phase, label] of [['starting', '启动保护'], ['stopping', '关闭保护']]) {
+  for (const [phase, label] of [['starting', '启动环境防护'], ['stopping', '关闭环境防护']]) {
     const html = button(phase);
     assert.match(html, /disabled=""/);
     assert.match(html, /aria-busy="true"/);
@@ -87,13 +195,13 @@ test('保护控制只有一个按钮和两种文案，部分验证不新增状�
     const html = workspace('partial', { report });
     assert.doesNotMatch(html, /部分生效|Partially verified|workspace-state/);
     assert.match(button('partial', { report }), new RegExp(`data-enabled="${enabled}"`));
-    assert.ok(button('partial', { report }).includes(enabled ? '>关闭保护</button>' : '>启动保护</button>'));
+    assert.ok(button('partial', { report }).includes(enabled ? '>关闭环境防护</button>' : '>启动环境防护</button>'));
     assert.match(html, /浏览器未验证/);
     assert.equal((html.match(/class="repair-button workspace-power"/g) ?? []).length, 1);
   }
   const report = { phase: 'restore_failed', enabled: false, issues: ['恢复失败'], history: [] };
   assert.doesNotMatch(button('restore_failed', { report }), /disabled=""/);
-  assert.match(button('restore_failed', { report }), />关闭保护<\/button>/);
+  assert.match(button('restore_failed', { report }), />关闭环境防护<\/button>/);
   assert.match(workspace('idle', { connected: false }), /本机服务未连接/);
   assert.match(button('idle', { connected: false }), /disabled=""/);
 });
@@ -234,11 +342,11 @@ test('重连失败按退避间隔重试，成功后解除重连状态', async t 
   const originalNow = Date.now;
   let now = 1000, attempts = 0;
   Date.now = () => now; t.after(() => { Date.now = originalNow; });
-  let report = { enabled: true, desiredEnabled: true, phase: 'active', testState: 'passed' };
+  let report = { enabled: false, desiredEnabled: true, phase: 'idle', testState: 'pending' };
   const hook = protectionHook(t, async action => {
     if (action === 'resume') {
       attempts++;
-      report = { ...report, testState: attempts === 1 ? 'failed' : 'passed', testError: attempts === 1 ? 'network not ready' : null };
+      report = { ...report, enabled: attempts > 1, phase: attempts === 1 ? 'idle' : 'active', testState: attempts === 1 ? 'failed' : 'passed', testError: attempts === 1 ? 'network not ready' : null };
     }
     return report;
   });
@@ -249,19 +357,19 @@ test('重连失败按退避间隔重试，成功后解除重连状态', async t 
   await hook.refresh(); assert.equal(attempts, 2);
 });
 
-test('服务掉线后恢复自动重连，多个唤醒通知不并发执行保护操作', async t => {
-  let offline = true, attempts = 0, release;
-  const report = { enabled: true, desiredEnabled: true, phase: 'active', testState: 'passed' };
+test('服务恢复或普通检测失败时保护仍启用，只读刷新不重新应用配置或锁按钮', async t => {
+  let offline = true, attempts = 0;
+  const report = { enabled: true, desiredEnabled: true, phase: 'partial', testState: 'failed' };
   const hook = protectionHook(t, async action => {
     if (offline) throw new TypeError('fetch failed');
-    if (action === 'resume') { attempts++; await new Promise(resolve => { release = resolve; }); }
+    if (action === 'resume') attempts++;
     return report;
   });
   await hook.refresh(); assert.equal(hook.state().connected, false);
   offline = false; hook.wake();
   await new Promise(resolve => setImmediate(resolve));
-  hook.wake(); await hook.refresh(); assert.equal(attempts, 1);
-  release(); await new Promise(resolve => setImmediate(resolve));
+  hook.wake(); await hook.refresh(); assert.equal(attempts, 0);
+  assert.equal(hook.state().busy, false);
   assert.equal(hook.state().connected, true); assert.equal(hook.state().error, '');
 });
 
@@ -288,11 +396,85 @@ test('工作台不显示连接、代理选择或时区服务管理面板', () =>
 });
 
 
-test('保护配置包含桌面行为开关，网页模式不冒充可修改系统登录项', () => {
-  const html = workspace('active');
-  assert.doesNotMatch(html, /关闭窗口后保持后台运行/);
+test('桌面行为开关集中在设置弹窗，网页模式不冒充可修改系统登录项', () => {
+  assert.doesNotMatch(workspace('active'), /开机自启动|启动后自动开启保护|workspace-preferences/);
+  const {WorkspaceSettingsDialog} = require(path.join(root, 'src/components/detector/WorkspaceSettingsDialog.tsx'));
+  const html = renderToStaticMarkup(React.createElement(WorkspaceSettingsDialog, { locale: 'zh', connected: true, busy: false, report: { enabled: true, monitoring: true, intervalMs: 300000 }, network: { locale: 'zh', report: null, busy: false }, dismissedNoticeCount: 0 }));
+  assert.doesNotMatch(html, /关闭窗口后保持后台运行|settings-panel-browser|选择浏览器/);
   for (const label of ['开机自启动', '启动后自动开启保护']) {
     assert.ok(html.includes(label));
     assert.ok(html.includes('aria-label="' + label + '" disabled'));
   }
+});
+
+test('网络配置集中到设置，保护占用隧道时仍禁止单独切换接管', () => {
+  const {NetCoreSettings} = require(path.join(root, 'src/components/detector/NetCoreSettings.tsx'));
+  const props = { locale: 'zh', busy: false, tunnelLocked: true, report: { enabled: true, state: 'running', nodes: ['node'], tunEnabled: true, elevation: { platform: 'darwin', elevated: true } }, onTunnelChange: () => {}, onStrictChange: () => {}, onManageSources: () => {}, onAddSource: () => {}, onOpenNetworkConfig: () => {}, onStart: () => {}, onStop: () => {}, onRestart: () => {} };
+  const html = renderToStaticMarkup(React.createElement(NetCoreSettings, props));
+  assert.match(html, /管理配置/); assert.match(html, /内网直连/);
+  const tunnel = html.match(/<button[^>]*role="switch"[^>]*>关闭接管<\/button>/)?.[0];
+  assert.ok(tunnel); assert.match(tunnel, /disabled/);
+  assert.match(html, /环境防护正在使用隧道/);
+  assert.doesNotMatch(workspace('active'), />管理配置<|诊断与高级操作|aria-label="自动检测间隔"/);
+  assert.match(workspace('active'), />选择浏览器</);
+});
+
+test('已开启的严格模式在平台或节点不可用时仍可从设置恢复联网', () => {
+  const {NetCoreSettings} = require(path.join(root, 'src/components/detector/NetCoreSettings.tsx'));
+  const props = { locale: 'zh', busy: false, tunnelLocked: false, report: { state: 'unavailable', nodes: [], strictMode: true, guard: { armed: true, phase: 'blocked' }, elevation: { platform: 'win32', elevated: false } }, onStrictChange: () => {} };
+  const html = renderToStaticMarkup(React.createElement(NetCoreSettings, props));
+  const recovery = html.match(/<button[^>]*role="switch"[^>]*>关闭严格模式并恢复联网<\/button>/)?.[0];
+  assert.ok(recovery); assert.doesNotMatch(recovery, /disabled/);
+  assert.match(html, /退出应用或异常崩溃后仍保留阻断/);
+  assert.match(html, /使用效果/);
+  assert.doesNotMatch(html, /出差时让 EGCC|Keep EGCC running/);
+  const busy = renderToStaticMarkup(React.createElement(NetCoreSettings, { ...props, busy: true }));
+  assert.match(busy.match(/<button[^>]*role="switch"[^>]*>关闭严格模式并恢复联网<\/button>/)?.[0] ?? '', /disabled/);
+});
+
+test('应用启动自动开启保护后立即补一轮检测，首屏不会停在尚未检测', () => {
+  const source = fs.readFileSync(path.join(root, 'scripts/local-repair.mjs'), 'utf8');
+  const startup = source.slice(source.indexOf("if (body.action === 'startup')"), source.indexOf("if (body.action === 'test')"));
+  assert.match(startup, /protection\.start\(origin\)/, '启动策略必须真正开启保护');
+  assert.match(startup, /protection\.retest\(\)/, '自动启动没有页面参与，必须补一轮检测才能产生得分');
+});
+
+test('传输记录卡片与详情固定说明本机存储，支持空状态与真实元数据', () => {
+  const { TransferLogCard, TransferRecordDetails, TransferLogDialog } = require(path.join(root, 'src/components/detector/TransferLog.tsx'));
+  const record = {id:'conn-a',host:'api.anthropic.com',ip:'203.0.113.4',port:443,chains:['Seoul','CLAUDE-PIN'],rule:'DomainSuffix',rulePayload:'anthropic.com',upload:123,download:4567,startedAt:'2026-11-08T00:00:00Z',endedAt:'2026-11-08T00:00:05Z',isClaude:true,route:'proxied',viaExit:true};
+  const data = {ok:true,available:true,storageError:false,retentionHours:48,stats:{active:0,ended:1,total:1},items:[record],recent:[record],total:1,offset:0,limit:50};
+  const render = (Component, props) => renderToStaticMarkup(React.createElement(Component, {locale:'zh',...props}));
+  const card = render(TransferLogCard,{data,onOpen:()=>{}});
+  assert.match(card,/传输记录/); assert.match(card,/数据只存放在本机，不会上传/);
+  assert.match(card,/活动 0 条 · 48 小时 1 条/); assert.match(card,/最近 3 条/);
+  assert.match(card,/api\.anthropic\.com/); assert.match(card,/已结束/);
+  const empty = render(TransferLogCard,{data:null,onOpen:()=>{}});
+  assert.match(empty,/暂无传输记录/); assert.doesNotMatch(empty,/role="alert"/);
+  const details = render(TransferRecordDetails,{record});
+  for (const field of ['数据只存放在本机，不会上传','连接详情','123 B','4567 B','是否 Claude','是否走出口','已走代理出口','命中规则','开始时间','结束时间']) assert.ok(details.includes(field),field);
+  assert.doesNotMatch(details,/processPath|authorization|token=/);
+  const dialog = render(TransferLogDialog,{data,selected:record,host:'',claude:false,viaExit:'all',offset:0,clearing:false,error:'',onHost:()=>{},onClaude:()=>{},onExit:()=>{},onPage:()=>{},onSelect:()=>{},onClear:()=>{},onClose:()=>{}});
+  assert.match(dialog,/仅 Claude/); assert.match(dialog,/清空记录/); assert.match(dialog,/上一页/);
+  assert.equal((dialog.match(/数据只存放在本机，不会上传/g)??[]).length,2);
+  for (const [route,heading] of [['proxied','代理出口连接'],['direct','直连连接'],['blocked','已拦截连接']]) {
+    const collection = render(TransferLogDialog,{data,selected:null,host:'',claude:false,route,recordState:route==='blocked'?'all':'active',offset:0,clearing:false,error:'',onHost:()=>{},onClaude:()=>{},onPage:()=>{},onSelect:()=>{},onClear:()=>{},onClose:()=>{}});
+    assert.match(collection,new RegExp('>'+heading+'</h2>'));
+    assert.match(collection,/连接路径/); assert.match(collection,/连接状态/);
+  }
+  const en = render(TransferLogCard,{locale:'en',data,onOpen:()=>{}});
+  assert.match(en,/Transfer log/); assert.match(en,/never uploaded/);
+});
+
+test('请求详情、导出和回放提供真实元数据与覆盖边界，设置包含仅 Claude/全部', () => {
+  const { TransferRecordDetails, TransferLogDialog } = require(path.join(root, 'src/components/detector/TransferLog.tsx'));
+  const { ConnectionLogSettings } = require(path.join(root, 'src/components/detector/ConnectionLogSettings.tsx'));
+  const record = { id:'request-a',kind:'request',host:'api.anthropic.com',ip:null,port:443,chains:[],rule:'',rulePayload:'',upload:123,download:456,startedAt:'2026-11-08T00:00:00Z',endedAt:'2026-11-08T00:00:01Z',isClaude:true,route:'unknown',viaExit:null,method:'POST',endpoint:'/v1/messages',status:201,elapsedMs:1000,error:null };
+  const details = renderToStaticMarkup(React.createElement(TransferRecordDetails, { record,locale:'zh' }));
+  for (const content of ['POST','/v1/messages','201','1000 ms','HTTP 网关','不解密','未知']) assert.ok(details.includes(content),content);
+  const at = '2026-11-08T00:00:00.500Z';
+  const data = {available:false,stats:{active:0,ended:1,total:1},total:1,offset:0,limit:50,items:[record],recent:[record],at};
+  const dialog = renderToStaticMarkup(React.createElement(TransferLogDialog, { locale:'zh',data,selected:record,host:'',claude:false,viaExit:'all',offset:0,clearing:false,error:'',kind:'request',at,replayBase:Date.parse('2026-11-08T00:01:00Z'),replayPosition:172740,playing:false,onHost:()=>{},onClaude:()=>{},onExit:()=>{},onPage:()=>{},onSelect:()=>{},onClear:()=>{},onClose:()=>{} }));
+  for (const content of ['导出 JSON','导出 CSV','回放时间轴','当时活动 1 条','不解密','最后采样的累计值']) assert.ok(dialog.includes(content),content);
+  const settings = renderToStaticMarkup(React.createElement(ConnectionLogSettings,{locale:'zh'}));
+  assert.match(settings,/仅 Claude/); assert.match(settings,/>全部</); assert.match(settings,/数据只存放在本机，不会上传/);
 });

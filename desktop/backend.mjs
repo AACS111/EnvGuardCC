@@ -5,6 +5,7 @@ import { closeServer, startSite } from './site.mjs';
 import { createShutdown } from './lifecycle.mjs';
 import { createDesktopSettings } from '../scripts/desktop-settings.mjs';
 import { createClaudeReset } from '../scripts/claude-reset.mjs';
+import { createClaudeProxySettings } from '../scripts/claude-proxy-settings.mjs';
 
 console.log = console.info = console.debug = console.error;
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -14,7 +15,7 @@ if (devURL && new URL(devURL).origin !== origin) throw new Error('开发页面�
 if (!process.env.CHECKCC_DESKTOP_USER_DATA) throw new Error('缺少桌面用户数据目录。');
 process.env.CHECKCC_STATE_DIR ||= path.join(process.env.CHECKCC_DESKTOP_USER_DATA, 'state');
 process.env.CHECKCC_NODE_EXECUTABLE = process.execPath;
-let helper, gateway, site, settings, powerTimer, stopping, resetPending = false;
+let helper, gateway, site, settings, powerTimer, stopping, kernel, resetPending = false;
 let queue = Promise.resolve(), shutdownRequested = false;
 let finishStartup;
 const startupFinished = new Promise(resolve => { finishStartup = resolve; });
@@ -41,6 +42,12 @@ async function report() {
 }
 const closeRuntime = createShutdown({ restore: () => helper?.closeRuntime(), closeServices: async () => {
     clearInterval(powerTimer);
+    // 退出时必须把定时器与内核一并关掉：否则进程退了、内核仍在接管流量（实测事故）。
+    kernel?.stopAutoRefresh?.();
+    kernel?.stopPublicDnsSync?.();
+    // 内核未确认退出时保留页面与控制接口，允许用户查看错误并重试退出。
+    await kernel?.stop();
+    // kernel.stop() 同时停止采样并保存已结束的本机传输记录。
     await closeServer(helper?.server);
     await closeServer(gateway);
     await closeServer(site);
@@ -82,11 +89,27 @@ try {
   if (!devURL) login = await native('get_login');
   settings = await store.load();
   const { createGateway } = await import('../scripts/claude-gateway.mjs');
-  gateway = createGateway();
+  const { createKernelRuntime } = await import('../scripts/net-core/runtime.mjs');
+  // 内核先于网关：页面通过网关诊断接口读取内核状态。未配置节点时保持“未启用”。
+  kernel = await createKernelRuntime({
+    stateDir: process.env.CHECKCC_STATE_DIR,
+    claudeProxy: createClaudeProxySettings({ stateDir: process.env.CHECKCC_STATE_DIR }),
+    root,
+    logger: (line) => console.error('[net-core]', line),
+  });
+  if (kernel.enabled) {
+    if (!await kernel.start()) console.error('[net-core] 内核未能启动，页面会显示未启用原因。');
+    else kernel.connectionLog?.start();
+    kernel.startAutoRefresh?.();
+    kernel.startPublicDnsSync?.();
+  } else {
+    console.error('[net-core] 未启用：', kernel.reason);
+  }
+  gateway = createGateway({ netCore: kernel });
   await new Promise((resolve, reject) => { gateway.once('error', reject); gateway.listen(devURL ? 3010 : 0, '127.0.0.1', resolve); });
   process.env.CHECKCC_GATEWAY_URL = `http://127.0.0.1:${gateway.address().port}`;
   const { startRepairHelper } = await import('../scripts/local-repair.mjs');
-  helper = await startRepairHelper(devURL ? 3001 : 0);
+  helper = await startRepairHelper(devURL ? 3001 : 0, { netCore: kernel });
   if (!helper.server) { helper = null; throw new Error('本机助手端口已被占用，请先退出旧服务。'); }
   const ports = { helper: helper.server.address().port, gateway: gateway.address().port };
   if (!devURL) {
@@ -94,8 +117,9 @@ try {
     origin = `http://127.0.0.1:${site.address().port}`;
     headers.Origin = origin;
   }
-  const protection = await report();
-  if (protection.phase === 'idle') {
+  // 每次启动都执行启动策略：已有会话要 resume 重新应用（退出时已恢复系统时区），不能只看状态。
+  await report();
+  {
     const response = await fetch(helper.url + '/session?tokenOnly=1', { headers });
     const session = await response.json();
     const configured = await fetch(helper.url + '/protection', { method: 'POST', headers: { ...headers, 'Content-Type': 'application/json', 'X-CheckCC-Token': session.token }, body: JSON.stringify({ action: 'startup', enabled: settings.autoStartProtection }), signal: AbortSignal.timeout(120000) });

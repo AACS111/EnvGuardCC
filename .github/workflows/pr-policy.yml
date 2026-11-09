@@ -1,0 +1,28 @@
+name: Pull request policy
+
+# Use the trusted base-branch workflow; do not check out or execute PR code here.
+on:
+  pull_request_target:
+    branches: [develop, main]
+    types: [opened, synchronize, reopened, edited, ready_for_review]
+
+permissions:
+  contents: read
+
+jobs:
+  branch-policy:
+    name: PR branch policy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const pr = context.payload.pull_request;
+            if (pr.base.ref === 'main' &&
+                (pr.head.ref !== 'develop' || pr.head.repo?.full_name !== context.payload.repository.full_name)) {
+              core.setFailed('main 只接受本仓库 develop 的发布 PR。功能修改和外部 PR 请将目标分支改为 develop。');
+            } else {
+              core.info(pr.base.ref === 'main'
+                ? '发布路径有效：本仓库 develop → main。仍需维护者测试确认并手动合并。'
+                : '开发 PR 的目标为 develop。通过检查后由维护者决定是否合并。');
+            }

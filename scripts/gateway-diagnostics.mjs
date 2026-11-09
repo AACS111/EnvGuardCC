@@ -120,11 +120,11 @@ export async function collectNetworkDiagnostics(upstream, { signalId } = {}) {
     selectedProbe("claudeReachability", "https://claude.ai/"), selectedProbe("anthropicReachability", "https://www.anthropic.com/"),
     selectedProbe("apiReachability", api, { method: "GET" }), !signalId || signalId.startsWith("dns") ? collectDnsDiagnostics(upstream) : Promise.resolve(undefined),
     needsExit ? probe("https://ipwho.is/", { method: "GET", json: true }) : Promise.resolve({}),
-    needsExit ? probe("https://ipapi.co/json/", { method: "GET", json: true }) : Promise.resolve({}),
+    needsExit ? probe("https://api.ip.sb/geoip", { method: "GET", json: true }) : Promise.resolve({}),
     !signalId || signalId === "ipv4" ? probe("https://api4.ipify.org/?format=json", { method: "GET", family: 4, json: true }) : Promise.resolve({}),
     !signalId ? probe("https://api6.ipify.org/?format=json", { method: "GET", family: 6, json: true }) : Promise.resolve({}),
   ]);
-  const sources = [geoSource(geoA, "ipwho.is"), geoSource(geoB, "ipapi.co")].filter(Boolean);
+  const sources = [geoSource(geoA, "ipwho.is"), geoSource(geoB, "ip.sb")].filter(Boolean);
   const countries = new Set(sources.map((source) => source.countryCode));
   return {
     checkedAt: new Date().toISOString(),

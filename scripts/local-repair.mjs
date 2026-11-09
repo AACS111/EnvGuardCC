@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import { createProtectionService } from "./protection-service.mjs";
 import { EnvironmentRuntime } from "./environment-runtime.mjs";
 import { BrowserCloakController } from "./browser-cloak.mjs";
+import { detectInstalledBrowsers, loadBrowserPreference, pickBrowser, saveBrowserPreference } from "./browser-catalog.mjs";
 import { readSystemTimezone, readAutomaticTimezone, setSystemTimezone, validIanaTimezone, sameTimezone, timezoneSupported } from "./system-timezone.mjs";
 import { resetTimezoneServiceAuthorization } from "./timezone-service.mjs";
 import { findBrowser, findDesktop } from "./application-paths.mjs";
@@ -46,7 +47,14 @@ let protectionChanging = false;
 let closing = false;
 let closePending = null;
 let initializing = true;
-const environmentRuntime = new EnvironmentRuntime({ stateDir });
+let networkRuntime = null;
+// 受管浏览器按偏好挑选：列表里被排除的浏览器不会被拉起。
+const browserChoice = async () => pickBrowser(await detectInstalledBrowsers(), await loadBrowserPreference(stateDir));
+const environmentRuntime = new EnvironmentRuntime({ stateDir, browserPathProvider: async () => {
+  const choice = await browserChoice();
+  if (!choice?.path) throw new Error("没有可接入的浏览器：请至少在列表里保留一个 Chromium 内核浏览器（Chrome / Edge / Brave / Vivaldi / Chromium）。");
+  return { id: choice.id, path: choice.path };
+} });
 const browserCloak = new BrowserCloakController(environmentRuntime, { gatewayUrl: process.env.CHECKCC_GATEWAY_URL || "http://127.0.0.1:3010", acquire: () => { if (changing || protectionChanging || closing) return false; changing = true; return true; }, release: () => { changing = false; } });
 
 const currentZone = () => readSystemTimezone();
@@ -68,7 +76,7 @@ async function capabilities() {
     desktopReason: process.platform === 'darwin' ? '当前 macOS Claude 不支持已验证的独立资料及调试接入；仅可普通打开，不声明已受保护。' : '',
   };
 }
-const protection = createProtectionService({ stateDir, runtime: environmentRuntime, browserCloak, currentZone, setZone, restoreTimezone: process.platform === "darwin" ? restoreSavedTimezone : undefined, canTest: () => !changing && !protectionChanging && !closing });
+const protection = createProtectionService({ stateDir, runtime: environmentRuntime, browserCloak, currentZone, setZone, restoreTimezone: process.platform === "darwin" ? restoreSavedTimezone : undefined, canTest: () => !changing && !protectionChanging && !closing, network: () => networkRuntime });
 async function readBackup() {
   try {
     const value = JSON.parse(await readFile(backupFile, "utf8"));
@@ -219,7 +227,11 @@ const server = http.createServer(async (req, res) => {
     finally { changing = false; }
   }
   if (req.url === "/protection") {
-    if (req.method === "GET") return send(200, protection.report());
+    if (req.method === "GET") {
+      const report = protection.report();
+      if (timezoneSupported(process.platform)) report.systemTimezone = await currentZone();
+      return send(200, report);
+    }
     if (req.method !== "POST") return send(405, { error: "仅支持 GET/POST。" });
     if (!authenticated(req.headers["x-checkcc-token"])) return send(403, { error: "会话已失效。" });
     if (!req.headers["content-type"]?.startsWith("application/json")) return send(415, { error: "必须使用 JSON。" });
@@ -227,7 +239,24 @@ const server = http.createServer(async (req, res) => {
       const body = await parseBody(req);
       if (body.action === "observe") return send(200, protection.observe(body));
       if (body.action === "monitor") return send(200, await protection.monitor(body.enabled, body.intervalMs));
-      if (body.action === 'startup') return send(200, await protection.startupPreference(body.enabled));
+      if (body.action === 'startup') {
+        const current = protection.report();
+        if (!body.enabled) {
+          if (current.enabled || current.desiredEnabled) return send(200, await protection.stop(origin));
+          // 保护未开启时也要先建立 Claude 阻断；失败原因随报告返回，由界面如实展示。
+          return send(200, await protection.ensureUnprotectedBlock());
+        }
+        // 退出保护时系统时区会被恢复；启动时只读取“已开启”状态而不重新 apply，会让时区/浏览器配置与出口失配。
+        if (current.enabled) return send(200, await protection.resume(origin, { background: true }));
+        // 自动启动没有页面参与：启动后立即补一轮后台检测，否则首轮得分要等到下一个检测间隔才出现。
+        const started = await protection.start(origin);
+        void protection.retest().catch(() => {});
+        return send(200, started);
+      }
+      if (body.action === 'test') {
+        if (changing || protectionChanging) return send(409, { error: "配置正在执行，请稍后检测。" });
+        return send(200, await protection.retest());
+      }
       if (!["start", "stop", "test", "resume"].includes(body.action)) return send(400, { error: "无效操作。" });
       if (protectionChanging) return send(409, { error: "配置正在执行，请稍后重试。" });
       if (body.action === 'start' || body.action === 'stop') resetTimezoneServiceAuthorization();
@@ -236,11 +265,33 @@ const server = http.createServer(async (req, res) => {
         // Reserve explicit protection actions so background sync cannot starve them.
         while (changing) await new Promise(resolve => setTimeout(resolve, 50));
         changing = true;
-        try { return send(200, await (body.action === "test" ? protection.retest() : protection[body.action](origin))); } finally { changing = false; }
+        try { return send(200, await protection[body.action](origin, { background: body.background === true })); } finally { changing = false; }
       } finally { protectionChanging = false; }
     } catch (error) { return send(400, { error: error.message }); }
   }
   if (req.method === "GET" && req.url === "/session?tokenOnly=1") return send(200, { token: secret });
+  // 本地浏览器清单与接入偏好：只做存在性探测，不启动任何浏览器。
+  if (req.method === "GET" && req.url === "/browsers") {
+    if (!authenticated(req.headers["x-checkcc-token"])) return send(403, { error: "会话已失效，请重新打开详情。" });
+    try {
+      const preference = await loadBrowserPreference(stateDir);
+      const browsers = await detectInstalledBrowsers();
+      const active = pickBrowser(browsers, preference);
+      return send(200, { browsers, ...preference, active: active ? { id: active.id, name: active.name, path: active.path } : null });
+    } catch (error) { return send(500, { error: error.message }); }
+  }
+  if (req.method === "POST" && req.url === "/browsers") {
+    if (!authenticated(req.headers["x-checkcc-token"])) return send(403, { error: "会话已失效，请重新打开详情。" });
+    if (!req.headers["content-type"]?.startsWith("application/json")) return send(415, { error: "必须使用 JSON。" });
+    try {
+      const body = await parseBody(req);
+      const preference = await saveBrowserPreference(stateDir, body);
+      browserCloak.invalidate();
+      const browsers = await detectInstalledBrowsers();
+      const active = pickBrowser(browsers, preference);
+      return send(200, { browsers, ...preference, active: active ? { id: active.id, name: active.name, path: active.path } : null });
+    } catch (error) { return send(400, { error: error.message }); }
+  }
   if (req.method === "GET" && req.url === "/session") {
     try { return send(200, { token: secret, helperProtocol: HELPER_PROTOCOL, shutdown: 1, desktopLauncher: 1, environmentScripts: 1, browserCloak: 1, platform: process.platform, capabilities: await capabilities(), timezone: timezoneSupported(process.platform) ? await currentZone() : "", canRestore: Boolean(await readBackup()), profile: await readProfile() }); }
     catch (error) {
@@ -332,7 +383,8 @@ const server = http.createServer(async (req, res) => {
 server.requestTimeout = 120000;
 server.headersTimeout = 10000;
 server.on("error", (error) => { if (error.code !== "EADDRINUSE") console.error(`[repair] ${error.code}: ${error.message}`); });
-export async function startRepairHelper(listenPort = port) {
+export async function startRepairHelper(listenPort = port, { netCore = null } = {}) {
+  networkRuntime = netCore;
   try {
     // Never silently abandon an active routing configuration from an older version.
     try {
@@ -354,6 +406,7 @@ export async function startRepairHelper(listenPort = port) {
     if (!response.ok || !/^[a-f0-9]{64}$/.test(session.token)) throw new Error("本机助手端口被其他服务占用。");
     if (session.environmentScripts !== 1 || session.browserCloak !== 1) throw new Error("3001 端口上的本机助手为旧版本，请退出旧 repair:helper 后重启 npm run dev。");
     assertCurrentHelper(session);
+    if (netCore) throw new Error("已有独立本机助手无法接管本次网络内核。请退出旧的 repair:helper，再启动 EGCC，避免网络与保护会话由不同进程控制。");
     const url = `http://127.0.0.1:${listenPort}`;
     // The listener belongs to the existing helper process; restore its runtime only.
     return { server: null, url, closeRuntime: () => shutdownHelper(url, "http://localhost:3000", session, false) };

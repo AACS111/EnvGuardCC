@@ -33,3 +33,5 @@ cargo test --manifest-path src-tauri/Cargo.toml --locked
 ## 发布
 
 开发分支测试完成后向 `main` 提交 PR，检查通过并审核后合并。`develop` 推送后构建 Windows x64 与 macOS arm64 安装包用于验证；将通过验证的代码合入 `main` 后，推送与 package.json 版本一致的 `v<版本>` 标签。标签工作流等待两平台构建成功，汇总四个安装包和校验值，再发布 GitHub Release。GitHub 默认分支和分支保护策略由仓库设置管理，本流程文件不提供强制保护。
+
+应用更新入口读取 GitHub 最新正式 Release，仅对高于运行版本且包含当前平台可用安装包的版本显示“可更新”。请保留 `EnvGuardCC-Setup-<版本>.exe`、`EnvGuardCC-<版本>-arm64.dmg` 与现有便携 ZIP 命名；草稿和预发布版不会触发提示。自行维护的公开发布仓库可通过后台环境变量 `CHECKCC_UPDATE_REPOSITORY=owner/repository` 配置。此功能提供检查与下载，不进行自动安装；测试为 `node --test scripts/check-app-updates.mjs`。

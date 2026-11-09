@@ -31,7 +31,8 @@ export function systemProxyStatus({ platform = process.platform, run = execFileS
     const value = query('ProxyServer').match(/ProxyServer\s+REG_SZ\s+(.+)/i)?.[1].trim();
     const protocols = Object.fromEntries((value || '').split(';').map(entry => entry.trim().split('=')));
     const address = value?.includes('=') ? protocols.https || protocols.http : value;
-    return address ? { state: 'configured', address: `http://${address}` } : { state: 'disabled' };
+    // Windows 注册表 ProxyServer 常自带 http:// 前缀；重复添加会得到 http://http://... 并让后续解析失败。
+    return address ? { state: 'configured', address: /^[a-z][a-z0-9+.-]*:\/\//i.test(address) ? address : `http://${address}` } : { state: 'disabled' };
   } catch { return { state: 'disabled' }; }
 }
 

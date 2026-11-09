@@ -1,4 +1,6 @@
 // Shares the API gateway's state; it never takes account content or credentials from renderer pages.
+import { environmentProfile } from "../src/detection/environment-profile.mjs";
+
 export class BrowserCloakController {
   fingerprint = null; report = null; origin = null; pending = null; timer = null;
   constructor(runtime, { gatewayUrl = "http://127.0.0.1:3010", intervalMs = 2500, acquire = () => true, release = () => {} } = {}) { this.runtime = runtime; this.gatewayUrl = gatewayUrl; this.intervalMs = intervalMs; this.acquire = acquire; this.release = release; }
@@ -31,8 +33,9 @@ export class BrowserCloakController {
       if (!state.profile?.language || !state.profile?.locale) throw new Error("请先配置网关出口语言与区域。");
       await this.runtime.load();
       const language = state.profile.language === "en" ? "en-US" : state.profile.language;
-      const languages = [...new Set([language, language.split("-")[0], "en"])];
-      const policy = { fontMode: "none", vendorFontLimit: 0, ...this.runtime.policy, webrtcDisabled: false, webrtcRelayOnly: true, languages, locale: state.profile.locale };
+      // 声明面参数一律由单一画像派生（语言/区域/时区/偏移），避免三处各自拼接产生矛盾。
+      const profile = environmentProfile({ language, locale: state.profile.locale, timezone: state.profile.timezone ?? null });
+      const policy = { fontMode: "none", vendorFontLimit: 0, ...this.runtime.policy, webrtcDisabled: false, webrtcRelayOnly: true, languages: profile.languages, locale: profile.locale, ...(profile.timezone ? { timezone: profile.timezone, offsetMinutes: profile.offsetMinutes } : {}) };
       const kinds = [...this.runtime.clients.keys()];
       if (launch && !kinds.includes("web")) kinds.unshift("web");
       execution = cached ? await this.runtime.inspectCurrent() : await this.runtime.apply(policy, origin, kinds);
