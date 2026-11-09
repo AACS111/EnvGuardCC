@@ -53,7 +53,10 @@ export function buildHostInstallPlan({ platform = process.platform, nodePath, ho
     // 因此生成一个短路径包装脚本，计划任务只指向它。
     const launch = paths.join(paths.dirname(hostScript), "host-launch.cmd");
     if (launch.length > 200) throw new Error(`包装脚本路径过长（${launch.length} 字符），请使用更短的状态目录。`);
-    const launchContent = ["@echo off", "setlocal DisableDelayedExpansion", 'set "NODE_OPTIONS="', 'set "NODE_PATH="', `${quote(nodePath)} ${quote(hostScript)} ${args.join(" ")}`, ""].join("\r\n");
+    // 计划任务不提供控制台：宿主启动即崩时什么也看不到。必须把它的输出落到日志，
+    // 否则“宿主未及时应答”永远只能猜（缺模块 / 端口被占 / 安全软件拦载都长一样）。
+    const hostLog = paths.join(stateDir, "host-log.txt");
+    const launchContent = ["@echo off", "setlocal DisableDelayedExpansion", 'set "NODE_OPTIONS="', 'set "NODE_PATH="', `${quote(nodePath)} ${quote(hostScript)} ${args.join(" ")} >> ${quote(hostLog)} 2>&1`, ""].join("\r\n");
     return {
       platform,
       files: [{ path: launch, content: launchContent, mode: 0o644, note: "计划任务指向该短路径脚本；/TR 有 261 字符上限" }],
@@ -74,6 +77,7 @@ export function buildHostInstallPlan({ platform = process.platform, nodePath, ho
       ],
       tokenFile,
       launchFile: launch,
+      hostLog,
       notes: [
         "授权前由当前用户生成令牌；Windows 的访问权限依赖用户状态目录 ACL，不能用 POSIX 0600 代替。",
         "计划任务只允许本机访问宿主端口，令牌缺失或不匹配一律拒绝。",

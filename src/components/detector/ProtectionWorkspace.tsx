@@ -20,7 +20,7 @@ import { ScoreMeter } from './ScoreMeter';
 import { exitNetworkType } from '@/detection/network-type';
 import { useState, useSyncExternalStore, useRef } from 'react';
 import type { SignalView } from '@/detection/client-engine';
-import type { ExitGeo, ExitTarget } from '@/detection/exit-geo';
+import { windowsTimezoneFor, type ExitGeo, type ExitTarget } from '@/detection/exit-geo';
 import type { ProtectionReport } from '@/detection/protection';
 import type { LocaleCode } from '@/i18n/messages';
 import type { ReactNode } from 'react';
@@ -34,10 +34,10 @@ type Props = {
   filter: string; search: string; onFilter: (value: string) => void; onSearch: (value: string) => void;
   onToggle: () => void; onStop: () => void; onMonitor: (enabled: boolean, intervalMs: number) => void; onRefresh: () => void; onRepair?: () => void; onSelect: (id: string) => void;
   netCore: NetCoreReport | null; netCoreBusy?: boolean; netCoreError?: string;
-  onNetCoreStrict?: (enabled: boolean) => void; onNetCoreTunnel?: (enabled: boolean) => void; onNetCoreRefresh: () => void; onNetCoreStart: () => void; onNetCoreStop: () => void; onNetCoreRestart: () => void; onNetCoreAuthorizeHost?: () => void; onNetCoreSelect: (name: string) => void; onNetCoreManageSources: () => void; onNetCoreAddSource?: () => void; onNetCoreOpenNetworkConfig: () => void; onNetCoreMeasure: () => void; onNetCoreModeChange: (mode: "rule" | "global" | "direct") => void; onNetCoreUnlockRegion?: () => void; netCoreMeasuring?: boolean; netCoreDelays?: Record<string, number | null>; netCoreExits?: Record<string, NetCoreExit | null>; netCoreExitsAt?: string | null; netCoreExiting?: boolean; onNetCoreProbeExits?: () => void; netCoreExitHistory?: ExitHistory | null; netCoreNetwork?: NetCoreNetworkState | null;
+  onNetCoreStrict?: (enabled: boolean) => void; onNetCoreTunnel?: (enabled: boolean) => void; onNetCoreRefresh: () => void; onNetCoreStart: () => void; onNetCoreStop: () => void; onNetCoreRestart: () => void; onNetCoreAuthorizeHost?: () => void; onNetCoreSelect: (name: string) => void; onNetCoreManageSources: () => void; onNetCoreAddSource?: () => void; onNetCoreOpenNetworkConfig: () => void; onNetCoreMeasure: () => void; onNetCoreModeChange: (mode: "rule" | "global" | "direct") => void; onNetCoreUnlockRegion?: () => void; onNetCoreNetworkFailure?: (policy: "claude" | "all") => void; netCoreMeasuring?: boolean; netCoreDelays?: Record<string, number | null>; netCoreExits?: Record<string, NetCoreExit | null>; netCoreExitsAt?: string | null; netCoreExiting?: boolean; onNetCoreProbeExits?: () => void; netCoreExitHistory?: ExitHistory | null; netCoreNetwork?: NetCoreNetworkState | null;
   browserCloak?: BrowserCloakExecution | null; linkingBrowser?: boolean; onLinkBrowser?: () => void; onOpenBrowserPicker?: () => void;
 };
-type WorkspaceNotice = { id: string; message: string; tone: 'warning' | 'error'; action?: { label: string; onClick: () => void } };
+type WorkspaceNotice = { id: string; message: string; tone: 'info' | 'warning' | 'error'; action?: { label: string; onClick: () => void } };
 const NOTICE_DISMISS_KEY = 'envguardcc.dismissed-workspace-notices';
 const REPOSITORY = 'https://github.com/AACS111/EnvGuardCC';
 const EMPTY_DISMISSED: string[] = [];
@@ -157,21 +157,11 @@ export function ProtectionWorkspace(props: Props) {
   const hostingWarning = props.target?.hosting
     ? text(`当前出口是云机房/托管 IP（${describeExit(props.target)}），Claude 可能拒绝登录；建议切换到住宅/原生 IP 节点。`, `The exit is a cloud/hosting IP (${describeExit(props.target)}); Claude may refuse login. Prefer a residential/native-IP node.`)
     : '';
-  const ipv6Notice = props.netCore?.ipv6
-    ? props.netCore.ipv6.supported === false
-      ? text(`IPv6 能力探测未通过（${props.netCore.ipv6.reason ?? "节点无 IPv6 出口"}）：已关闭系统 IPv6，Claude 走 IPv4 专线。需要 IPv6 请换支持 IPv6 的节点。`, `IPv6 capability check failed (${props.netCore.ipv6.reason ?? "no IPv6 egress"}); system IPv6 was disabled so Claude stays on the protected IPv4 exit. Use a node with IPv6 egress to keep IPv6.`)
-      : props.netCore.ipv6.supported === true
-        ? text(`当前节点支持 IPv6；IPv6 隧道保护尚未启用，已关闭系统 IPv6 以避免泄漏。`, `This node supports IPv6, but IPv6-in-tunnel protection is not enabled; system IPv6 was disabled to avoid leaks.`)
-        : ''
-    : '';
-  const ipv6Fallback = props.netCore?.ipv6 && props.netCore.ipv6.system === "unknown"
-    ? text("自动关闭系统 IPv6 未确认成功；如果仍有 IPv6 连接，请在系统设置里关闭当前网卡的 IPv6。", "Automatic IPv6 shutdown is unconfirmed; if IPv6 connections persist, disable IPv6 on the active network service in System Settings.")
-    : '';
   const targetTimezone = props.target?.timezone ?? report?.target?.timezone ?? null;
   const systemTimezone = report?.systemTimezone ?? null;
-  const timezoneMismatch = Boolean(systemTimezone && targetTimezone && systemTimezone !== targetTimezone);
+  const timezoneMismatch = Boolean(systemTimezone && targetTimezone && systemTimezone !== targetTimezone && systemTimezone !== windowsTimezoneFor(targetTimezone));
   const timezoneNotice = timezoneMismatch
-    ? { id: 'system-timezone', message: text(`系统时区是 ${systemTimezone}，目标是 ${targetTimezone}；环境防护没有完全适配，Claude 仍可能看到国内时区。`, `System timezone is ${systemTimezone}, target is ${targetTimezone}; protection is not fully applied and Claude may still see the local timezone.`), tone: 'error' as const, action: props.onRepair ? { label: text('重新应用并修复', 'Reapply and fix'), onClick: () => props.onRepair?.() } : undefined }
+    ? { id: 'system-timezone', message: text(`系统时区是 ${systemTimezone}，目标是 ${targetTimezone}；系统时区与出口地区不匹配，请重新应用修复。`, `System timezone is ${systemTimezone}, target is ${targetTimezone}. The system timezone does not match the exit region. Reapply protection to fix it.`), tone: 'error' as const, action: props.onRepair ? { label: text('重新应用并修复', 'Reapply and fix'), onClick: () => props.onRepair?.() } : undefined }
     : null;
   const unprotectedBlockError = !protectionEnabled && !starting && !stopping ? report?.unprotectedBlock?.error : null;
   const unprotectedBlocked = !protectionEnabled && !starting && !stopping && report?.unprotectedBlock?.active === true;
@@ -184,11 +174,9 @@ export function ProtectionWorkspace(props: Props) {
     report?.phase === 'restore_failed' ? { id: 'restore-failed', message: text('配置恢复未完成，备份已保留。请点击“关闭保护”重试恢复。', 'Restoration incomplete. Backup retained; select Stop protection to retry restoration.'), tone: 'error' as const } : null,
     report?.alarm ? { id: 'score-alarm', message: text('验证得分较上次有效检测下降至少40%，请查看异常项目。', 'Verification score dropped at least 40% since the previous valid check. Review the flagged items.'), tone: 'error' as const } : null,
     restartNotice ? { id: 'restart-required', message: restartNotice, tone: 'error' as const } : null,
-    ipv6Fallback ? { id: 'ipv6-fallback', message: ipv6Fallback, tone: 'error' as const } : null,
     hostingWarning ? { id: 'hosting-exit', message: hostingWarning, tone: 'warning' as const } : null,
-    ipv6Notice ? { id: `ipv6:${props.netCore?.ipv6?.node ?? 'node'}:${String(props.netCore?.ipv6?.supported)}`, message: ipv6Notice, tone: 'warning' as const } : null,
   ] as (WorkspaceNotice | null)[]).filter((item): item is WorkspaceNotice => item !== null && !(item.tone === 'warning' && dismissedNotices.includes(item.id)));
-  const noticeTone = noticeItems.some((item) => item.tone === 'error') ? 'error' : 'warning';
+  const noticeTone = noticeItems.some((item) => item.tone === 'error') ? 'error' : noticeItems.some((item) => item.tone === 'warning') ? 'warning' : 'info';
 
   return <section className="protection-workspace">
     <header className="workspace-global">
@@ -220,7 +208,7 @@ export function ProtectionWorkspace(props: Props) {
     <div className="workspace-main">
       <div className="workspace-content">
         <header className="workspace-page-heading">
-          <div><h1>{tabs.find(([id]) => id === tab)?.[1]}</h1><p>{tab === 'basic' ? text('查看防护状态和待处理事项', 'Review protection and items that need attention') : tab === 'network' ? text('管理出口、代理范围与连接保护', 'Manage exits, proxy scope and connection protection') : tab === 'tests' ? text('查看当前检测结果和判定依据', 'Review current results and their evidence') : text('查看开启防护后的变化', 'Review changes after enabling protection')}</p>
+          <div><h1>{tabs.find(([id]) => id === tab)?.[1]}</h1>
             <div className="workspace-flow-status" data-tone={kernel.tone}><span aria-hidden="true" />{kernel.conclusion.title}</div>
             <p className="workspace-flow-description">{text('以已观测连接为准，未覆盖全部系统流量', 'Observed connections only; not all system traffic')}</p>
           </div>
@@ -233,10 +221,18 @@ export function ProtectionWorkspace(props: Props) {
             {notice.tone === 'warning' && <button type="button" className="workspace-alert__dismiss" aria-label={text('不再提示这条提醒', 'Dismiss this notice')} title={text('不再提示', 'Dismiss')} onClick={() => dismissNotice(notice.id)}>×</button>}
           </div>)}
         </div>}
-        {props.netCore?.regionLock?.locked && <div className="workspace-notices" data-tone="error" role="alert">
-          <p className="workspace-alert" data-tone="error">{props.netCore.regionLock.reason || text('固定出口未通过复检，Claude 流量已阻断。', 'The pinned exit failed recheck; Claude traffic is blocked.')}</p>
-          <button type="button" className="repair-button" onClick={() => props.onNetCoreUnlockRegion?.()} disabled={Boolean(props.netCoreBusy) || busy}>{text('复检并解除', 'Recheck and unlock')}</button>
-        </div>}
+        {props.netCore?.regionLock?.locked && (() => {
+          const lock = props.netCore.regionLock;
+          // 网络波动造成的锁定会自动复检，界面只需告知进度，不逼用户手动点。
+          const auto = lock.type === 'network' || lock.autoRecover === true;
+          const attempts = Number.isInteger(lock.recheckAttempts) ? lock.recheckAttempts : 0;
+          return <div className="workspace-notices" data-tone="error" role="alert">
+            <p className="workspace-alert" data-tone="error">{lock.reason || text('固定出口未通过复检，Claude 流量已阻断。', 'The pinned exit failed recheck; Claude traffic is blocked.')}</p>
+            {auto
+              ? <p className="workspace-alert" data-tone="info" role="status">{text(`正在自动复检${attempts ? `（第 ${attempts} 次）` : ''}：网络恢复后会立即自动解除，无需手动操作。`, `Automatic recheck${attempts ? ` (attempt ${attempts})` : ''} is running: it unlocks as soon as the network recovers. No manual action needed.`)}</p>
+              : <button type="button" className="repair-button" onClick={() => props.onNetCoreUnlockRegion?.()} disabled={Boolean(props.netCoreBusy) || busy}>{text('复检并解除', 'Recheck and unlock')}</button>}
+          </div>;
+        })()}
         <div id="panel-basic" role="tabpanel" aria-labelledby="tab-basic" tabIndex={0} hidden={tab !== 'basic'}>
           <section className="workspace-panel workspace-hero">
             <div><span className="netcore-pill" data-tone={protectionEnabled ? 'ok' : 'muted'}>{protectionEnabled ? text('环境防护运行中', 'Environment protection is on') : text('环境防护未开启', 'Environment protection is off')}</span>
@@ -292,7 +288,7 @@ export function ProtectionWorkspace(props: Props) {
       </div>
     </div>
     {settingsSection && <WorkspaceSettingsDialog locale={locale} initialSection={settingsSection} onClose={() => setSettingsSection(null)} report={report} connected={connected} busy={busy} onMonitor={props.onMonitor} dismissedNoticeCount={dismissedNotices.length} onRestoreNotices={restoreDismissedNotices}
-      network={{ locale, report: props.netCore, busy: Boolean(props.netCoreBusy) || busy, error: props.netCoreError, tunnelLocked: protectionEnabled, networkState: props.netCoreNetwork, onStart: props.onNetCoreStart, onStop: props.onNetCoreStop, onRestart: props.onNetCoreRestart, onTunnelChange: props.onNetCoreTunnel, onStrictChange: props.onNetCoreStrict, onManageSources: props.onNetCoreManageSources, onAddSource: props.onNetCoreAddSource, onOpenNetworkConfig: props.onNetCoreOpenNetworkConfig, onAuthorizeHost: props.onNetCoreAuthorizeHost }} />}
+      network={{ locale, report: props.netCore, busy: Boolean(props.netCoreBusy) || busy, error: props.netCoreError, tunnelLocked: protectionEnabled, networkState: props.netCoreNetwork, onStart: props.onNetCoreStart, onStop: props.onNetCoreStop, onRestart: props.onNetCoreRestart, onTunnelChange: props.onNetCoreTunnel, onStrictChange: props.onNetCoreStrict, onNetworkFailureChange: props.onNetCoreNetworkFailure, onManageSources: props.onNetCoreManageSources, onAddSource: props.onNetCoreAddSource, onOpenNetworkConfig: props.onNetCoreOpenNetworkConfig, onAuthorizeHost: props.onNetCoreAuthorizeHost }} />}
     {docsOpen && <DocumentationDialog locale={locale} onClose={() => setDocsOpen(false)} />}
   </section>;
 }

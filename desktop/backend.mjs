@@ -5,6 +5,7 @@ import { closeServer, startSite } from './site.mjs';
 import { createShutdown } from './lifecycle.mjs';
 import { createDesktopSettings } from '../scripts/desktop-settings.mjs';
 import { createClaudeReset } from '../scripts/claude-reset.mjs';
+import { createClaudeProxySettings } from '../scripts/claude-proxy-settings.mjs';
 
 console.log = console.info = console.debug = console.error;
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -92,6 +93,7 @@ try {
   // 内核先于网关：页面通过网关诊断接口读取内核状态。未配置节点时保持“未启用”。
   kernel = await createKernelRuntime({
     stateDir: process.env.CHECKCC_STATE_DIR,
+    claudeProxy: createClaudeProxySettings({ stateDir: process.env.CHECKCC_STATE_DIR }),
     root,
     logger: (line) => console.error('[net-core]', line),
   });

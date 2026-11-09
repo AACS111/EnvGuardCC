@@ -67,7 +67,7 @@ export function createProtectionService({ stateDir, runtime, browserCloak, curre
       // 先解除未保护阻断，否则保护自己的模拟测试会被 REJECT 规则挡住。
       if (kernel.setUnprotectedGuard) await kernel.setUnprotectedGuard(false);
       unprotectedBlock = { active: false, error: null };
-      await kernel.setTunnel(true);
+      await kernel.setTunnel(true, { ensureHost: true });
       await assertNetwork();
     },
     beforeTest: assertNetwork,

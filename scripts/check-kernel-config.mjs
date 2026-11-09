@@ -10,6 +10,27 @@ const proxies = [
 ];
 const build = (overrides = {}) => buildKernelConfig({ proxies, selected: 'node-a', apiPort: 39090, mixedPort: 39080, egressMode: 'rule', ...overrides });
 
+test('地区 DNS 无响应时可并行使用 DoH，显式协议保持且解析遵循路由', () => {
+  const config = build({ publicDns: ['168.95.1.1', '168.95.192.1'] });
+  const doh = ['https://1.1.1.1/dns-query', 'https://8.8.8.8/dns-query'];
+  assert.deepEqual(config.dns.nameserver, ['168.95.1.1', '168.95.192.1', ...doh]);
+  assert.equal(config.dns['respect-rules'], true);
+  const custom = build({ publicDns: ['https://dns.example/dns-query', 'udp://192.0.2.53'] });
+  assert.deepEqual(custom.dns.nameserver, ['https://dns.example/dns-query', 'udp://192.0.2.53', ...doh]);
+  assert.deepEqual(build({ publicDns: doh }).dns.nameserver, doh);
+});
+
+test('支持 IPv6 的节点启用双栈 TUN、AAAA 和同一套 Claude 固定出口规则', () => {
+  const config = build({ ipv6: true });
+  assert.equal(config.ipv6, true);
+  assert.equal(config.dns.ipv6, true);
+  assert.deepEqual(config.tun['inet6-address'], ['fdfe:dcba:9876::1/126']);
+  assertKernelConfig(config, { egressMode: 'rule' });
+  const strict = strictKernelConfig({ ...config, secret: 'x'.repeat(32) });
+  assert.equal(strict.ipv6, true);
+  assertStrictKernelConfig(strict);
+});
+
 test('规则模式：Claude 置顶、固定出口、strict-route、fake-ip 与故障转移兜底', () => {
   const config = build();
   assert.equal(config.ipv6, false);

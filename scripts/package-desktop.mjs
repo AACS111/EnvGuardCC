@@ -19,6 +19,8 @@ for (const name of ['src', 'public', 'package.json', 'tsconfig.json', 'next-env.
   try { await cp(path.join(root, name), path.join(buildRoot, name), { recursive: true }); }
   catch (error) { if (error.code !== 'ENOENT' || !['public', 'next-env.d.ts'].includes(name)) throw error; }
 }
+await mkdir(path.join(buildRoot, 'scripts/net-core'), { recursive: true });
+await cp(path.join(root, 'scripts/net-core/public-dns.mjs'), path.join(buildRoot, 'scripts/net-core/public-dns.mjs'));
 await symlink(path.join(root, 'node_modules'), link, 'junction');
 const run = (args, env, cwd = root) => new Promise((resolve, reject) => {
   const child = spawn(process.execPath, args, { cwd, env, windowsHide: true, stdio: 'inherit' });

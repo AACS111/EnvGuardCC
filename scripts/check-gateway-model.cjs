@@ -12,6 +12,147 @@ require.extensions['.ts'] = (module, filename) => module._compile(ts.transpileMo
 require.extensions['.tsx'] = (module, filename) => module._compile(ts.transpileModule(fs.readFileSync(filename,'utf8'), {compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2020,jsx:ts.JsxEmit.ReactJSX}}).outputText,filename);
 const {buildGatewayCheck} = require(path.join(root,'src/detection/gateway-check.ts'));
 const {signalConfig} = require(path.join(root,'src/detection/config/signals.ts'));
+test('节点及供应商切换等待后台完成，避免请求超时后实际已切换', async t => {
+  const { controlNetCore, netCoreSourceAction } = require(path.join(root, 'src/detection/gateway-check.ts'));
+  const timeouts = [];
+  t.mock.method(AbortSignal, 'timeout', milliseconds => {
+    timeouts.push(milliseconds);
+    return new AbortController().signal;
+  });
+  t.mock.method(globalThis, 'fetch', async () => ({ ok: true, json: async () => ({ ok: true }) }));
+  await controlNetCore('select', 'test-node');
+  await netCoreSourceAction('activate', 'src_test');
+  await netCoreSourceAction('refresh', 'src_test');
+  assert.deepEqual(timeouts, [180000, 180000, 180000]);
+});
+
+test('节点延迟颜色区分低、中、高、超时与未测量', async () => {
+  const { nodeLatencyTone } = await import('../src/detection/net-core-view.mjs');
+  for (const [delay, tone] of [[0, 'ok'], [199, 'ok'], [200, 'warn'], [499, 'warn'], [500, 'danger'], [null, 'danger'], [undefined, 'muted'], [-1, 'muted'], [Infinity, 'muted']]) {
+    assert.equal(nodeLatencyTone(delay), tone);
+  }
+});
+
+test('节点测量标识随供应商和配置更新时间变化，改名不影响测量归属', async () => {
+  const { nodeMeasurementScope } = await import('../src/detection/net-core-view.mjs');
+  const report = { activeId: 'src_a', source: { url: 'https://example.com/sub', updatedAt: 'first' } };
+  assert.notEqual(nodeMeasurementScope(report), nodeMeasurementScope({ ...report, activeId: 'src_b' }));
+  assert.notEqual(nodeMeasurementScope(report), nodeMeasurementScope({ ...report, source: { ...report.source, updatedAt: 'second' } }));
+  assert.equal(nodeMeasurementScope(report), nodeMeasurementScope({ ...report, sources: [{ id: 'src_a', name: 'renamed' }] }));
+});
+
+test('切换供应商前发出的慢轮询不得恢复旧报告及旧测速结果', async () => {
+  const { nodeMeasurementScope } = await import('../src/detection/net-core-view.mjs');
+  const source = fs.readFileSync(path.join(root, 'src/components/detector/Detector.tsx'), 'utf8');
+  const file = ts.createSourceFile('Detector.tsx', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
+  let callback;
+  const visit = node => {
+    if (ts.isVariableDeclaration(node) && node.name.getText(file) === 'refreshNetCore') callback = node.initializer.arguments[0].getText(file);
+    ts.forEachChild(node, visit);
+  };
+  visit(file);
+  assert.ok(callback);
+  const scope = { current: 'old-source' };
+  const reports = [], samples = [], pending = [];
+  const refresh = require('node:vm').runInNewContext(`(${callback})`, {
+    latestSourceScope: scope, nodeMeasurementScope,
+    readNetCore: () => new Promise(resolve => pending.push(resolve)),
+    setNetCore: report => reports.push(report), setNetCoreDelaySample: sample => samples.push(sample),
+    setExitHistory() {}, setNetCoreError() {},
+  });
+  const oldRequest = refresh();
+  scope.current = 'new-source';
+  pending.shift()({ netCore: { activeId: 'old-source', delays: { same: 1 } } });
+  await oldRequest;
+  assert.equal(reports.length, 0);
+  assert.equal(samples.length, 0);
+  const freshRequest = refresh();
+  const external = { activeId: 'external-source', delays: { same: 200 } };
+  pending.shift()({ netCore: external });
+  await freshRequest;
+  assert.equal(reports[0], external);
+  assert.equal(scope.current, nodeMeasurementScope(external));
+});
+
+test('超时按真实出口地区区分同地区备用与跨地区，未测量节点不当作可用', async () => {
+  const { nodeSelectionState, netCoreView } = await import('../src/detection/net-core-view.mjs');
+  const nodes = ['Japan 01', 'Taiwan 02', 'Taiwan 03', 'Japan 04', '未知节点', 'Japan 05'];
+  const delays = { 'Japan 01': null, 'Taiwan 02': 100, 'Taiwan 03': 200, 'Japan 04': null, '未知节点': 300 };
+  const exits = { 'Japan 01': { countryCode: 'TW' }, 'Taiwan 03': { countryCode: 'JP' } };
+  const state = nodeSelectionState({ nodes, selected: 'Japan 01', delays, exits });
+  assert.equal(state.recovery.tone, 'warn');
+  assert.deepEqual(state.recovery.sameRegion.map(node => node.name), ['Taiwan 02']);
+  assert.deepEqual(state.recovery.otherRegions.map(node => node.name), ['Taiwan 03', '未知节点']);
+  assert.equal(state.nodes.find(node => node.name === 'Taiwan 03').switchTone, 'danger');
+  assert.equal(nodeSelectionState({ nodes, selected: 'Japan 01', delays: { ...delays, 'Taiwan 02': null }, exits }).recovery.tone, 'danger');
+  assert.equal(nodeSelectionState({ nodes, selected: 'Japan 01', delays: {}, exits }).recovery, null);
+  assert.equal(netCoreView({ enabled: true, state: 'unavailable', nodes, selected: 'Japan 01' }).actions.canSelect, true);
+});
+
+test('节点卡片显示延迟色阶，超时有同地区备用时显示黄色并保留选择入口', () => {
+  const { NetCorePanel } = require(path.join(root, 'src/components/detector/NetCorePanel.tsx'));
+  const report = { enabled: true, state: 'unavailable', nodes: ['Taiwan 01', 'Taiwan 02', 'Japan 01', 'US 01'], selected: 'Taiwan 01', mode: 'rule' };
+  const props = { locale: 'zh', report, delays: { 'Taiwan 01': null, 'Taiwan 02': 100, 'Japan 01': 300, 'US 01': 700 }, onRefresh() {}, onRestart() {}, onSelectNode() {}, onMeasure() {}, onModeChange() {} };
+  const html = renderToStaticMarkup(React.createElement(NetCorePanel, props));
+  assert.doesNotMatch(html, /延迟分级|低延迟|中延迟|高延迟/);
+  assert.doesNotMatch(renderToStaticMarkup(React.createElement(NetCorePanel, { ...props, locale: 'en' })), /Latency levels|Low &lt; 200 ms|Medium 200–499 ms|High ≥ 500 ms/);
+  assert.match(html, /class="netcore-recovery" data-tone="warn"/);
+  assert.match(html, /同地区有 1 个可用备用节点/);
+  assert.match(html, /class="netcore-node__latency" data-tone="ok"[^>]*>100 ms/);
+  assert.match(html, /class="netcore-node__latency" data-tone="warn"[^>]*>300 ms/);
+  assert.match(html, /class="netcore-node__latency" data-tone="danger"[^>]*>700 ms/);
+  assert.match(html, /class="netcore-node__latency" data-tone="danger"[^>]*>超时/);
+  const cards = html.slice(html.indexOf('<ul class="netcore-nodes">'));
+  assert.doesNotMatch(cards, /disabled=""/);
+  const crossRegion = renderToStaticMarkup(React.createElement(NetCorePanel, { ...props, delays: { ...props.delays, 'Taiwan 02': null } }));
+  assert.match(crossRegion, /class="netcore-recovery" data-tone="danger"/);
+  assert.match(crossRegion, /跨地区切换需要确认/);
+});
+
+test('跨地区选择必须确认，同地区手动切换，供应商变化后旧确认失效', t => {
+  const { NetCorePanel } = require(path.join(root, 'src/components/detector/NetCorePanel.tsx'));
+  const states = [];
+  let hook = 0;
+  t.mock.method(React, 'useState', initial => {
+    const index = hook++;
+    if (!(index in states)) states[index] = initial;
+    return [states[index], value => { states[index] = value; }];
+  });
+  t.mock.method(React, 'useId', () => 'node-test');
+  const triggerRef = { current: null };
+  t.mock.method(React, 'useRef', () => triggerRef);
+  const trigger = { focus: t.mock.fn() };
+  const selected = [];
+  const report = { enabled: true, state: 'running', activeId: 'src_a', nodes: ['Taiwan 01', 'Taiwan 02', 'Japan 01'], selected: 'Taiwan 01', mode: 'rule' };
+  const props = { locale: 'zh', report, delays: { 'Taiwan 01': null, 'Taiwan 02': 100, 'Japan 01': 200 }, onRefresh() {}, onRestart() {}, onSelectNode: name => selected.push(name), onMeasure() {}, onModeChange() {} };
+  const render = (next = props) => { hook = 0; return NetCorePanel(next); };
+  const elements = tree => {
+    const result = [];
+    React.Children.forEach(tree, element => {
+      if (!React.isValidElement(element)) return;
+      result.push(element, ...elements(element.props.children));
+    });
+    return result;
+  };
+  const findCard = (tree, name) => elements(tree).find(element => element.type === 'button' && element.props.className === 'netcore-node' && elements(element.props.children).some(child => child.props.className === 'netcore-node__name' && child.props.children === name));
+  const findConfirm = tree => elements(tree).find(element => element.type === 'button' && element.props.children === '确认切换');
+  findCard(render(), 'Japan 01').props.onClick({ currentTarget: trigger });
+  assert.deepEqual(selected, []);
+  let tree = render();
+  assert.ok(elements(tree).some(element => element.props.className === 'netcore-confirm' && element.props['data-tone'] === 'danger'));
+  assert.ok(findConfirm(tree));
+  elements(tree).find(element => element.type === 'button' && element.props.children === '取消').props.onClick();
+  assert.equal(trigger.focus.mock.callCount(), 1);
+  assert.deepEqual(selected, []);
+  findCard(render(), 'Japan 01').props.onClick({ currentTarget: trigger });
+  tree = render();
+  assert.equal(findConfirm(render({ ...props, report: { ...report, activeId: 'src_b' } })), undefined);
+  findConfirm(tree).props.onClick();
+  assert.deepEqual(selected, ['Japan 01']);
+  findCard(render(), 'Taiwan 02').props.onClick({ currentTarget: trigger });
+  assert.deepEqual(selected, ['Japan 01', 'Taiwan 02']);
+});
+
 const fixtures = () => ({
   version:1,upstream:'https://api.anthropic.com/',platform:'win32',profileError:null,
   profile:{language:'ko-KR',locale:'ko-KR',timezone:'Asia/Seoul',updatedAt:'new'},
@@ -842,9 +983,11 @@ test('overview exposes recheck and pass coverage while configuration moves to se
   assert.doesNotMatch(html,/自动检测间隔|开机自启动|workspace-preferences/);
   assert.match(html,/aria-haspopup="dialog"[^>]*>[\s\S]*?设置/);
   assert.doesNotMatch(html,/最近检测|下次检测|异常分/);
+  assert.doesNotMatch(html,/查看防护状态和待处理事项/);
   assert.match(html,/环境检测得分/); assert.match(html,/满分 100/); assert.match(html,/未判定项暂计半分/); assert.match(html,/环境风险估计/);
   assert.doesNotMatch(html,/aria-valuenow=/,'without samples, provisional credit is not displayed as a measured score');
   const english = renderToStaticMarkup(React.createElement(ProtectionWorkspace,{...props,locale:'en'}));
+  assert.doesNotMatch(english,/Review protection and items that need attention/);
   assert.match(english,/Weighted score out of 100/); assert.match(english,/unresolved items receive half credit/);
   const busy = renderToStaticMarkup(React.createElement(ProtectionWorkspace,{...props,busy:true,checking:true}));
   assert.match(busy,/disabled=""[^>]*>检测中…/);
@@ -1021,7 +1164,7 @@ test('网络内核面板：只给证据，不给未经证实的通过结论',()=
   // 无流量：不得出现通过态。
   const unknown=render({...running,routing:{state:'unknown',claude:0,pinned:0,direct:0,total:0,violations:[]}});
   assert.match(unknown,/未观察到 Claude 连接/);
-  assert.doesNotMatch(unknown,/data-tone="ok"/);
+  assert.match(unknown, /class="netcore-conclusion" data-tone="warn"/);
 
   // 违规：列出主机与代理链。
   const violation=render({...running,routing:{state:'violation',claude:2,pinned:1,direct:1,total:3,violations:[{host:'api.anthropic.com',chains:['DIRECT']}]}});
@@ -1033,7 +1176,7 @@ test('网络内核面板：只给证据，不给未经证实的通过结论',()=
   // 演示模式必须标注，且不能是 ok。
   const demo=render({...running,demo:true});
   assert.match(demo,/演示节点/);
-  assert.doesNotMatch(demo,/data-tone="ok"/);
+  assert.match(demo, /class="netcore-conclusion" data-tone="warn"/);
 
   // 未配置：空态与原因，不出现任何出口结论指标。
   const disabled=render({enabled:false,state:'disabled',reason:'尚未配置出口节点'});
@@ -1047,7 +1190,7 @@ test('网络内核面板：只给证据，不给未经证实的通过结论',()=
   assert.match(en,/Observed Claude connections use the dedicated exit/);
   const blocked=render({...running,strictMode:true,guard:{armed:true,phase:'blocked'},capabilities:{strictTravel:false}});
   assert.match(blocked,/严格连接尚未放行/);
-  assert.doesNotMatch(blocked,/data-tone="ok"/);
+  assert.doesNotMatch(blocked, /class="netcore-conclusion" data-tone="ok"/);
   for(const mode of blocked.match(/<button[^>]*class="netcore-mode"[^>]*>/g)??[]) assert.match(mode,/disabled=""/);
 });
 
@@ -1251,6 +1394,22 @@ test('路径图独立显示普通代理采样，不依赖 Claude 活动，也不
   const render = (value, locale='zh') => renderToStaticMarkup(React.createElement(TrafficFlow,{report:value,locale,onDetails:()=>{}}));
   try {
     const html = render(report);
+    const classifiedReport = { ...report, connectionLog: { ...report.connectionLog, active: [
+      { ...report.connectionLog.active[0], id: 'claude-proxy', host: 'api.anthropic.com', isClaude: true },
+      { ...report.connectionLog.active[1], id: 'claude-direct', host: 'claude.ai', route: 'direct', isClaude: true },
+      { ...report.connectionLog.active[2], id: 'ordinary-proxy', isClaude: false },
+    ] } };
+    const classified = render(classifiedReport);
+    assert.match(classified, /workspace-flow__connection--proxy" data-claude="true"/);
+    assert.match(classified, /workspace-flow__connection--direct" data-claude="true"/);
+    assert.match(classified, /workspace-flow__connection--proxy" data-claude="false"/);
+    assert.match(classified, /<title>Claude · api\.anthropic\.com · 代理出口<\/title>/);
+    const flowCss = fs.readFileSync(path.join(root, 'src/components/detector/workspace.css'), 'utf8');
+    assert.match(flowCss, /\.workspace-flow__caption\s*\{[^}]*text-align:\s*right/);
+    assert.match(flowCss, /--workspace-flow-claude:\s*#2d67a3\b/);
+    assert.match(flowCss, /\.workspace-flow__connection\[data-claude="true"\]\s*\{\s*fill:\s*var\(--workspace-flow-claude\)/);
+    assert.match(html, /workspace-flow__filament/);
+    assert.doesNotMatch(fs.readFileSync(path.join(root, 'src/components/detector/TrafficFlow.tsx'), 'utf8'), /\.pauseAnimations\(/);
     assert.match(html, /代理出口 · 3 条/);
     assert.match(html, /直连 · 0 条/);
     assert.match(html, /workspace-flow__path--proxy" data-verified="true"/);
@@ -1261,7 +1420,8 @@ test('路径图独立显示普通代理采样，不依赖 Claude 活动，也不
     // 每个粒子带一段名字显隐动画：离开本机后短暂显示、2 秒时隐藏；30 条连接按 10 轮错开，避免同时挤满起点。
     assert.equal((html.match(/attributeName="opacity" values="0;0;1;1;0;0"/g) ?? []).length, 30);
     assert.match(html, /keyTimes="0;0\.0058;0\.0083;0\.0342;0\.0392;1" dur="60s" begin="0\.00s"/);
-    assert.match(html, /光点离开本机时短暂显示主机名/);
+    assert.match(html, /网络连接流向 · 悬停查看信息，点击打开详情/);
+    assert.doesNotMatch(html, /光效为路径示意|光点离开本机时短暂显示主机名/);
     assert.equal((html.match(/role="button"/g) ?? []).length, 30);
     const merged = render({...report,routing:{...report.routing,state:'verified',claude:2,pinned:2,traffic:{proxied:27,direct:1,blocked:0,unknown:0},paths:{proxied:29,direct:1,blocked:0,unknown:0}},connectionLog:{...report.connectionLog,activeTotal:30,active:report.connectionLog.active.map((record,i)=>i===0?{...record,host:'claude.ai',isClaude:true,chains:['node','CLAUDE-PIN']}:record)}});
     assert.match(merged, /代理出口 · 29 条/);
@@ -1276,14 +1436,19 @@ test('路径图独立显示普通代理采样，不依赖 Claude 活动，也不
     assert.match(stale, /代理出口 · 待采样/);
     assert.doesNotMatch(stale, /workspace-flow__connection--|data-verified="true"/);
     assert.match(stale, /workspace-flow__photon--proxy/);
-    assert.match(stale, /光效为路径示意/);
+    assert.match(stale, /网络连接流向 · 悬停查看信息，点击打开详情/);
     const absent = render({...report,connectionLog:undefined,routing:{...report.routing,traffic:undefined}});
     assert.match(absent, /代理出口 · 待采样/);
     assert.doesNotMatch(absent, /workspace-flow__connection--/);
     assert.match(absent, /workspace-flow__photon--direct/);
     assert.doesNotMatch(render({...report,state:'idle'}), /animateMotion/);
     reduced = true;
+    const stillClassified = render(classifiedReport);
+    assert.match(stillClassified, /workspace-flow__connection--proxy" data-claude="true"/);
+    assert.match(stillClassified, /workspace-flow__connection--direct" data-claude="true"/);
+    assert.doesNotMatch(stillClassified, /animateMotion/);
     const still = render(report,'en');
+    assert.match(still, /Network connection flow · hover for info, select for details/);
     assert.match(still, /Proxy exit · 3 conn\./);
     assert.match(still, /data-verified="true"/);
     assert.doesNotMatch(still, /animateMotion/);

@@ -131,6 +131,27 @@ test('特权宿主心跳失联后自动回收真实内核', { timeout: 20000 }, 
   } finally { await host.close(); await fs.rm(directory,{recursive:true,force:true}); }
 });
 
+test('真实内核保留代理 IPv6 出口所需的双栈配置，不要求本机原生 IPv6', { timeout: 20000 }, async t => {
+  try { await fs.access(binary); } catch { t.skip('当前平台未准备内核'); return; }
+  const { createNetCore } = await import('./net-core.mjs');
+  const { buildKernelConfig, serializeKernelConfig } = await import('./net-core/config.mjs');
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'checkcc-ipv6-config-'));
+  const apiPort = await freePort();
+  const configPath = path.join(directory, 'config.yaml');
+  const secret = 'ipv6-test-secret'.repeat(3);
+  const config = buildKernelConfig({ proxies: [{ name: 'test', type: 'http', server: '127.0.0.1', port: 9 }], selected: 'test', apiPort, secret, ipv6: true });
+  // 仅核对配置与进程，不修改系统路由和 DNS。
+  config.tun.enable = false; config.dns.enable = false;
+  await fs.writeFile(configPath, serializeKernelConfig(config));
+  const core = createNetCore({ binary, homeDir: directory, configPath, apiPort, secret });
+  try {
+    await core.start();
+    const applied = await core.request('/configs');
+    assert.equal(applied.ipv6, true);
+    assert.deepEqual(applied.tun['inet6-address'], ['fdfe:dcba:9876::1/126']);
+  } finally { await core.stop(); await fs.rm(directory, { recursive: true, force: true }); }
+});
+
 test('真实内核控制器要求密钥，热加载保持原选择', { timeout: 20000 }, async t => {
   try { await fs.access(binary); } catch { t.skip('当前平台未准备内核'); return; }
   const { createNetCore } = await import('./net-core.mjs');

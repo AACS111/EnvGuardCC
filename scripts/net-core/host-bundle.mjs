@@ -7,7 +7,9 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 
 const execute = promisify(execFile);
-const FILES = ["scripts/net-core/host.mjs", "scripts/net-core.mjs", "scripts/net-core/config.mjs", "scripts/net-core/public-dns.mjs", "scripts/net-core/ports.mjs", "scripts/net-core/guardian.cjs", "scripts/net-core/firewall.mjs", "scripts/net-core/system-ipv6.mjs"];
+// 宿主运行包必须自包含：staged 目录里缺任何一个被 import 的文件，装好的宿主会直接起不来。
+export const HOST_BUNDLE_FILES = ["scripts/net-core/host.mjs", "scripts/net-core.mjs", "scripts/net-core/config.mjs", "scripts/net-core/public-dns.mjs", "scripts/net-core/ports.mjs", "scripts/net-core/guardian.cjs", "scripts/net-core/firewall.mjs", "scripts/net-core/system-ipv6.mjs", "scripts/windows-timezone.mjs"];
+const FILES = HOST_BUNDLE_FILES;
 
 export function protectedHostRoot(platform = process.platform) {
   if (platform === "darwin") return "/Library/PrivilegedHelperTools/com.envguardcc.kernelhost.bundle";
@@ -26,14 +28,42 @@ async function rejectSymlinkParents(target) {
   }
 }
 
+/** icacls 只要有一个文件失败就整体返回非零：把失败路径捞出来逐项处理。 */
+export function parseIaclsFailures(error) {
+  const text = `${error?.stdout ?? ""}\n${error?.stderr ?? ""}\n${error?.message ?? ""}`;
+  const paths = new Set();
+  for (const line of text.split("\n")) {
+    const match = line.match(/^([A-Za-z]:\\[^:]+?):\s/);
+    if (match) paths.add(match[1]);
+  }
+  return [...paths];
+}
+
 export async function stageHostBundle({ nodePath = process.execPath, hostScript, binary, destination = protectedHostRoot(), platform = process.platform, run = execute } = {}) {
   if (!hostScript || !binary) throw new Error("宿主安装缺少程序来源。");
   await rejectSymlinkParents(destination);
   await mkdir(destination, { recursive: true, mode: 0o755 });
+  const warnings = [];
   const secure = async directory => {
     if (platform === "win32") {
-      await run("icacls.exe", [directory, "/inheritance:r", "/grant:r", "*S-1-5-18:(OI)(CI)F", "*S-1-5-32-544:(OI)(CI)F", "/T", "/Q"]);
-      await run("icacls.exe", [directory, "/setowner", "*S-1-5-32-544", "/T", "/Q"]);
+      // DACL 是安全边界：必须成功，否则拒绝安装。
+      // 文件必须显式授权。仅授予目录继承权限再移除继承，会把文件变成空 DACL。
+      await run("icacls.exe", [directory, "/inheritance:r", "/grant:r", "*S-1-5-18:F", "*S-1-5-32-544:F", "/T", "/Q"]);
+      // 追加各级目录的继承权限，保留文件已经获得的显式权限。
+      await run("icacls.exe", [directory, "/grant", "*S-1-5-18:(OI)(CI)F", "*S-1-5-32-544:(OI)(CI)F", "/T", "/Q"]);
+      // 所有权是纵深防御：第三方二进制（VPN TAP 驱动、内核 exe）可能被安全软件占用，或
+      // 拒绝普通管理员改所有者，导致 /setowner /T 整体失败。逐项重试仍失败的只记警告：
+      // DACL 已把写权限限制为 SYSTEM/Administrators，标准用户无法改写运行包。
+      const failures = await run("icacls.exe", [directory, "/setowner", "*S-1-5-32-544", "/T", "/Q"]).then(() => [], parseIaclsFailures);
+      for (const file of failures) {
+        let owned = false;
+        for (let attempt = 0; attempt < 3 && !owned; attempt += 1) {
+          if (attempt) await new Promise((resolve) => setTimeout(resolve, 200));
+          try { await run("icacls.exe", [file, "/setowner", "*S-1-5-32-544", "/Q"]); owned = true; }
+          catch { /* 下一轮重试：安全软件扫描时可能只是临时占用 */ }
+        }
+        if (!owned) warnings.push(`${file} 的所有者未能改为 Administrators（DACL 已限制，继续安装）`);
+      }
     } else if (platform === "darwin") {
       await run("/bin/chmod", ["-RN", directory]);
       await run("/usr/sbin/chown", ["-R", "root:wheel", directory]);
@@ -70,6 +100,6 @@ export async function stageHostBundle({ nodePath = process.execPath, hostScript,
     await chmod(stage, 0o755);
     const installed = path.join(destination, version);
     await rename(stage, installed);
-    return { root: installed, nodePath: path.join(installed, executable), hostScript: path.join(installed, "scripts/net-core/host.mjs"), binary: path.join(installed, kernel) };
+    return { root: installed, nodePath: path.join(installed, executable), hostScript: path.join(installed, "scripts/net-core/host.mjs"), binary: path.join(installed, kernel), warnings: [...new Set(warnings)] };
   } catch (error) { await rm(stage, { recursive: true, force: true }); throw error; }
 }

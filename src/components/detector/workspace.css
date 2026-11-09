@@ -16,6 +16,7 @@
   --repair-danger-surface: #fcebea;
   --repair-focus: #9b5b45;
   --score-measured: #426451;
+  --workspace-flow-claude: #2d67a3;
   --score-measured-surface: #e8f3e9;
   --signal-pass-surface: #e8f3e9;
   --signal-pass-text: #315f42;
@@ -167,6 +168,8 @@
 .workspace-notices { display: grid; gap: 2px; margin-bottom: 12px; padding: 6px 16px; border: 1px solid var(--repair-border); border-radius: var(--workspace-radius); background: var(--repair-surface); }
 .workspace-notices[data-tone="warning"] { border-color: var(--workspace-warn-border, #e7c98a); background: var(--workspace-warn-surface, #fbf3df); }
 .workspace-notices[data-tone="error"] { border-color: var(--repair-danger); background: var(--repair-danger-surface); }
+.workspace-notices[data-tone="info"] { border-color: var(--score-measured); background: var(--score-measured-surface); }
+.workspace-alert[data-tone="info"] { color: var(--score-measured); }
 .workspace-alert { display: flex; align-items: flex-start; gap: 8px; margin: 2px 0; color: var(--repair-muted); overflow-wrap: anywhere; }
 .workspace-alert > p { flex: 1; min-width: 0; margin: 0; }
 .workspace-alert::before { content: ""; flex: 0 0 8px; width: 8px; height: 8px; margin-top: 6px; border-radius: 50%; background: var(--repair-danger); }
@@ -301,6 +304,8 @@
 .netcore-facts { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 18px; margin: 6px 0 0; color: var(--repair-text); font-size: 13px; font-variant-numeric: tabular-nums; }
 .netcore-facts b { margin-right: 6px; color: var(--repair-muted); font-size: var(--workspace-label); font-weight: 600; }
 .netcore-facts .netcore-muted { color: var(--repair-muted); font-size: var(--workspace-label); }
+.netcore-ipv6 { margin: 4px 0 0; color: var(--repair-muted); font-size: var(--workspace-label); line-height: 1.5; overflow-wrap: anywhere; }
+.netcore-ipv6[data-tone="danger"] { color: var(--repair-danger); }
 .netcore-conclusion__state { display: grid; justify-items: end; align-content: space-between; gap: 8px; }
 .netcore-badge { padding: 2px 10px; border-radius: 999px; font-size: var(--workspace-label); font-weight: 600; }
 .netcore-badge[data-tone="ok"] { background: var(--score-measured-surface); color: var(--score-measured); }
@@ -338,6 +343,16 @@
 .netcore-node__badge { flex-shrink: 0; margin-left: auto; padding: 0 8px; border-radius: 999px; background: var(--repair-selected); color: var(--repair-accent); font-size: 11px; font-weight: 700; }
 .netcore-node__badge--auto { background: var(--workspace-track); color: var(--repair-muted); }
 .netcore-node__state { color: var(--repair-muted); font-size: var(--workspace-label); font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.netcore-node__latency[data-tone="ok"] { color: var(--score-measured); }
+.netcore-node__latency[data-tone="warn"] { color: var(--workspace-warn-text); }
+.netcore-node__latency[data-tone="danger"] { color: var(--repair-danger); }
+.netcore-recovery { display: grid; gap: 8px; padding: 8px 12px; border: 1px solid var(--workspace-warn-border); border-radius: var(--workspace-control-radius); background: var(--workspace-warn-surface); color: var(--workspace-warn-text); font-size: var(--workspace-body); overflow-wrap: anywhere; }
+.netcore-recovery p { margin: 0; }
+.netcore-recovery .netcore-confirm__actions { margin-left: 0; flex-wrap: wrap; }
+.netcore-recovery .repair-button { max-width: 100%; white-space: normal; overflow-wrap: anywhere; }
+.netcore-recovery[data-tone="danger"], .netcore-confirm[data-tone="danger"] { border-color: var(--repair-danger); background: var(--repair-danger-surface); color: var(--repair-danger); }
+.netcore-confirm[data-tone="danger"] { min-width: 0; overflow-wrap: anywhere; }
+.netcore-confirm[data-tone="danger"] > span { min-width: 0; }
 .netcore-probed { margin-top: -2px; }
 .netcore-history { color: var(--repair-muted); font-size: var(--workspace-label); }
 .netcore-history summary { cursor: pointer; font-weight: 600; }
@@ -499,9 +514,11 @@
 .workspace-flow__diagram { position: relative; min-width: 0; }
 .workspace-flow__footer { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 12px; min-width: 0; min-height: 28px; }
 .protection-workspace .workspace-flow__lines { position: absolute; width: 100%; height: 100%; }
-.workspace-flow__path { fill: none; stroke: #a9a39a; stroke-width: .9; opacity: .42; stroke-dasharray: 4 5; }
-.workspace-flow__path[data-verified="true"] { stroke: #ae7558; stroke-width: 1.1; stroke-dasharray: none; opacity: .62; }
-.workspace-flow__path--direct[data-verified="true"] { stroke: #6e8e79; }
+.workspace-flow__path { fill: none; stroke: var(--repair-muted); stroke-width: .45; opacity: .22; }
+.workspace-flow__path[data-verified="true"] { stroke: var(--repair-accent); opacity: .5; }
+.workspace-flow__path--direct[data-verified="true"] { stroke: var(--score-measured); }
+.workspace-flow__filament { stroke: var(--repair-accent); stroke-width: 1; stroke-linecap: round; }
+.workspace-flow__path--direct .workspace-flow__filament { stroke: var(--score-measured); }
 .workspace-flow__particle { fill: #ae7558; opacity: .85; }
 .workspace-flow__particle--direct { fill: #6e8e79; }
 .workspace-flow__bypass { fill: none; stroke: #b44239; stroke-width: 1; stroke-dasharray: 4 5; }
@@ -525,7 +542,7 @@
 .workspace-flow__mascot::after { content: ''; position: absolute; left: -3px; top: 5px; z-index: -1; width: 28px; height: 4px; background: #d9795d; }
 .workspace-flow__mascot > span { position: absolute; left: 3px; bottom: -4px; width: 3px; height: 5px; background: #d9795d; box-shadow: 5px 0 #d9795d, 10px 0 #d9795d, 15px 0 #d9795d; }
 .workspace-flow__warning { position: absolute; left: 68%; top: 39%; width: 22px; height: 22px; border: 1px solid #e1aaa4; border-radius: 50%; background: var(--repair-danger-surface); color: var(--repair-danger); font-size: 13px; font-weight: 700; cursor: pointer; }
-.workspace-flow__caption { flex: 1 1 180px; min-width: 0; color: var(--repair-muted); font-size: 10px; }
+.workspace-flow__caption { flex: 1 1 180px; min-width: 0; color: var(--repair-muted); font-size: 10px; text-align: right; }
 .check-workspace .workspace-global .repair-button { min-height: 33px; padding: 6px 12px; }
 .check-workspace .repair-button:hover:not(:disabled) { border-color: var(--repair-accent); }
 .workspace-hero { display: flex; align-items: center; justify-content: space-between; gap: 18px; }
@@ -773,10 +790,11 @@
 
 .workspace-flow__connection { fill: var(--repair-accent); cursor: pointer; outline: none; }
 .workspace-flow__connection text { fill: var(--repair-text); font-size: 8px; paint-order: stroke; stroke: var(--workspace-page); stroke-width: 3px; stroke-linejoin: round; pointer-events: none; opacity: 0; }
-.workspace-flow__connection--direct { fill: #6e8e79; }
+.workspace-flow__connection--direct { fill: var(--score-measured); }
 .workspace-flow__connection--bypass { fill: var(--repair-danger); }
 .workspace-flow__connection--unknown { fill: var(--repair-muted); }
-.workspace-flow__connection:hover text, .workspace-flow__connection:focus-visible text { opacity: 1; }
+.workspace-flow__connection[data-claude="true"] { fill: var(--workspace-flow-claude); }
+.workspace-flow__connection:hover text, .workspace-flow__connection:focus-visible text, .workspace-flow__connection[data-revealed="true"] text { opacity: 1; }
 .workspace-flow__hit { fill: transparent; pointer-events: all; }
 .workspace-flow__connection:focus-visible text { fill: var(--repair-focus); text-decoration: underline; }
 .transfer-log-tools { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0; }
@@ -788,5 +806,5 @@
 .transfer-log-setting select, .transfer-log-replay select { min-height: 32px; padding: 4px 8px; border: 1px solid var(--repair-border); border-radius: 6px; background: var(--repair-surface); color: var(--repair-text); font: inherit; }
 
 .workspace-flow__photon { fill: var(--repair-accent); color: var(--repair-accent); filter: drop-shadow(0 0 3px currentColor); pointer-events: none; }
-.workspace-flow__photon--direct { fill: #6e8e79; color: #6e8e79; }
+.workspace-flow__photon--direct { fill: var(--score-measured); color: var(--score-measured); }
 @media (prefers-reduced-motion: reduce) { .workspace-flow__photon { display: none; } }

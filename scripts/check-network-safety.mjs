@@ -15,7 +15,9 @@ import { readHostConfig } from "./net-core/host.mjs";
 import { buildHostInstallPlan } from "./net-core/service.mjs";
 import { stageHostBundle } from "./net-core/host-bundle.mjs";
 import { createNetCore } from "./net-core.mjs";
+import { pickPortBlock } from './net-core/ports.mjs';
 import { ProtectionSession } from "./protection-session.mjs";
+import { createClaudeProxySettings } from './claude-proxy-settings.mjs';
 
 const node = name => ({ name, type: "ss", server: "203.0.113.10", port: 443, cipher: "aes-128-gcm", password: "test" });
 
@@ -87,6 +89,13 @@ test("区域锁定必须显示为阻断，不能继续显示通过", () => {
   assert.equal(locked.tone, "danger");
   assert.match(locked.conclusion.title, /阻断/);
   assert.match(locked.conclusion.detail, /CN/);
+  assert.match(locked.conclusion.detail, /复检并解除/, "地区锁必须提示人工确认");
+  // 网络波动的锁会自动复检：界面必须说清楚不用手动点，并显示复检进度。
+  const networkLock = netCoreView({ ...current, regionLock: { locked: true, type: "network", autoRecover: true, recheckAttempts: 3, reason: "网络中断或波动" } });
+  assert.equal(networkLock.tone, "danger");
+  assert.match(networkLock.conclusion.detail, /自动复检/);
+  assert.match(networkLock.conclusion.detail, /第 3 次/);
+  assert.doesNotMatch(networkLock.conclusion.detail, /切换节点后/);
   assert.equal(netCoreView({ ...current, regionLock: { locked: false } }).tone, "ok");
 });
 
@@ -115,8 +124,9 @@ test("来源 DNS 独立持久化，旧顶层 DNS 只迁移到原 active", async 
   assert.deepEqual(migrated.sources[1].proxyServerDns, ["192.0.2.53"]);
 });
 
-async function fakeRuntime(t, takeover = { prepare: async () => {}, status: () => ({ phase: "idle", closed: [] }) }, { host = false } = {}) {
+async function fakeRuntime(t, takeover = { prepare: async () => {}, status: () => ({ phase: "idle", closed: [] }) }, { host = false, ipv6Supported = false, nodeExits = {}, nodeDelays = {}, claudeProxy = null } = {}) {
   const dir = await directory(t);
+  const apiPort = await pickPortBlock(2, { start: 40181 });
   let failNext = false;
   let failedReloads = 0;
   let tunnelActive = true;
@@ -124,10 +134,31 @@ async function fakeRuntime(t, takeover = { prepare: async () => {}, status: () =
   let capturedSecret;
   let starts = 0, maxStarts = 0;
   let healthBroken = false, scheduled = null, interfaceAddress = "192.0.2.10", launches = 0;
+  let ipv6Disabled = false;
+  let failRestore = false;
+  let failDisable = false;
+  let selectedNode = null;
   const runtime = await createKernelRuntime({
     stateDir: dir,
     takeover,
+    claudeProxy,
+    exitFetch: async () => {
+      const country = Object.hasOwn(nodeExits, selectedNode) ? nodeExits[selectedNode] : 'SG';
+      if (country === null) throw new Error('test exit timeout');
+      return JSON.stringify({ ip: '203.0.113.20', country_code: country, success: true });
+    },
+    systemIpv6: {
+      disable: async () => {
+        if (failDisable === 'throw') throw new Error('test IPv6 disable failed');
+        if (failDisable === 'reason') return { changed: false, reason: 'test IPv6 disable unconfirmed' };
+        ipv6Disabled = true;
+        return { changed: true, service: 'test', previous: 'Automatic' };
+      },
+      restore: async () => { if (failRestore) throw new Error('test IPv6 restore failed'); ipv6Disabled = false; return true; },
+    },
+    ipv6Fetch: async () => '2001:db8::1',
     env: { CHECKCC_NET_CORE_BINARY: process.execPath, CHECKCC_NET_CORE_TUN: "0", CHECKCC_NET_CORE_DNS: "https://192.0.2.53/dns-query",
+      CHECKCC_NET_CORE_API_PORT: String(apiPort), CHECKCC_NET_CORE_MIXED_PORT: String(apiPort + 1),
       ...(host ? { CHECKCC_NET_CORE_HOST: "http://127.0.0.1:39091", CHECKCC_NET_CORE_HOST_TOKEN: "test-host-token" } : {}),
     },
     fetchImpl: async (_url, options) => {
@@ -138,7 +169,7 @@ async function fakeRuntime(t, takeover = { prepare: async () => {}, status: () =
     healthScheduler: { every: callback => { scheduled = callback; return { unref() {} }; }, clear: () => { scheduled = null; } },
     createCore: options => {
       // 能力探测不访问真实节点，也不操作系统 IPv6。
-      if (options.configPath.endsWith("probe.yaml")) return { start: async () => { throw new Error("test probe disabled"); }, stop: async () => {} };
+      if (options.configPath.endsWith("probe.yaml")) return { start: async () => { if (!ipv6Supported) throw new Error("test probe disabled"); }, stop: async () => {} };
       capturedSecret = options.secret;
       let running = false, config;
       return {
@@ -148,6 +179,7 @@ async function fakeRuntime(t, takeover = { prepare: async () => {}, status: () =
             await new Promise(resolve => setTimeout(resolve, 5));
             if (failNext) { failNext = false; throw new Error("injected launch failure"); }
             config = yaml(await readFile(options.configPath, "utf8"));
+            selectedNode = config['proxy-groups'][0].proxies[0];
             running = true;
             healthBroken = false;
             launches++;
@@ -159,7 +191,13 @@ async function fakeRuntime(t, takeover = { prepare: async () => {}, status: () =
           if (!running || healthBroken) throw new Error("not running");
           return { version: "test", connections: [], proxies: { proxies: { "CLAUDE-PIN": { now: config["proxy-groups"][0].proxies[0] } } } };
         },
-        request: async () => ({ delay: 1 }),
+        request: async url => {
+          if (url === '/configs') return config;
+          if (url === '/proxies') return { proxies: { 'CLAUDE-PIN': { now: selectedNode } } };
+          const name = decodeURIComponent(url.split('/')[2] ?? '');
+          return { delay: Object.hasOwn(nodeDelays, name) ? nodeDelays[name] : 1 };
+        },
+        selectProxy: async (_group, name) => { config['proxy-groups'][0].proxies = [name]; selectedNode = name; },
         tunnelStatus: async () => ({ active: tunnelActive }),
         reloadFromFile: async () => {
           config = yaml(await readFile(options.configPath, "utf8"));
@@ -174,8 +212,230 @@ async function fakeRuntime(t, takeover = { prepare: async () => {}, status: () =
     setTunnelActive: value => { tunnelActive = value; },
     tick: async () => { await scheduled?.(); }, disconnect: () => { healthBroken = true; },
     switchNetwork: () => { interfaceAddress = "192.0.2.11"; }, launches: () => launches,
+    ipv6Disabled: () => ipv6Disabled, setIpv6Supported: value => { ipv6Supported = value; },
+    failIpv6Restore: value => { failRestore = value; },
+    failIpv6Disable: value => { failDisable = value; },
   };
 }
+
+test('内核就绪后同步 Claude 代理，停止和启动失败时恢复配置', async t => {
+  const calls = [];
+  const claudeProxy = {
+    apply: async proxy => { calls.push(['apply', proxy]); },
+    restore: async () => { calls.push(['restore']); },
+  };
+  const f = await fakeRuntime(t, undefined, { claudeProxy });
+  calls.length = 0;
+  await f.runtime.importNodes([node('a')]);
+  assert.equal(await f.runtime.start(), true);
+  assert.equal(calls[0]?.[0], 'apply');
+  assert.match(calls[0][1], /^http:\/\/127\.0\.0\.1:\d+$/);
+  assert.equal(calls[0][1], (await f.runtime.report()).localProxy);
+  await f.runtime.stop();
+  assert.deepEqual(calls.at(-1), ['restore']);
+  calls.length = 0;
+  f.fail();
+  assert.equal(await f.runtime.start(), false);
+  assert.equal(calls.some(([action]) => action === 'apply'), false);
+  assert.deepEqual(calls.at(-1), ['restore']);
+});
+
+test('Claude 代理同步失败时回滚，并允许修复后重试启动', async t => {
+  let fail = false;
+  let restored = 0;
+  const f = await fakeRuntime(t, undefined, { claudeProxy: {
+    apply: async () => { if (fail) throw new Error('test Claude settings write failed'); },
+    restore: async () => { restored++; },
+  } });
+  await f.runtime.importNodes([node('a')]);
+  await f.runtime.stop();
+  restored = 0;
+  fail = true;
+  assert.equal(await f.runtime.start(), false);
+  assert.equal(restored, 1);
+  assert.equal((await f.runtime.report()).state, 'error');
+  fail = false;
+  assert.equal(await f.runtime.start(), true);
+});
+
+test('内核生命周期实际写入当前端口并恢复 Claude 配置', async t => {
+  const stateDir = await directory(t);
+  const configDir = path.join(stateDir, 'claude');
+  const file = path.join(configDir, 'settings.json');
+  const original = { env: { HTTP_PROXY: 'http://127.0.0.1:7890' }, model: 'custom' };
+  await mkdir(configDir);
+  await writeFile(file, JSON.stringify(original));
+  const f = await fakeRuntime(t, undefined, { claudeProxy: createClaudeProxySettings({ stateDir, configDir }) });
+  await f.runtime.importNodes([node('a')]);
+  const configured = JSON.parse(await readFile(file, 'utf8'));
+  assert.equal(configured.env.HTTP_PROXY, (await f.runtime.report()).localProxy);
+  assert.equal(configured.env.HTTPS_PROXY, configured.env.HTTP_PROXY);
+  assert.equal(configured.model, 'custom');
+  await f.runtime.stop();
+  assert.deepEqual(JSON.parse(await readFile(file, 'utf8')), original);
+});
+
+test('Claude 代理恢复失败时保留内核运行以便重试退出', async t => {
+  let fail = false;
+  const f = await fakeRuntime(t, undefined, { claudeProxy: {
+    apply: async () => {},
+    restore: async () => { if (fail) throw new Error('test Claude settings restore failed'); },
+  } });
+  await f.runtime.importNodes([node('a')]);
+  assert.equal(await f.runtime.start(), true);
+  fail = true;
+  await assert.rejects(f.runtime.stop(), /restore failed/);
+  assert.equal((await f.runtime.report()).state, 'running');
+  fail = false;
+  await f.runtime.stop();
+});
+
+test('启动时未启用内核也会恢复异常退出遗留的 Claude 代理', async t => {
+  const stateDir = await directory(t);
+  const configDir = path.join(stateDir, 'claude');
+  const file = path.join(configDir, 'settings.json');
+  const original = { env: { HTTP_PROXY: 'http://127.0.0.1:7890' } };
+  await mkdir(configDir);
+  await writeFile(file, JSON.stringify(original));
+  const claudeProxy = createClaudeProxySettings({ stateDir, configDir });
+  await claudeProxy.apply('http://127.0.0.1:39080');
+  const runtime = await createKernelRuntime({ stateDir, env: { CHECKCC_NET_CORE: '0' }, claudeProxy });
+  t.after(() => runtime.stop());
+  assert.equal(runtime.enabled, false);
+  assert.deepEqual(JSON.parse(await readFile(file, 'utf8')), original);
+});
+
+test('切换供应商后同名节点不复用旧供应商的测速缓存', async t => {
+  const measurements = { 'same-name': 1 };
+  const f = await fakeRuntime(t, undefined, { nodeDelays: measurements });
+  await f.runtime.importNodes([node('same-name')], { sourceName: 'A' });
+  const first = (await f.runtime.report()).activeId;
+  await f.runtime.collectDelays(['same-name'], { force: true });
+  assert.equal((await f.runtime.report()).delays['same-name'], 1);
+  const second = await f.runtime.importNodes([node('same-name')], { sourceName: 'B', activate: false });
+  assert.notEqual(first, second.sourceId);
+  measurements['same-name'] = 77;
+  await f.runtime.activateSource(second.sourceId);
+  assert.equal((await f.runtime.report()).delays['same-name'], 77);
+});
+
+test('供应商切换按订阅顺序跳过超时、未知和 Claude 不支持的实际出口', async t => {
+  const f = await fakeRuntime(t, undefined, {
+    nodeExits: { 'Japan-banned': 'HK', 'unknown': 'ZZ', 'Hong-Kong-name': 'TW', 'last': 'US' },
+    nodeDelays: { 'timeout': null, 'Hong-Kong-name': 250, 'last': 20 },
+  });
+  await f.runtime.importNodes([node('original')]);
+  const imported = await f.runtime.importNodes(['Japan-banned', 'timeout', 'unknown', 'Hong-Kong-name', 'last'].map(node), { sourceName: 'new', selected: 'last', activate: false });
+  await f.runtime.activateSource(imported.sourceId);
+  const report = await f.runtime.report();
+  assert.equal(report.selected, 'Hong-Kong-name');
+  assert.equal(report.regionLock.locked, false);
+  const saved = JSON.parse(await readFile(path.join(f.dir, 'net-nodes.json'), 'utf8'));
+  assert.equal(saved.selected, 'Hong-Kong-name');
+});
+
+test('供应商没有合格节点时恢复原供应商、节点和阻断状态', async t => {
+  const f = await fakeRuntime(t, undefined, { nodeExits: { banned: 'HK', failed: null }, nodeDelays: { timeout: null } });
+  await f.runtime.importNodes([node('original')]);
+  const imported = await f.runtime.importNodes(['banned', 'timeout', 'failed'].map(node), { sourceName: 'bad', activate: false });
+  const before = await f.runtime.report();
+  const saved = await readFile(path.join(f.dir, 'net-nodes.json'), 'utf8');
+  await assert.rejects(f.runtime.activateSource(imported.sourceId), /没有.*Claude.*节点/);
+  const after = await f.runtime.report();
+  assert.equal(after.activeId, before.activeId);
+  assert.equal(after.selected, 'original');
+  assert.equal(after.regionLock.locked, false);
+  assert.equal(await readFile(path.join(f.dir, 'net-nodes.json'), 'utf8'), saved);
+});
+
+test('首次导入并启用供应商同样选择第一个可用且地区受支持的节点', async t => {
+  const f = await fakeRuntime(t, undefined, { nodeExits: { first: 'HK', second: 'TW' } });
+  const imported = await f.runtime.importNodes(['first', 'second'].map(node));
+  assert.equal(imported.selected, 'second');
+  assert.equal((await f.runtime.report()).selected, 'second');
+});
+
+test('删除当前供应商后接替的供应商也过滤 Claude 不支持地区', async t => {
+  const f = await fakeRuntime(t, undefined, { nodeExits: { first: 'HK', second: 'TW' } });
+  await f.runtime.importNodes([node('original')]);
+  const original = (await f.runtime.report()).activeId;
+  await f.runtime.importNodes(['first', 'second'].map(node), { sourceName: 'backup', activate: false });
+  await f.runtime.deleteSource(original);
+  const report = await f.runtime.report();
+  assert.equal(report.selected, 'second');
+  assert.equal(report.sources.length, 1);
+});
+
+test('供应商筛选失败回滚后仍保持原来的未保护阻断', async t => {
+  const f = await fakeRuntime(t, undefined, { host: true, nodeExits: { banned: 'HK' } });
+  await f.runtime.importNodes([node('original')]);
+  await f.runtime.setTunnel(true);
+  await f.runtime.setUnprotectedGuard(true);
+  const imported = await f.runtime.importNodes([node('banned')], { sourceName: 'bad', activate: false });
+  await assert.rejects(f.runtime.activateSource(imported.sourceId), /没有.*Claude.*节点/);
+  assert.equal((await f.runtime.report()).unprotectedGuard.active, true);
+  const config = yaml(await readFile(path.join(f.dir, 'net-core/config.yaml'), 'utf8'));
+  assert.ok(config.rules.includes('DOMAIN-SUFFIX,claude.ai,REJECT'));
+});
+
+test('IPv6 支持时启用双栈，换到未确认节点时关闭系统 IPv6，停止时恢复', async t => {
+  const f = await fakeRuntime(t, undefined, { ipv6Supported: true });
+  await f.runtime.importNodes([node('a'), node('b')]);
+  await f.runtime.setTunnel(true);
+  let config = yaml(await readFile(path.join(f.dir, 'net-core/config.yaml'), 'utf8'));
+  assert.equal(config.ipv6, true);
+  assert.equal(f.ipv6Disabled(), false);
+  assert.equal((await f.runtime.report()).ipv6.protected, true);
+  f.setIpv6Supported(false);
+  await f.runtime.select('b');
+  config = yaml(await readFile(path.join(f.dir, 'net-core/config.yaml'), 'utf8'));
+  assert.equal(config.ipv6, false);
+  assert.equal(f.ipv6Disabled(), true);
+  const report = await f.runtime.report();
+  assert.equal(report.ipv6.supported, null);
+  assert.equal(report.ipv6.system, 'disabled');
+  assert.equal(report.ipv6.protected, false);
+  await f.runtime.stop();
+  assert.equal(f.ipv6Disabled(), false);
+});
+
+test('IPv6 恢复失败明确报错，内核已停止后仍可重试恢复', async t => {
+  const f = await fakeRuntime(t);
+  await f.runtime.importNodes([node('a')]);
+  await f.runtime.setTunnel(true);
+  f.failIpv6Restore(true);
+  await assert.rejects(f.runtime.stop(), /IPv6 restore failed/);
+  assert.equal(f.ipv6Disabled(), true);
+  f.failIpv6Restore(false);
+  await f.runtime.stop();
+  assert.equal(f.ipv6Disabled(), false);
+});
+
+test('关闭 IPv6 抛错或未确认时拒绝启用保护并保留原隧道状态', async t => {
+  const f = await fakeRuntime(t);
+  await f.runtime.importNodes([node('a')]);
+  for (const failure of ['throw', 'reason']) {
+    f.failIpv6Disable(failure);
+    await assert.rejects(f.runtime.setTunnel(true), /IPv6 disable/);
+    assert.equal((await f.runtime.report()).tunEnabled, false);
+    const config = yaml(await readFile(path.join(f.dir, 'net-core/config.yaml'), 'utf8'));
+    assert.equal(config.tun.enable, false);
+  }
+});
+
+test('换节点的 IPv6 热加载失败时恢复原选择、配置和保护状态', async t => {
+  const f = await fakeRuntime(t, undefined, { ipv6Supported: true });
+  await f.runtime.importNodes([node('a'), node('b')]);
+  await f.runtime.setTunnel(true);
+  f.failReload();
+  await assert.rejects(f.runtime.select('b'), /injected reload failure/);
+  const report = await f.runtime.report();
+  assert.equal(report.selected, 'a');
+  assert.equal(report.ipv6.protected, true);
+  const config = yaml(await readFile(path.join(f.dir, 'net-core/config.yaml'), 'utf8'));
+  assert.equal(config['proxy-groups'][0].proxies[0], 'a');
+  assert.equal(config.ipv6, true);
+});
 
 test("已有代理启用 TUN 前先交接，冲突时保留原代理配置与未接管状态", async t => {
   let called = 0;
@@ -273,6 +533,19 @@ test("代理范围重载后隧道失效不能返回切换成功", async t => {
   assert.equal(report.mode, "rule");
   assert.equal(report.state, "error");
   assert.equal(f.runtime.connectionState().tunCaptured, null);
+});
+
+test("网络异常默认只阻断 Claude；严格断流需显式开启并落盘", async t => {
+  const f = await fakeRuntime(t);
+  await f.runtime.importNodes([node("a")]);
+  assert.equal((await f.runtime.report()).networkFailurePolicy, "claude", "默认只阻断 Claude，不封全部网络");
+  await f.runtime.setNetworkFailurePolicy("all");
+  assert.equal((await f.runtime.report()).networkFailurePolicy, "all");
+  await assert.rejects(f.runtime.setNetworkFailurePolicy("everything"), /claude 或 all/);
+  const saved = JSON.parse(await readFile(path.join(f.dir, "net-core-guard-policy.json"), "utf8"));
+  assert.equal(saved.networkFailure, "all", "选择必须落盘，重启后保持");
+  await f.runtime.setNetworkFailurePolicy("claude");
+  assert.equal((await f.runtime.report()).networkFailurePolicy, "claude");
 });
 
 test("未保护阻断保持系统接管并拒绝 Claude 域名", async t => {

@@ -1,9 +1,9 @@
 "use client";
 // 网络页展示出口证据和常用操作；低频配置统一由设置弹窗管理。
-import { useId, useState, type Ref } from "react";
+import { useId, useRef, useState, type Ref } from "react";
 import type { LocaleCode } from "@/i18n/messages";
 import type { ExitHistory, NetCoreExit, NetCoreReport } from "@/detection/gateway-check";
-import { netCoreView, visibleViolations } from "@/detection/net-core-view.mjs";
+import { netCoreView, nodeLatencyTone, nodeSelectionState, visibleViolations } from "@/detection/net-core-view.mjs";
 import { claudeRegionSupport } from "@/detection/claude-regions.mjs";
 import { describeExit } from "@/detection/exit-quality.mjs";
 import { countryDisplayName } from "@/detection/exit-geo";
@@ -68,16 +68,43 @@ export function NetCorePanel({
 }: Props) {
   const zh = locale.startsWith("zh");
   const text = (cn: string, en: string) => zh ? cn : en;
+  const ipv6 = report?.state === 'running' && report.tunEnabled ? report.ipv6 : null;
+  const ipv6Message = !ipv6 ? '' : ipv6.protected
+    ? text('当前节点支持 IPv6，IPv4 与 IPv6 均通过保护隧道。', 'This node supports IPv6. IPv4 and IPv6 both use the protected tunnel.')
+    : ipv6.system === 'disabled'
+      ? text(`${ipv6.supported === false ? '当前节点不支持 IPv6' : ipv6.supported === true ? '当前节点支持 IPv6，双栈保护尚未启用' : '当前节点 IPv6 能力未确认'}，已关闭系统 IPv6，Claude 使用 IPv4 保护隧道；停止保护后恢复原设置。`, `${ipv6.supported === false ? 'This node does not support IPv6' : ipv6.supported === true ? 'This node supports IPv6, but dual-stack protection is not active' : 'IPv6 support is unconfirmed'}. System IPv6 is disabled and Claude uses the protected IPv4 tunnel. Original settings are restored when protection stops.`)
+      : text('IPv6 保护及系统关闭状态未确认，可能绕过保护隧道。请重新应用修复，或在系统网络设置中关闭 IPv6。', 'IPv6 protection and system shutdown are unconfirmed. IPv6 may bypass the tunnel. Reapply protection or disable IPv6 in system network settings.');
+  const ipv6Issue = Boolean(ipv6 && !ipv6.protected && ipv6.system !== 'disabled');
   const view = netCoreView(report, { locale, exitHistory });
   const { items: violations, hidden } = visibleViolations(view, 20);
   // 代理范围会影响新连接的路由；确认后热加载，已有连接可能沿用原路径。
   const [pendingMode, setPendingMode] = useState<Mode | null>(null);
+  const [pendingNode, setPendingNode] = useState<{ name: string; from: string | null; sourceId: string | null } | null>(null);
+  const nodeTrigger = useRef<HTMLButtonElement | null>(null);
   const measureHelpId = useId();
   const exitHelpId = useId();
   const strict = report?.strictMode === true || report?.guard?.armed === true;
 
   const selectedName = view.nodes.find((node) => node.selected)?.name ?? view.selected ?? null;
   const selectedDelay = selectedName ? delays[selectedName] : undefined;
+  const nodeState = nodeSelectionState({ nodes: view.nodes.map(node => node.name), selected: selectedName, delays, exits });
+  const { recovery } = nodeState;
+  const currentNode = nodeState.nodes.find(node => node.name === selectedName);
+  const pendingChoice = pendingNode?.from === selectedName && pendingNode?.sourceId === (report?.activeId ?? null)
+    ? nodeState.nodes.find(node => node.name === pendingNode?.name && node.name !== selectedName)
+    : null;
+  const selectNode = (name: string, trigger: HTMLButtonElement) => {
+    if (busy || strict || !view.actions.canSelect || name === selectedName) return;
+    const target = nodeState.nodes.find(node => node.name === name);
+    if (!target) return;
+    if (target.switchTone === "danger") {
+      nodeTrigger.current = trigger;
+      setPendingNode({ name, from: selectedName, sourceId: report?.activeId ?? null });
+      return;
+    }
+    setPendingNode(null);
+    onSelectNode(name);
+  };
   const selectedExit = selectedName ? exits[selectedName] : null;
   const exitSupport = claudeRegionSupport(selectedExit?.countryCode);
   const exitIp = selectedExit?.ip ?? exitHistory?.current ?? null;
@@ -97,11 +124,12 @@ export function NetCorePanel({
         <p className="netcore-facts">
           {exitIp && <span><b>{text("出口 IP", "Exit IP")}</b>{exitIp}</span>}
           {selectedName && <span><b>{text("节点", "Node")}</b>{selectedName}</span>}
-          {typeof selectedDelay === "number" && <span><b>{text("延迟", "Latency")}</b>{selectedDelay} ms</span>}
+          {selectedDelay !== undefined && <span><b>{text("延迟", "Latency")}</b><span className="netcore-node__latency" data-tone={nodeLatencyTone(selectedDelay)}>{selectedDelay === null ? text("超时", "Timeout") : `${selectedDelay} ms`}</span></span>}
           {region && <span><b>{text("地区", "Region")}</b>{region}</span>}
           {selectedExit?.hosting && <span><b>{text("出口类型", "Exit type")}</b>{text("云机房/托管", "Cloud/hosting")}</span>}
           {view.sampledAt && <span className="netcore-muted">{text(`采样 ${relative(view.sampledAt, true)} · 自动刷新`, `Sampled ${relative(view.sampledAt, false)} · auto refresh`)}</span>}
         </p>
+        {ipv6Message && <p className="netcore-ipv6" data-tone={ipv6Issue ? 'danger' : 'muted'} role={ipv6Issue ? 'alert' : undefined}>{ipv6Message}</p>}
         {selectedExit?.hosting && <p className="netcore-alert" role="alert">
           {text(
             `出口是云机房/托管 IP（${describeExit(selectedExit)}），Claude 可能拒绝登录；建议使用住宅/原生 IP 节点。`,
@@ -181,6 +209,29 @@ export function NetCorePanel({
             `这 ${report.ingress.total} 个节点共用同一入口（${report.ingress.groups[0]?.server ?? ""}）：入口故障会全部中断，切换节点只是换端口，不产生冗余。`,
             `These ${report.ingress.total} nodes share one ingress (${report.ingress.groups[0]?.server ?? ""}): if it fails all nodes fail; switching nodes only changes the port.`,
           )}</p>}
+          {recovery && <div className="netcore-recovery" data-tone={recovery.tone} role="status">
+            <p>{recovery.sameRegion.length
+              ? text(`当前节点超时，同地区有 ${recovery.sameRegion.length} 个可用备用节点，请手动选择切换。`, `The current node timed out. ${recovery.sameRegion.length} same-region alternatives are available. Select one to switch.`)
+              : recovery.otherRegions.length
+                ? text("当前节点超时，暂未测得同地区可用备用节点。跨地区切换需要确认。", "The current node timed out. No same-region alternative is measured as available. Switching regions requires confirmation.")
+                : text("当前节点超时，暂未测得可用备用节点。可重新测速或选择节点重试。", "The current node timed out. No alternative is measured as available. Measure again or select a node to retry.")}</p>
+            {(currentNode?.inferred || [...recovery.sameRegion, ...recovery.otherRegions].some(node => node.inferred)) && <p>{text("部分地区根据节点名称推断，切换后请复检实际出口。", "Some regions are inferred from node names. Recheck the actual exit after switching.")}</p>}
+            {strict && <p>{text("严格模式已固定出口，请先在网络设置中关闭严格模式再切换。", "Strict mode pins the exit. Turn it off in network settings before switching.")}</p>}
+            <div className="netcore-confirm__actions">
+              {(recovery.sameRegion.length ? recovery.sameRegion : recovery.otherRegions).slice(0, 3).map(node => <button key={node.name} type="button" className="repair-button repair-button--quiet" disabled={busy || strict || !view.actions.canSelect} onClick={event => selectNode(node.name, event.currentTarget)}>{text(`切换到 ${node.name}`, `Switch to ${node.name}`)}</button>)}
+              <button type="button" className="repair-button repair-button--quiet" disabled={busy || measuring || !view.actions.canSelect} onClick={onMeasure}>{text("重新测速", "Measure again")}</button>
+            </div>
+          </div>}
+          {pendingChoice && <div className="netcore-confirm" data-tone="danger" role="alert">
+            <span>{pendingChoice.countryCode && currentNode?.countryCode
+              ? text(`将从 ${countryDisplayName(currentNode.countryCode, locale)} 切换到 ${countryDisplayName(pendingChoice.countryCode, locale)} 的「${pendingChoice.name}」，出口地区和 IP 可能变化。确认切换？`, `Switch from ${countryDisplayName(currentNode.countryCode, locale)} to "${pendingChoice.name}" in ${countryDisplayName(pendingChoice.countryCode, locale)}? The exit region and IP may change.`)
+              : text(`「${pendingChoice.name}」的切换地区尚未确认，出口地区和 IP 可能变化。确认切换？`, `The region for switching to "${pendingChoice.name}" is unconfirmed. The exit region and IP may change. Switch?`)}</span>
+            {(pendingChoice.inferred || currentNode?.inferred) && <span>{text("地区包含按节点名称推断的信息，切换后请复检。", "Region information includes node-name inference. Recheck after switching.")}</span>}
+            <div className="netcore-confirm__actions">
+              <button type="button" className="repair-button repair-button--quiet" autoFocus onClick={() => { setPendingNode(null); nodeTrigger.current?.focus(); }}>{text("取消", "Cancel")}</button>
+              <button type="button" className="repair-button" disabled={busy || strict || !view.actions.canSelect} onClick={() => { setPendingNode(null); onSelectNode(pendingChoice.name); }}>{text("确认切换", "Switch")}</button>
+            </div>
+          </div>}
           <ul className="netcore-nodes">
             {view.nodes.map((node) => {
               const probe = exits[node.name] ?? null;
@@ -188,7 +239,7 @@ export function NetCorePanel({
               const measuredRegion = probe?.countryCode ? countryDisplayName(probe.countryCode, locale) : probe?.country;
               const delayText = delays[node.name] === undefined ? "" : delays[node.name] === null ? text("超时", "Timeout") : `${delays[node.name]} ms`;
               return <li key={node.name}>
-                <button type="button" className="netcore-node" aria-pressed={node.selected} disabled={busy || !view.actions.canSelect} onClick={() => onSelectNode(node.name)}>
+                <button type="button" className="netcore-node" aria-pressed={node.selected} disabled={busy || strict || !view.actions.canSelect} onClick={event => selectNode(node.name, event.currentTarget)}>
                   <span className="netcore-node__head">
                     <span className="netcore-node__name">{node.name}</span>
                     {node.selected && <span className="netcore-node__badge">{text("当前", "Active")}</span>}
@@ -196,7 +247,7 @@ export function NetCorePanel({
                   </span>
                   <span className="netcore-node__state">
                     {/* 延迟：未测到就留空（定时测速在后台跑，不显示「测速中」），结果回来直接覆盖；失败是死节点（超时/不可达），不能画成 0ms。 */}
-                    {delayText}
+                    <span className="netcore-node__latency" data-tone={nodeLatencyTone(delays[node.name])}>{delayText}</span>
                     {!exitsAt && nodeRegion && <>{delayText ? " · " : ""}{nodeRegion}</>}
                     {!exitsAt && probe?.ip && <>{(delayText || nodeRegion) ? " · " : ""}{probe.ip}</>}
                   </span>

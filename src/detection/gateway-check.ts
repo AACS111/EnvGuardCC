@@ -74,7 +74,13 @@ export type NetCoreReport = {
   /** 节点 IPv6 能力探测：supported=false 时应用会关闭系统 IPv6，避免绕过 IPv4 TUN。 */
   ipv6?: { supported: boolean | null; ip?: string | null; node: string | null; checkedAt: string | null; reason: string | null; protected?: boolean; system?: string } | null;
   /** 区域锁定：固定出口在 Claude 不支持地区时，内核直接 REJECT Claude 域名。 */
-  regionLock?: { locked: boolean; type?: "region" | "network"; reason?: string | null; countryCode?: string | null; ip?: string | null; at?: string } | null;
+  regionLock?: {
+    locked: boolean; type?: "region" | "network"; reason?: string | null; countryCode?: string | null; ip?: string | null; at?: string;
+    /** 网络锁：自动复检，连续验证通过后自行解除；地区锁为 false/缺省，必须人工解除。 */
+    autoRecover?: boolean; recovered?: number; recheckAttempts?: number; recheckAt?: string | null;
+    /** 最近一次自动复检看到的出口（仅网络锁期间）。 */
+    recheckProbe?: { ip?: string | null; countryCode?: string | null } | null;
+  } | null;
   /** 未保护阻断：保护关闭时仍保持 TUN 接管并拒绝 Claude 域名。 */
   unprotectedGuard?: { active: boolean; at?: string | null; reason?: string | null } | null;
   claudeBlocked?: boolean;
@@ -90,6 +96,8 @@ export type NetCoreReport = {
   source?: { mode: "url" | "content" | "manual"; url?: string; updatedAt?: string; intervalHours?: number } | null;
   localProxy?: string | null;
   mode?: "rule" | "global" | "direct";
+  /** 网络异常时的处置：claude=只阻断 Claude（默认）；all=严格断流，封全部非节点流量。 */
+  networkFailurePolicy?: "claude" | "all";
   elevation?: { elevated: boolean; platform: string; instruction: string };
 };
 
@@ -467,7 +475,7 @@ export async function controlNetCore(action: NetCoreAction, node?: string, optio
     method: "POST",
     headers: { "X-CheckCC-Client": "gateway-ui", "Content-Type": "application/json" },
     body: JSON.stringify({ action, ...(node ? { node } : {}), ...(["tunnel", "strict"].includes(action) ? { enabled: options.enabled !== false } : {}) }),
-    cache: "no-store", signal: AbortSignal.timeout(["strict", "tunnel", "start", "restart"].includes(action) ? 120000 : 30000),
+    cache: "no-store", signal: AbortSignal.timeout(["strict", "tunnel", "start", "restart", "select"].includes(action) ? 180000 : 30000),
   });
   const value = await response.json().catch(() => null);
   if (!response.ok) throw new Error(value?.error ?? `HTTP ${response.status}`);
@@ -552,7 +560,7 @@ export async function netCoreSourceAction(action: NetCoreSourceAction, id: strin
     method: "POST",
     headers: { "X-CheckCC-Client": "gateway-ui", "Content-Type": "application/json" },
     body: JSON.stringify({ action, id, name }),
-    cache: "no-store", signal: AbortSignal.timeout(65000),
+    cache: "no-store", signal: AbortSignal.timeout(180000),
   });
   const value = await response.json().catch(() => null);
   if (!response.ok) return { ok: false, reason: value?.reason ?? value?.error ?? `HTTP ${response.status}`, netCore: value?.netCore ?? null };
@@ -596,6 +604,21 @@ export async function setNetCoreMode(mode: NetCoreEgressMode): Promise<{ ok: boo
     method: "POST",
     headers: { "X-CheckCC-Client": "gateway-ui", "Content-Type": "application/json" },
     body: JSON.stringify({ mode }),
+    cache: "no-store", signal: AbortSignal.timeout(60000),
+  });
+  const value = await response.json().catch(() => null);
+  if (!response.ok) return { ok: false, reason: value?.reason ?? value?.error ?? `HTTP ${response.status}`, netCore: value?.netCore ?? null };
+  return value;
+}
+
+// 网络异常时的处置：claude（默认）只阻断 Claude 域名，其他流量照常；all 才启用严格断流。
+export type NetCoreNetworkFailure = "claude" | "all";
+
+export async function setNetCoreNetworkFailure(policy: NetCoreNetworkFailure): Promise<{ ok: boolean; reason?: string; networkFailure?: NetCoreNetworkFailure; netCore?: NetCoreReport | null }> {
+  const response = await fetch(`${gatewayUrl}/__checkcc/net-core/network-failure`, {
+    method: "POST",
+    headers: { "X-CheckCC-Client": "gateway-ui", "Content-Type": "application/json" },
+    body: JSON.stringify({ policy }),
     cache: "no-store", signal: AbortSignal.timeout(60000),
   });
   const value = await response.json().catch(() => null);

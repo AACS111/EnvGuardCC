@@ -11,11 +11,12 @@ export type NetCoreSettingsProps = {
   tunnelLocked: boolean; networkState?: NetCoreNetworkState | null;
   onStart: () => void; onStop?: () => void; onRestart: () => void;
   onTunnelChange?: (enabled: boolean) => void; onStrictChange?: (enabled: boolean) => void;
+  onNetworkFailureChange?: (policy: "claude" | "all") => void;
   onManageSources: () => void; onAddSource?: () => void; onOpenNetworkConfig: () => void; onAuthorizeHost?: () => void;
 };
 const clock = (value: string | null) => value ? new Date(value).toLocaleTimeString([], { hour12: false }) : '—';
 
-export function NetCoreSettings({ locale, report, busy, error, tunnelLocked, networkState, onStart, onStop, onRestart, onTunnelChange, onStrictChange, onManageSources, onAddSource, onOpenNetworkConfig, onAuthorizeHost, advanced = false }: NetCoreSettingsProps & { advanced?: boolean }) {
+export function NetCoreSettings({ locale, report, busy, error, tunnelLocked, networkState, onStart, onStop, onRestart, onTunnelChange, onStrictChange, onNetworkFailureChange, onManageSources, onAddSource, onOpenNetworkConfig, onAuthorizeHost, advanced = false }: NetCoreSettingsProps & { advanced?: boolean }) {
   const zh = locale.startsWith('zh');
   const text = (cn: string, en: string) => zh ? cn : en;
   const view = netCoreView(report, { locale });
@@ -80,6 +81,17 @@ export function NetCoreSettings({ locale, report, busy, error, tunnelLocked, net
         {report?.capabilities?.systemKillSwitch === false && !strict && <p className="netcore-detail" role="note">{text("尚未开启系统断流阻断：内核异常退出后可能恢复直连。", "System kill switch is off: traffic may go direct after a kernel failure.")}</p>}
       </section>}
 
+      {onNetworkFailureChange && <section className="netcore-block" aria-label={text("网络异常时的处置", "Behavior on network failure")}>
+        <div className="netcore-block__head">
+          <h3>{text("网络异常时", "On network failure")}</h3>
+          <div className="netcore-modes" role="group" aria-label={text("网络异常时的处置", "Behavior on network failure")}>
+            <button type="button" className="netcore-mode" aria-pressed={(report?.networkFailurePolicy ?? 'claude') === 'claude'} disabled={busy} onClick={() => onNetworkFailureChange('claude')}>{text("仅阻断 Claude", "Claude only")}</button>
+            <button type="button" className="netcore-mode" aria-pressed={report?.networkFailurePolicy === 'all'} disabled={busy} onClick={() => onNetworkFailureChange('all')}>{text("阻断全部网络", "Block all")}</button>
+          </div>
+        </div>
+        <p className="netcore-detail">{text("默认只拒绝 Claude 域名，直连与其他代理出口不受影响；断开后 3 分钟内每 5 秒自动复检，一恢复就立即解除。选择「阻断全部网络」才使用严格断流封禁其他流量。", "By default only Claude domains are rejected; direct and other proxy traffic keeps working. After a drop it re-probes every 5 seconds for 3 minutes and unlocks as soon as the network returns. Choose \"Block all\" to engage the strict kill switch.")}</p>
+      </section>}
+
       {onStrictChange && <section className="netcore-block" aria-label={text("严格连接保护", "Strict connection protection")}>
         <div className="netcore-block__head">
           <h3>{text("严格连接保护", "Strict connection protection")}</h3>
@@ -90,7 +102,7 @@ export function NetCoreSettings({ locale, report, busy, error, tunnelLocked, net
           </button>
         </div>
         <p className="netcore-detail">{text('将全部出站流量固定到一个节点，阻断其他网络路径。仅支持兼容的 macOS 防火墙环境。', 'Pin all outbound traffic to one node and block other paths. Requires a compatible macOS firewall environment.')}</p>
-        <p className="netcore-detail">{text('使用效果：其他直连与普通内网连接将被阻断；出口变化后会暂停连接，关闭严格模式可恢复联网。', 'Effect: other direct and ordinary LAN connections are blocked. An exit change pauses connections; disabling strict mode restores networking.')}</p>
+        <p className="netcore-detail">{text('使用效果：其他直连与普通内网连接将被阻断。出口异常时按上方「网络异常时」设置处理，默认只阻断 Claude。', 'Effect: other direct and ordinary LAN connections are blocked. Exit failures follow the "On network failure" setting above; the default only blocks Claude.')}</p>
         {strict && <p className="netcore-detail" role="status">{report?.guard?.phase === 'active' && report.capabilities?.strictTravel ? text('系统阻断与隧道已核验。', 'System filter and tunnel verified.') : text('严格模式正在阻断或尚未验证；请复检，或关闭严格模式恢复联网。', 'Strict mode is blocking or unverified; recheck, or disable strict mode to restore networking.')}</p>}
         {strict && <p className="netcore-detail">{text("退出应用或异常崩溃后仍保留阻断。也可在终端运行 sudo /Library/PrivilegedHelperTools/com.envguardcc.kernel-recover 恢复联网。", "Blocking remains after quitting or crashing. To recover from Terminal, run sudo /Library/PrivilegedHelperTools/com.envguardcc.kernel-recover.")}</p>}
         {confirmStrict && !strict && <div className="netcore-confirm" role="alert">

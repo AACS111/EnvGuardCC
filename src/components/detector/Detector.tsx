@@ -1,5 +1,6 @@
 "use client";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { nodeMeasurementScope } from "@/detection/net-core-view.mjs";
 import { ProtectionWorkspace, type Baseline } from "./ProtectionWorkspace";
 import { useProtection } from "./useProtection";
 import { measurementStatus, measurementPoints } from "@/detection/measurement-status";
@@ -13,7 +14,7 @@ import { signalPolicy, signalTestKind } from "@/detection/signal-policy";
 import { activeRuntimePolicy, synchronizeBrowserCloak, watchBrowserCloak, type BrowserCloakExecution } from "@/detection/environment-runtime";
 import { installRuntimePolicy, restoreRuntimePolicy } from "@/detection/runtime-policy.mjs";
 import { protectionRequest } from "@/detection/protection";
-import { buildGatewayCheck, readNetCore, readNetCoreNetwork, controlNetCore, importNetCore, netCoreSourceAction, measureNetCoreDelay, setNetCoreMode, installKernelHost, type NetCoreReport, type NetCoreExit, type NetCoreNetworkState, type NetCoreAction, type NetCoreImportPayload, type NetCoreSourceAction, type ExitHistory } from "@/detection/gateway-check";
+import { buildGatewayCheck, readNetCore, readNetCoreNetwork, controlNetCore, importNetCore, netCoreSourceAction, measureNetCoreDelay, setNetCoreMode, setNetCoreNetworkFailure, installKernelHost, type NetCoreReport, type NetCoreExit, type NetCoreNetworkState, type NetCoreAction, type NetCoreImportPayload, type NetCoreSourceAction, type ExitHistory } from "@/detection/gateway-check";
 import { SourcesDialog } from "./SourcesDialog";
 import { NetworkExemptDialog } from "./NetworkExemptDialog";
 import { BrowserPickerDialog } from "./BrowserPickerDialog";
@@ -53,14 +54,19 @@ export function Detector({ locale = "zh" }: { locale?: LocaleCode }) {
   const [manageSourcesOpen, setManageSourcesOpen] = useState(false);
   const [manageSourcesView, setManageSourcesView] = useState<"list" | "add">("list");
   // 逐节点实测出口：显式触发，避免自动轮询造成出口 IP 抖动。
-  const [netCoreExits, setNetCoreExits] = useState<Record<string, NetCoreExit | null>>({});
-  const [netCoreExitsAt, setNetCoreExitsAt] = useState<string | null>(null);
+  const [netCoreExitSample, setNetCoreExitSample] = useState<{ scope: string; exits: Record<string, NetCoreExit | null>; at: string } | null>(null);
   const [netCoreExiting, setNetCoreExiting] = useState(false);
   const [networkExemptOpen, setNetworkExemptOpen] = useState(false);
   const [netCoreNetwork, setNetCoreNetwork] = useState<NetCoreNetworkState | null>(null);
   const [exitHistory, setExitHistory] = useState<ExitHistory | null>(null);
-  const [netCoreDelays, setNetCoreDelays] = useState<Record<string, number | null>>({});
+  const [netCoreDelaySample, setNetCoreDelaySample] = useState<{ scope: string; delays: Record<string, number | null> } | null>(null);
   const [netCoreMeasuring, setNetCoreMeasuring] = useState(false);
+  const sourceScope = nodeMeasurementScope(netCore);
+  const latestSourceScope = useRef(sourceScope);
+  useEffect(() => { latestSourceScope.current = sourceScope; }, [sourceScope]);
+  const netCoreExits = netCoreExitSample?.scope === sourceScope ? netCoreExitSample.exits : {};
+  const netCoreExitsAt = netCoreExitSample?.scope === sourceScope ? netCoreExitSample.at : null;
+  const netCoreDelays = netCoreDelaySample?.scope === sourceScope ? netCoreDelaySample.delays : (netCore?.delays ?? {});
   const [checkError, setCheckError] = useState("");
   // 浏览器迷惑层报告：未接入就是 null，界面把它显示成「未验证」而不是通过。
   const [browserCloak, setBrowserCloak] = useState<BrowserCloakExecution | null>(null);
@@ -100,48 +106,55 @@ export function Detector({ locale = "zh" }: { locale?: LocaleCode }) {
   }, [locale]);
   // 内核状态只读轮询：失败保留真实错误，不静默回退为“未启用”。
   const refreshNetCore = useCallback(async () => {
+    const requestScope = latestSourceScope.current;
     try {
       const value = await readNetCore();
+      if (latestSourceScope.current !== requestScope) return;
+      latestSourceScope.current = nodeMeasurementScope(value.netCore);
       setNetCore(value.netCore);
       setExitHistory(value.exitHistory);
       // 延迟随状态下发：检测时自动填上，用户不需要先点「测速」。
       const measured = value.netCore?.delays;
-      if (measured) setNetCoreDelays(measured);
+      if (measured) setNetCoreDelaySample({ scope: nodeMeasurementScope(value.netCore), delays: measured });
       setNetCoreError("");
     }
     catch (error) {
+      if (latestSourceScope.current !== requestScope) return;
       const reason = error instanceof Error ? error.message : String(error);
       setNetCoreError(reason);
       setNetCore(previous => previous ? { ...previous, state: "unavailable", reason, tunCaptured: null, routing: undefined } : null);
     }
   }, []);
   const measureNetCore = useCallback(async (options: { silent?: boolean } = {}) => {
+    const requestScope = nodeMeasurementScope(netCore);
     const names = (netCore?.nodes ?? []).filter((name): name is string => typeof name === "string");
     if (!names.length) return;
     // 自动/定时测速静默执行：界面不切「测速中」，旧结果继续显示，新结果回来直接覆盖。
     if (!options.silent) setNetCoreMeasuring(true);
     try {
       const result = await measureNetCoreDelay(names, { force: true });
-      if (result.delays) setNetCoreDelays(result.delays);
+      if (latestSourceScope.current !== requestScope || (result.netCore && nodeMeasurementScope(result.netCore) !== requestScope)) return;
+      if (result.delays) setNetCoreDelaySample({ scope: requestScope, delays: result.delays });
       if (result.netCore) setNetCore(result.netCore);
       if (!result.ok) setNetCoreError(result.reason ?? "测速失败。");
-    } catch (error) { setNetCoreError(error instanceof Error ? error.message : String(error)); }
+    } catch (error) { if (latestSourceScope.current === requestScope) setNetCoreError(error instanceof Error ? error.message : String(error)); }
     finally { if (!options.silent) setNetCoreMeasuring(false); }
   }, [netCore]);
   const probeExits = useCallback(async () => {
+    const requestScope = nodeMeasurementScope(netCore);
     const names = (netCore?.nodes ?? []).filter((name): name is string => typeof name === "string");
     if (!names.length) return;
     setNetCoreExiting(true);
     setNetCoreError("");
     try {
       const result = await probeNodeExits(names);
-      setNetCoreExits(result.exits ?? {});
-      setNetCoreExitsAt(new Date().toISOString());
+      if (latestSourceScope.current !== requestScope || (result.netCore && nodeMeasurementScope(result.netCore) !== requestScope)) return;
+      setNetCoreExitSample({ scope: requestScope, exits: result.exits ?? {}, at: new Date().toISOString() });
       if (result.netCore) setNetCore(result.netCore);
       if (!result.ok) setNetCoreError(result.reason ?? (zh ? "出口检测失败。" : "Exit probe failed."));
     } catch (error) {
-      setNetCoreExits({});
-      setNetCoreExitsAt(new Date().toISOString());
+      if (latestSourceScope.current !== requestScope) return;
+      setNetCoreExitSample({ scope: requestScope, exits: {}, at: new Date().toISOString() });
       setNetCoreError(error instanceof Error ? error.message : String(error));
     }
     finally { setNetCoreExiting(false); }
@@ -159,8 +172,8 @@ export function Detector({ locale = "zh" }: { locale?: LocaleCode }) {
     }
     finally { setNetCoreBusy(false); }
   }, [zh]);
-  // TUN 需要 root：这两类原因都意味着「授权安装特权助手」能解决。
-  const hostPermissionError = (reason: string | null | undefined) => /TUN 需要更高权限|隧道未接管|严格模式需要/.test(reason ?? "");
+  // 需要系统授权的原因：一次性安装/更新特权助手都能解决，取消授权后要能直接重试。
+  const hostPermissionError = (reason: string | null | undefined) => /TUN 需要更高权限|隧道未接管|严格模式需要|需要管理员权限|特权助手|授权已取消/.test(reason ?? "");
   const authorizeHost = useCallback(async () => {
     if (hostBusy) return;
     const purpose = hostAuth?.purpose ?? "proxy";
@@ -467,9 +480,9 @@ export function Detector({ locale = "zh" }: { locale?: LocaleCode }) {
   };
   useEffect(() => watchBrowserCloak((report) => setBrowserCloak(report)), []);
   return <>
-    <ProtectionWorkspace error={checkError || protection.error} locale={locale} report={protection.report} connected={protection.connected} powerAction={powerAction} checking={manualChecking} busy={cloakBusy || transitioning} scores={scores} geo={exitGeo} target={target} baseline={baseline} browser={browserSignals} claude={claudeSignals} signals={allSignals} filter={filter} search={search} onFilter={setFilter} onSearch={setSearch} onToggle={() => void toggleProtection()} onStop={() => void toggleProtection(true)} onMonitor={(enabled, intervalMs) => { void protection.act("monitor", { enabled, intervalMs }).catch(() => {}); }} onRefresh={() => void recheck()} onRepair={() => { void protection.act("resume").catch(() => {}); }} onSelect={setDetailSignalId} netCore={netCore} netCoreBusy={netCoreBusy} netCoreError={netCoreError} onNetCoreRefresh={() => void refreshNetCore()} onNetCoreStrict={(enabled) => { void netCoreAction("strict", undefined, { enabled }).then(result => { if (!result.ok && hostPermissionError(result.reason) && netCore?.elevation?.platform === "darwin") setHostAuth({ error: "", purpose: "strict" }); }); }} onNetCoreTunnel={(enabled) => { void netCoreAction("tunnel", undefined, { enabled }).then(result => { if (!result.ok && hostPermissionError(result.reason) && ["darwin", "win32"].includes(netCore?.elevation?.platform ?? "")) setHostAuth({ error: "" }); }); }} onNetCoreStart={() => void netCoreAction("start")} onNetCoreStop={() => void netCoreAction("stop")} onNetCoreRestart={() => void netCoreAction("restart")} onNetCoreAuthorizeHost={() => setHostAuth({ error: "" })} onNetCoreSelect={(name) => void netCoreAction("select", name)} onNetCoreManageSources={() => { setManageSourcesView("list"); setManageSourcesOpen(true); }} onNetCoreAddSource={() => { setManageSourcesView("add"); setManageSourcesOpen(true); }} onNetCoreOpenNetworkConfig={() => setNetworkExemptOpen(true)} netCoreNetwork={netCoreNetwork} netCoreExitHistory={exitHistory} onNetCoreMeasure={() => void measureNetCore()} onNetCoreModeChange={(mode) => { setNetCoreBusy(true); void setNetCoreMode(mode).then((result) => { if (result.netCore) setNetCore(result.netCore); if (!result.ok) setNetCoreError(result.reason ?? "切换出站模式失败。"); }).catch((error) => setNetCoreError(error instanceof Error ? error.message : String(error))).finally(() => setNetCoreBusy(false)); }} netCoreMeasuring={netCoreMeasuring} netCoreDelays={netCoreDelays} netCoreExits={netCoreExits} netCoreExitsAt={netCoreExitsAt} netCoreExiting={netCoreExiting} onNetCoreProbeExits={() => void probeExits()} onNetCoreUnlockRegion={() => { setNetCoreBusy(true); void netCoreAction("unlock-region").then((result) => { if (result.netCore) setNetCore(result.netCore); if (!result.ok) setNetCoreError(result.reason ?? "区域锁定解除失败。"); }).catch((error) => setNetCoreError(error instanceof Error ? error.message : String(error))).finally(() => setNetCoreBusy(false)); }} browserCloak={browserCloak} linkingBrowser={linkingBrowser} onLinkBrowser={() => void linkBrowser()} onOpenBrowserPicker={() => setBrowserPickerOpen(true)}
+    <ProtectionWorkspace error={checkError || protection.error} locale={locale} report={protection.report} connected={protection.connected} powerAction={powerAction} checking={manualChecking} busy={cloakBusy || transitioning} scores={scores} geo={exitGeo} target={target} baseline={baseline} browser={browserSignals} claude={claudeSignals} signals={allSignals} filter={filter} search={search} onFilter={setFilter} onSearch={setSearch} onToggle={() => void toggleProtection()} onStop={() => void toggleProtection(true)} onMonitor={(enabled, intervalMs) => { void protection.act("monitor", { enabled, intervalMs }).catch(() => {}); }} onRefresh={() => void recheck()} onRepair={() => { void protection.act("resume").catch(() => {}); }} onSelect={setDetailSignalId} netCore={netCore} netCoreBusy={netCoreBusy} netCoreError={netCoreError} onNetCoreRefresh={() => void refreshNetCore()} onNetCoreStrict={(enabled) => { void netCoreAction("strict", undefined, { enabled }).then(result => { if (!result.ok && hostPermissionError(result.reason) && netCore?.elevation?.platform === "darwin") setHostAuth({ error: "", purpose: "strict" }); }); }} onNetCoreTunnel={(enabled) => { void netCoreAction("tunnel", undefined, { enabled }).then(result => { if (!result.ok && hostPermissionError(result.reason) && ["darwin", "win32"].includes(netCore?.elevation?.platform ?? "")) setHostAuth({ error: "" }); }); }} onNetCoreStart={() => void netCoreAction("start")} onNetCoreStop={() => void netCoreAction("stop")} onNetCoreRestart={() => void netCoreAction("restart")} onNetCoreAuthorizeHost={() => setHostAuth({ error: "" })} onNetCoreSelect={(name) => void netCoreAction("select", name)} onNetCoreManageSources={() => { setManageSourcesView("list"); setManageSourcesOpen(true); }} onNetCoreAddSource={() => { setManageSourcesView("add"); setManageSourcesOpen(true); }} onNetCoreOpenNetworkConfig={() => setNetworkExemptOpen(true)} netCoreNetwork={netCoreNetwork} netCoreExitHistory={exitHistory} onNetCoreMeasure={() => void measureNetCore()} onNetCoreModeChange={(mode) => { setNetCoreBusy(true); void setNetCoreMode(mode).then((result) => { if (result.netCore) setNetCore(result.netCore); if (!result.ok) setNetCoreError(result.reason ?? "切换出站模式失败。"); }).catch((error) => setNetCoreError(error instanceof Error ? error.message : String(error))).finally(() => setNetCoreBusy(false)); }} netCoreMeasuring={netCoreMeasuring} netCoreDelays={netCoreDelays} netCoreExits={netCoreExits} netCoreExitsAt={netCoreExitsAt} netCoreExiting={netCoreExiting} onNetCoreProbeExits={() => void probeExits()} onNetCoreUnlockRegion={() => { setNetCoreBusy(true); void netCoreAction("unlock-region").then((result) => { if (result.netCore) setNetCore(result.netCore); if (!result.ok) setNetCoreError(result.reason ?? "区域锁定解除失败。"); }).catch((error) => setNetCoreError(error instanceof Error ? error.message : String(error))).finally(() => setNetCoreBusy(false)); }} onNetCoreNetworkFailure={(policy) => { setNetCoreBusy(true); void setNetCoreNetworkFailure(policy).then((result) => { if (result.netCore) setNetCore(result.netCore); if (!result.ok) setNetCoreError(result.reason ?? "网络异常处置切换失败。"); }).catch((error) => setNetCoreError(error instanceof Error ? error.message : String(error))).finally(() => setNetCoreBusy(false)); }} browserCloak={browserCloak} linkingBrowser={linkingBrowser} onLinkBrowser={() => void linkBrowser()} onOpenBrowserPicker={() => setBrowserPickerOpen(true)}
       cards={<SignalTable signals={visibleSignals} browser={browserSignals} claude={claudeSignals} locale={locale} onSelect={setDetailSignalId} />} />
-    {manageSourcesOpen && <SourcesDialog locale={locale} initialView={manageSourcesView} busy={netCoreBusy} sources={netCore?.sources ?? []} activeId={netCore?.activeId ?? null} onClose={() => setManageSourcesOpen(false)} onImport={async (payload: NetCoreImportPayload) => { const result = await importNetCore(payload); if (result.netCore) setNetCore(result.netCore); else await refreshNetCore(); return result; }} onAction={async (action: NetCoreSourceAction, id: string, name?: string) => { const result = await netCoreSourceAction(action, id, name); if (result.netCore) setNetCore(result.netCore); else await refreshNetCore(); return result; }} onChanged={() => void refreshNetCore()} />}
+    {manageSourcesOpen && <SourcesDialog locale={locale} initialView={manageSourcesView} busy={netCoreBusy} sources={netCore?.sources ?? []} activeId={netCore?.activeId ?? null} onClose={() => setManageSourcesOpen(false)} onImport={async (payload: NetCoreImportPayload) => { const result = await importNetCore(payload); if (result.netCore) { latestSourceScope.current = nodeMeasurementScope(result.netCore); setNetCore(result.netCore); } else await refreshNetCore(); return result; }} onAction={async (action: NetCoreSourceAction, id: string, name?: string) => { const result = await netCoreSourceAction(action, id, name); if (result.netCore) { latestSourceScope.current = nodeMeasurementScope(result.netCore); setNetCore(result.netCore); } else await refreshNetCore(); return result; }} onChanged={() => void refreshNetCore()} />}
     {browserPickerOpen && <BrowserPickerDialog locale={locale} busy={netCoreBusy} onClose={() => setBrowserPickerOpen(false)} onSaved={() => {}} onLink={async () => { await linkBrowser(); }} />}
     {hostAuth && <HostAuthorizationDialog platform={netCore?.elevation?.platform} locale={locale} busy={hostBusy} error={hostAuth.error} onAuthorize={() => void authorizeHost()} onClose={() => { if (!hostBusy) setHostAuth(null); }} />}
     {networkExemptOpen && <NetworkExemptDialog locale={locale} busy={netCoreBusy} onClose={() => setNetworkExemptOpen(false)} onSaved={async (state) => { setNetCoreNetwork(state); if (state.netCore) setNetCore(state.netCore); else await refreshNetCore(); setNetCoreError(state.problem ?? ""); }} />}

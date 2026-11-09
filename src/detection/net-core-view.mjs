@@ -6,7 +6,40 @@
 //   2. demo = true 时必须标注演示，且不得判为通过；
 //   3. 内核未运行或未配置时，不得给出任何出口结论。
 
+import { regionOfNode } from "../../scripts/net-core/public-dns.mjs";
+
 const text = (locale, cn, en) => (String(locale).startsWith("zh") ? cn : en);
+
+export function nodeMeasurementScope(report) {
+  return JSON.stringify([report?.activeId ?? null, report?.source?.url ?? null, report?.source?.updatedAt ?? null]);
+}
+
+export function nodeLatencyTone(delay) {
+  if (delay === null) return "danger";
+  if (!Number.isFinite(delay) || delay < 0) return "muted";
+  if (delay < 200) return "ok";
+  if (delay < 500) return "warn";
+  return "danger";
+}
+
+/** 实测出口优先于节点名称；未知地区按需要确认的切换处理。 */
+export function nodeSelectionState({ nodes = [], selected = null, delays = {}, exits = {} } = {}) {
+  const states = nodes.map(name => {
+    const measured = String(exits[name]?.countryCode ?? "").toUpperCase();
+    const countryCode = /^[A-Z]{2}$/.test(measured) ? measured : regionOfNode({ name });
+    return { name, countryCode, inferred: !/^[A-Z]{2}$/.test(measured), delay: delays[name] };
+  });
+  const current = states.find(node => node.name === selected);
+  const choices = states.map(node => ({
+    ...node,
+    switchTone: current?.countryCode && current.countryCode === node.countryCode ? "warn" : "danger",
+  }));
+  if (current?.delay !== null) return { nodes: choices, recovery: null };
+  const available = choices.filter(node => node.name !== selected && Number.isFinite(node.delay) && node.delay >= 0);
+  const sameRegion = available.filter(node => node.switchTone === "warn");
+  const otherRegions = available.filter(node => node.switchTone === "danger");
+  return { nodes: choices, recovery: { tone: sameRegion.length ? "warn" : "danger", sameRegion, otherRegions } };
+}
 
 const STATE_LABELS = {
   unconfigured: ["未启用", "Not enabled"],
@@ -181,12 +214,21 @@ export function netCoreView(report, { locale = "zh", exitHistory = null } = {}) 
   }
   // 区域锁定优先于「运行中」的其他结论：Claude 已经被拒绝，不能再显示为可用。
   if (report.regionLock?.locked) {
+    const lock = report.regionLock;
+    // 网络锁会自动复检并自行解除；地区锁必须人工确认新出口。
+    const auto = lock.type === "network" || lock.autoRecover === true;
+    const attempts = Number.isInteger(lock.recheckAttempts) ? lock.recheckAttempts : 0;
     tone = "danger";
     label = t("已阻断", "Blocked");
     conclusion = {
       tone,
       title: t("Claude 流量已阻断", "Claude traffic blocked"),
-      detail: report.regionLock.reason || t("固定出口未通过复检，Claude 域名已被拒绝。", "The pinned exit failed recheck; Claude domains are rejected."),
+      detail: [
+        lock.reason || t("固定出口未通过复检，Claude 域名已被拒绝。", "The pinned exit failed recheck; Claude domains are rejected."),
+        auto
+          ? t(`系统正在自动复检${attempts ? `（第 ${attempts} 次）` : ""}：网络恢复后会立即自动解除，无需手动操作。`, `Automatic recheck is running${attempts ? ` (attempt ${attempts})` : ""}: it unlocks as soon as the network recovers; no manual action needed.`)
+          : t("出口确实不在 Claude 支持地区：切换节点后点「复检并解除」。", "The exit is in an unsupported region: switch nodes, then recheck and unlock."),
+      ].join(" "),
     };
   } else if (report.unprotectedGuard?.active === true) {
     // 保护关闭即阻断：隧道仍然接管着流量，只是 Claude 域名被拒绝。
@@ -218,13 +260,16 @@ export function netCoreView(report, { locale = "zh", exitHistory = null } = {}) 
   }));
 
   // 未启用 TUN 时必须说明原因，而不是让用户以为内核坏了。
-  const tunHint = state === "running" && !tunEnabled
+  const hostStaleHint = !hostMode && report.hostStale
+    ? t("特权助手版本过旧：开启环境防护时会请求一次系统授权更新，之后不再提示。", "The privileged helper is outdated: enabling protection will request a one-time system authorization to update it.")
+    : null;
+  const tunHint = hostStaleHint ?? (state === "running" && !tunEnabled
     ? (hostMode
       ? t("系统接管已关闭，内核仍可提供本机代理；开启接管后会重新验证隧道。", "System capture is off; the kernel still provides a local proxy. Enabling capture will reverify the tunnel.")
       : (elevated !== true
         ? (report.elevation?.instruction || t("TUN 需要管理员权限才能接管系统流量。", "TUN requires administrator privileges to capture system traffic."))
         : t("当前是本机直连模式，未安装特权宿主；需要 TUN 请安装宿主。", "Running kernel directly without the privileged host; install the host to use TUN.")))
-    : null;
+    : null);
 
   const empty = state === "unconfigured" || state === "off"
     ? {
@@ -266,7 +311,7 @@ export function netCoreView(report, { locale = "zh", exitHistory = null } = {}) 
       canStart: state !== "running" && state !== "unconfigured" && state !== "off",
       canStop: state === "running",
       canRestart: state === "running",
-      canSelect: state === "running" && nodes.length > 0,
+      canSelect: ["running", "unavailable"].includes(state) && nodes.length > 0,
     },
   };
 }

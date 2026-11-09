@@ -3,8 +3,8 @@
 //   1. Claude 家族域名规则必须置顶，且优先于任何订阅规则；
 //   2. Claude 出口组固定为 select，禁止 url-test 自动切节点（IP 漂移本身就是风控信号）；
 //   3. tun.strict-route 默认开启；公司 VPN 的 Windows DNS 兼容需用户显式关闭；
-//   4. IPv6 关闭，避免双栈旁路；DNS 使用 fake-ip 且 respect-rules，查询也走隧道；
-//      境外域名的解析器必须与出口地区一致（anycast 会被 GeoIP 标成别的国家），见 public-dns.mjs；
+//   4. IPv6 仅在节点能力验证后启用双栈 TUN；DNS 使用 fake-ip 且 respect-rules，查询也走隧道；
+//      境外域名通过隧道并行使用地区解析器与 DoH，避免地区 DNS 失效导致断网，见 public-dns.mjs；
 //   5. 最后一条规则必须是 MATCH，否则内核拒绝启动；
 //   6. 非 Claude 流量的兜底出口是带健康检查的故障转移组（fallback / url-test），
 //      不允许绑定单个节点：单节点抖动会让全部境外流量 fail-closed 中断（FlClash 同样用组兜底）。
@@ -162,6 +162,7 @@ export function buildKernelConfig({
   blockStun = true,
   // 区域锁定：出口落回 Claude 不支持地区时，直接把 Claude 域名的 TCP 连接拒绝掉。
   blockClaude = false,
+  ipv6 = false,
 } = {}) {
   const nodes = (proxies ?? []).map(assertProxy).map((node) => {
     // 只给真做 TLS 握手的节点补指纹；用户显式写的值优先。
@@ -274,7 +275,7 @@ export function buildKernelConfig({
     mode: "rule",
     "log-level": logLevel,
 
-    ipv6: false,
+    ipv6,
     ...(hosts && Object.keys(hosts).length ? { hosts } : {}),
     ...(sniffer ? {
       sniffer: {
@@ -300,16 +301,18 @@ export function buildKernelConfig({
       "route-exclude-address": excludedRoutes,
       "dns-hijack": ["any:53"],
       "mtu": 9000,
+      ...(ipv6 ? { "inet6-address": ["fdfe:dcba:9876::1/126"] } : {}),
     },
     dns: {
       enable: true,
-      ipv6: false,
+      ipv6,
       "enhanced-mode": "fake-ip",
       "fake-ip-range": DEFAULT_FAKE_IP_RANGE,
       "fake-ip-filter": [...internalDomains.map((domain) => `+.${domain}`), "+.msftconnecttest.com", "+.msftncsi.com"],
       "default-nameserver": ["223.5.5.5", "1.1.1.1"],
       "proxy-server-nameserver": (Array.isArray(proxyServerDns) && proxyServerDns.length ? proxyServerDns : ["223.5.5.5", "1.1.1.1"]).map((item) => item.trim()),
-      nameserver: Array.isArray(publicDns) && publicDns.length ? [...publicDns] : [...ANYCAST_DOH],
+      // 同组并行查询：地区解析器无响应时也能用 DoH，避免等待主解析超时耗尽整个查询时限。
+      nameserver: [...new Set([...(Array.isArray(publicDns) ? publicDns : []), ...ANYCAST_DOH])],
       // respect-rules 会让 DNS 查询也走节点，而解析「代理服务器域名 / DoH 引导域名」又必须先有 DNS ——
       // 不把这两类域名钉死在直连解析上就会互相等待（实测：全部节点超时、/dns/query 超时）。
       "nameserver-policy": Object.fromEntries([
@@ -411,10 +414,16 @@ export function strictKernelConfig(config, { blockClaude = false } = {}) {
   return assertStrictKernelConfig(candidate);
 }
 
+function assertIpv6Config(config) {
+  if (typeof config.ipv6 !== 'boolean' || config.dns?.ipv6 !== config.ipv6) throw new Error('IPv6 与 DNS 双栈设置必须一致。');
+  if (config.ipv6 && (!config.tun?.['auto-route'] || !config.tun?.['inet6-address']?.includes('fdfe:dcba:9876::1/126'))) throw new Error('IPv6 必须由双栈 TUN 自动路由接管。');
+}
+
 export function assertStrictKernelConfig(config) {
   const group = config?.["proxy-groups"]?.find(item => item.name === DEFAULT_GROUP);
   if (config?.authentication?.length !== 1 || config.authentication[0] !== `egcc:${config.secret}`) throw new Error("严格模式必须启用私有本机代理认证。");
-  if (config?.tun?.device !== "utun90" || config.tun.enable !== true || config.tun["strict-route"] !== true || config.ipv6 !== false) throw new Error("严格模式必须使用独立网卡、严格路由并关闭内核 IPv6。");
+  if (config?.tun?.device !== "utun90" || config.tun.enable !== true || config.tun["strict-route"] !== true) throw new Error("严格模式必须使用独立网卡和严格路由。");
+  assertIpv6Config(config);
   if (config["proxy-groups"].length !== 1 || group?.type !== "select" || group.proxies?.length !== 1) throw new Error("严格模式只能使用一个固定出口。");
   if (config.rules?.at(-1) !== `MATCH,${DEFAULT_GROUP}` || config.rules.some(rule => !rule.endsWith(`,${DEFAULT_GROUP}`) && !rule.endsWith(",REJECT"))) throw new Error("严格模式不得包含直连、兜底或额外出口。");
   if (config.tun["route-exclude-address"]?.length) throw new Error("严格模式不得排除物理路由。");
@@ -424,7 +433,7 @@ export function assertStrictKernelConfig(config) {
 }
 export function assertKernelConfig(config, { groupName = DEFAULT_GROUP, domains = CLAUDE_DOMAINS, strictRoute = true, egressMode, autoGroupName = DEFAULT_AUTO_GROUP, sniffer = true, blockStun = true, requireTlsFingerprint = true, blockClaude = false } = {}) {
   if (!config || typeof config !== "object") throw new Error("内核配置为空。");
-  if (config.ipv6 !== false) throw new Error("必须关闭 IPv6，否则双栈旁路会绕过隧道。");
+  assertIpv6Config(config);
   if (sniffer) {
     if (config.sniffer?.enable !== true) throw new Error("必须启用 sniffer：否则纯 IP 连接无法按域名分流，QUIC/SNI 也读不到。");
     if (config.sniffer?.["override-destination"] !== true) throw new Error("sniffer 必须 override-destination，否则分流仍然按 IP 而不是域名。");

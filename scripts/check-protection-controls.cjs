@@ -32,6 +32,31 @@ const workspace = (phase, props = {}) => {
 };
 const button = (phase, props = {}) => workspace(phase, props).match(/<button[^>]*class="repair-button workspace-power"[^>]*>[^<]*<\/button>/)[0];
 
+test('Windows 与 IANA 时区按同一地区比较，真实不匹配仍提醒', () => {
+  const report = { phase: 'active', enabled: true, issues: [], history: [], systemTimezone: 'Korea Standard Time' };
+  assert.doesNotMatch(workspace('active', { report, target: { timezone: 'Asia/Seoul' } }), /系统时区是/);
+  assert.match(workspace('active', { report, target: { timezone: 'America/New_York' } }), /系统时区是/);
+});
+
+test('IPv6 状态放在出口结论内，区分双栈、降级及失败', () => {
+  const report = { phase: 'active', enabled: true, issues: [], history: [] };
+  const render = ipv6 => workspace('active', { report, netCore: { state: 'running', tunEnabled: true, ipv6 } });
+  const unknown = render({ supported: null, system: 'unknown', protected: false, reason: 'TLS failed' });
+  assert.match(unknown, /IPv6.*未确认/);
+  assert.doesNotMatch(unknown, /已关闭系统 IPv6/);
+  assert.equal((unknown.match(/class="workspace-alert"/g) ?? []).length, 0);
+  const conclusion = unknown.match(/class="netcore-conclusion__body">([\s\S]*?)class="netcore-conclusion__state"/);
+  assert.ok(conclusion, '出口结论卡片必须存在');
+  assert.match(conclusion[1], /class="netcore-ipv6" data-tone="danger" role="alert"/);
+  assert.match(conclusion[1], /IPv6.*未确认/);
+  const disabled = render({ supported: false, system: 'disabled', protected: false });
+  assert.match(disabled, /class="netcore-ipv6" data-tone="muted"/);
+  assert.match(disabled, /已关闭系统 IPv6/);
+  const protectedHtml = render({ supported: true, system: 'unchanged', protected: true });
+  assert.match(protectedHtml, /class="netcore-ipv6" data-tone="muted"/);
+  assert.match(protectedHtml, /IPv6.*保护隧道/);
+});
+
 test('关闭请求期间保持加载、禁用；结束后才允许再次操作', () => {
   for (const phase of ['active', 'idle']) {
     const html = button(phase, { powerAction: 'stop' });

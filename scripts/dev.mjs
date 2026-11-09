@@ -6,6 +6,7 @@ import { createGateway } from "./claude-gateway.mjs";
 import { startRepairHelper } from "./local-repair.mjs";
 import { createKernelRuntime } from "./net-core/runtime.mjs";
 import { ensureKernel } from "./net-core/vendor.mjs";
+import { createClaudeProxySettings } from "./claude-proxy-settings.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const require = createRequire(import.meta.url);
@@ -52,8 +53,10 @@ export async function startDev(args = process.argv.slice(2), { handleSignals = t
   try {
     if (process.env.CHECKCC_NET_CORE !== "0" && !process.env.CHECKCC_NET_CORE_BINARY) await ensureKernel();
     // 内核先启动：网关诊断接口需要读取它的状态；未配置节点时明确报“未启用”。
+    const stateDir = process.env.CHECKCC_STATE_DIR || path.join(root, "node_modules", ".checkcc-local");
     kernel = await createKernelRuntime({
-      stateDir: process.env.CHECKCC_STATE_DIR || path.join(root, "node_modules", ".checkcc-local"),
+      stateDir,
+      claudeProxy: createClaudeProxySettings({ stateDir }),
       root,
       logger: (line) => process.stderr.write(`[net-core] ${line}\n`),
     });

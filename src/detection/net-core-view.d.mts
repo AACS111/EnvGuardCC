@@ -4,6 +4,26 @@ export type NetCoreViewState = "unconfigured" | "error" | "idle" | "running" | "
 
 export type NetCoreViolation = { host: string; chains: string[]; count: number; note: string };
 
+export type NodeSelectionChoice = {
+  name: string;
+  countryCode: string | null;
+  inferred: boolean;
+  delay: number | null | undefined;
+  switchTone: "warn" | "danger";
+};
+
+export function nodeLatencyTone(delay: number | null | undefined): NetCoreTone;
+export function nodeMeasurementScope(report: unknown): string;
+export function nodeSelectionState(options?: {
+  nodes?: string[];
+  selected?: string | null;
+  delays?: Record<string, number | null>;
+  exits?: Record<string, { countryCode?: string | null } | null>;
+}): {
+  nodes: NodeSelectionChoice[];
+  recovery: { tone: "warn" | "danger"; sameRegion: NodeSelectionChoice[]; otherRegions: NodeSelectionChoice[] } | null;
+};
+
 export type NetCoreView = {
   state: NetCoreViewState;
   tone: NetCoreTone;

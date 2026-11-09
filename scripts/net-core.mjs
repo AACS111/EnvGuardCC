@@ -193,7 +193,8 @@ export function createNetCore({
     }
     logger(`启动内核：${binary} ${args().join(" ")}`);
     const guardian = fileURLToPath(new URL('./net-core/guardian.cjs', import.meta.url));
-    const next = spawn(process.execPath, [guardian, binary, ...args()], { stdio: ["pipe", "pipe", "pipe", "ipc"], windowsHide: true });
+    // 代理出口可以提供 IPv6，即使本机没有原生 IPv6 地址也需要建立双栈 TUN。
+    const next = spawn(process.execPath, [guardian, binary, ...args()], { stdio: ["pipe", "pipe", "pipe", "ipc"], windowsHide: true, env: { ...process.env, SKIP_SYSTEM_IPV6_CHECK: 'true' } });
     child = next;
     wire(next);
     try {

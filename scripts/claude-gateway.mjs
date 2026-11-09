@@ -190,7 +190,7 @@ export function createGateway({ upstreamBase = "https://api.anthropic.com", prof
           response.writeHead(204); return response.end();
         }
         if (request.headers["x-checkcc-client"] !== "gateway-ui") return sendJson(response, 403, { error: "缺少诊断客户端标识。" });
-        if (!["/__checkcc/status", "/__checkcc/diagnostics", "/__checkcc/cloak", "/__checkcc/simulation", "/__checkcc/message-probe", "/__checkcc/browser-probe", "/__checkcc/net-core", "/__checkcc/net-core/host", "/__checkcc/net-core/import", "/__checkcc/net-core/sources", "/__checkcc/net-core/refresh", "/__checkcc/net-core/delay", "/__checkcc/net-core/exits", "/__checkcc/net-core/mode", "/__checkcc/net-core/network", "/__checkcc/net-core/verify-domain", "/__checkcc/net-core/local-proxies", "/__checkcc/net-core/connections"].includes(pathname)) return sendJson(response, 404, { error: "未知诊断接口。" });
+        if (!["/__checkcc/status", "/__checkcc/diagnostics", "/__checkcc/cloak", "/__checkcc/simulation", "/__checkcc/message-probe", "/__checkcc/browser-probe", "/__checkcc/net-core", "/__checkcc/net-core/host", "/__checkcc/net-core/import", "/__checkcc/net-core/sources", "/__checkcc/net-core/refresh", "/__checkcc/net-core/delay", "/__checkcc/net-core/exits", "/__checkcc/net-core/mode", "/__checkcc/net-core/network-failure", "/__checkcc/net-core/network", "/__checkcc/net-core/verify-domain", "/__checkcc/net-core/local-proxies", "/__checkcc/net-core/connections"].includes(pathname)) return sendJson(response, 404, { error: "未知诊断接口。" });
         if (pathname === "/__checkcc/net-core/connections") {
           if (!["GET", "POST"].includes(request.method)) return sendJson(response, 405, { error: "传输记录仅允许 GET/POST。" });
           const log = netCore?.connectionLog;
@@ -377,6 +377,23 @@ export function createGateway({ upstreamBase = "https://api.anthropic.com", prof
             return sendJson(response, 200, { ok: true, ...result, ...await kernelPayload() });
           } catch (error) { return sendJson(response, 400, { ok: false, reason: error.message, ...await kernelPayload() }); }
         }
+        // 网络异常处置：claude（默认，只阻断 Claude）/ all（严格断流）。
+        if (pathname === "/__checkcc/net-core/network-failure") {
+          if (request.method !== "POST") return sendJson(response, 405, { error: "网络异常处置仅允许 POST。" });
+          if (!netCore || typeof netCore.setNetworkFailurePolicy !== "function") return sendJson(response, 200, { ok: false, reason: "本次启动未接入网络内核。" });
+          let policyBody = "";
+          for await (const chunk of request) {
+            policyBody += chunk;
+            if (Buffer.byteLength(policyBody) > 4096) return sendJson(response, 413, { error: "请求体过大。" });
+          }
+          let value;
+          try { value = JSON.parse(policyBody || "{}"); }
+          catch { return sendJson(response, 400, { error: "无效的 JSON。" }); }
+          try {
+            const result = await netCore.setNetworkFailurePolicy(value?.policy);
+            return sendJson(response, 200, { ok: true, ...result, ...await kernelPayload() });
+          } catch (error) { return sendJson(response, 400, { ok: false, reason: error.message, ...await kernelPayload() }); }
+        }
         // 节点延迟：逐个读取内核的延迟测试结果；失败的节点返回 null，不编造数字。
         if (pathname === "/__checkcc/net-core/delay") {
           if (request.method !== "POST") return sendJson(response, 405, { error: "测速仅允许 POST。" });
@@ -488,8 +505,9 @@ export function createGateway({ upstreamBase = "https://api.anthropic.com", prof
             }
             else if (action === "tunnel") {
               // 关闭保护只退 TUN，内核保持运行。
+              // 开启是用户主动动作：允许一次系统授权安装特权助手（缺权限时弹 UAC，仅首次）。
               if (typeof netCore.setTunnel !== "function") { ok = false; reason = "本次启动未支持单独的 TUN 开关。"; }
-              else await netCore.setTunnel(kernelValue.enabled);
+              else await netCore.setTunnel(kernelValue.enabled, { ensureHost: true });
             }
             else if (action === "stop") await netCore.stop();
             else if (action === "restart") { await netCore.stop(); ok = await netCore.start(); }
