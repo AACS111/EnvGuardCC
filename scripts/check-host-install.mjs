@@ -31,13 +31,16 @@ test('安装命令使用绝对路径、显式状态目录并只执行 --apply', 
   assert.match(command, /'\/usr\/local\/bin\/node' '\/repo\/scripts\/net-core\/install-host\.mjs' --apply$/);
 });
 
-test('单引号会被转义，路径无法注入额外命令', () => {
+test('单引号会被转义，路径无法注入额外命令', async t => {
   const evil = "/tmp/it's; rm -rf /";
   assert.equal(shellQuote(evil), "'/tmp/it'\\''s; rm -rf /'");
-  // 交给真实 sh 解析：整个值必须仍然是单个参数，分号不生效。
-  assert.equal(execFileSync('/bin/sh', ['-c', `printf '%s' ${shellQuote(evil)}`]).toString(), evil);
   const command = buildInstallCommand({ scriptPath: '/repo/x.mjs', stateDir: evil });
   assert.ok(command.includes(shellQuote(evil)));
+  // The macOS installer uses a POSIX shell. Keep the quoting assertions on all
+  // platforms, and exercise the real shell only where /bin/sh exists.
+  await t.test('真实 POSIX shell 将转义值保留为单个参数', { skip: process.platform === 'win32' ? 'Windows 不使用 POSIX 安装命令' : false }, () => {
+    assert.equal(execFileSync('/bin/sh', ['-c', `printf '%s' ${shellQuote(evil)}`]).toString(), evil);
+  });
 });
 
 test('macOS 通过 osascript 请求系统管理员授权', async () => {
