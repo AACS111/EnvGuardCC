@@ -69,7 +69,7 @@ jobs:
           pnpm test:tauri
           mkdir -p node_modules/.checkcc-tauri-backend
           cargo test --manifest-path src-tauri/Cargo.toml --locked
-          node --test --test-timeout=60000 scripts/check-dev.mjs scripts/check-desktop-launcher.mjs scripts/check-shutdown-restore.mjs scripts/check-protection-session.mjs scripts/check-protection-controls.cjs scripts/check-protection-reconnect.mjs scripts/check-application-paths.mjs scripts/check-macos-adapters.mjs scripts/check-windows-timezone.mjs scripts/check-timezone-service.mjs scripts/check-desktop-settings.mjs scripts/check-claude-reset.mjs scripts/check-gateway.mjs
+          node --test --test-timeout=60000 scripts/check-dev.mjs scripts/check-desktop-launcher.mjs scripts/check-shutdown-restore.mjs scripts/check-protection-session.mjs scripts/check-protection-controls.cjs scripts/check-protection-reconnect.mjs scripts/check-application-paths.mjs scripts/check-macos-adapters.mjs scripts/check-windows-timezone.mjs scripts/check-timezone-service.mjs scripts/check-desktop-settings.mjs scripts/check-claude-reset.mjs scripts/check-gateway.mjs scripts/check-app-updates.mjs scripts/check-gateway-model.cjs scripts/check-network-type.cjs
       - name: Fetch kernel and verify its lifecycle
         shell: bash
         run: |

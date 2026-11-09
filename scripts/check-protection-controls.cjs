@@ -17,10 +17,12 @@ Module._resolveFilename = function(id, parent, ...rest) {
 };
 for (const extension of ['.ts', '.tsx']) {
   require.extensions[extension] = (module, filename) => module._compile(ts.transpileModule(fs.readFileSync(filename, 'utf8'), {
-    compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020, jsx: ts.JsxEmit.ReactJSX },
+    compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020, jsx: ts.JsxEmit.ReactJSX, esModuleInterop: true },
   }).outputText, filename);
 }
 const { ProtectionWorkspace } = require(path.join(root, 'src/components/detector/ProtectionWorkspace.tsx'));
+const { AppUpdateDialog } = require(path.join(root, 'src/components/detector/AppUpdateNotice.tsx'));
+const { ReleaseNotes } = require(path.join(root, 'src/components/detector/ReleaseNotes.tsx'));
 const { verificationScores } = require(path.join(root, 'src/detection/verification-score.ts'));
 const workspace = (phase, props = {}) => {
   const html = renderToStaticMarkup(React.createElement(ProtectionWorkspace, {
@@ -31,6 +33,68 @@ const workspace = (phase, props = {}) => {
   return html;
 };
 const button = (phase, props = {}) => workspace(phase, props).match(/<button[^>]*class="repair-button workspace-power"[^>]*>[^<]*<\/button>/)[0];
+
+test('侧栏提供更新入口与当前版本，未检查时不宣称已是最新或可更新', () => {
+  const html = workspace('idle');
+  assert.match(html, /class="workspace-text-link workspace-update__button" aria-haspopup="dialog"/);
+  assert.match(html, /检查更新/);
+  assert.match(html, new RegExp(`workspace-update__version">v${require('../package.json').version.replaceAll('.', '\\.')}`));
+  assert.doesNotMatch(html, /可更新|当前无需更新/);
+});
+
+test('更新弹窗仅在匹配安装包可用时提供下载，版本说明不执行 HTML', () => {
+  const report = { currentVersion: '0.1.3', latestVersion: '0.2.0', status: 'available',
+    downloadUrl: 'https://github.com/community/EnvGuardCC/releases/download/v0.2.0/EnvGuardCC-Setup-0.2.0.exe',
+    releaseUrl: 'https://github.com/community/EnvGuardCC/releases/tag/v0.2.0', notes: '<script>run()</script>',
+  };
+  const render = value => renderToStaticMarkup(React.createElement(AppUpdateDialog, { locale: 'zh', report: value, busy: false, failed: false }));
+  const html = render(report);
+  assert.match(html, /发现新版本 v0.2.0/);
+  assert.ok(html.includes(`href="${report.downloadUrl}"`));
+  assert.match(html, /等待配置恢复完成/);
+  assert.doesNotMatch(html, /<script>/);
+  for (const status of ['pending', 'unsupported', 'current', 'no-release']) {
+    assert.doesNotMatch(render({ ...report, status }), /下载新版本/);
+  }
+});
+
+test('真实发布说明渲染为标题、列表与行内代码，不再显示 Markdown 标记', () => {
+  const notes = fs.readFileSync(path.join(root, 'docs/releases/v0.1.3.md'), 'utf8');
+  const html = renderToStaticMarkup(React.createElement(ReleaseNotes, { baseUrl: 'https://github.com/AACS111/EnvGuardCC/releases/tag/v0.1.3' }, notes));
+  assert.match(html, /<h1>EnvGuardCC 0\.1\.3<\/h1>/);
+  assert.match(html, /<h2>下载与安装<\/h2>/);
+  assert.match(html, /<h2>验证范围<\/h2>/);
+  assert.match(html, /<ul>\s*<li>桌面宿主/);
+  assert.match(html, /<code>EnvGuardCC-Setup-0\.1\.3\.exe<\/code>/);
+  assert.doesNotMatch(html, /# EnvGuardCC|## 下载与安装|`EnvGuardCC-Setup/);
+});
+
+test('发布说明支持 GFM 表格、任务列表、引用、代码块和安全链接', () => {
+  const notes = '**修复**与~~旧行为~~\n\n> 升级说明\n\n1. 下载\n2. 安装\n\n- [x] 完成\n\n| 平台 | 状态 |\n| --- | --- |\n| Mac | 支持 |\n\n```sh\npnpm build\n```\n\n[反馈](../../issues/1)';
+  const html = renderToStaticMarkup(React.createElement(ReleaseNotes, { baseUrl: 'https://github.com/community/EnvGuardCC/releases/tag/v0.2.0' }, notes));
+  for (const tag of ['strong', 'del', 'blockquote', 'ol', 'table', 'th', 'td', 'pre']) assert.ok(html.includes(`<${tag}`), tag);
+  assert.match(html, /type="checkbox" disabled="" checked=""/);
+  assert.match(html, /<code class="language-sh">pnpm build\n<\/code>/);
+  assert.match(html, /href="https:\/\/github.com\/community\/EnvGuardCC\/issues\/1" target="_blank" rel="noreferrer"/);
+});
+
+test('Markdown 不执行原始 HTML，不生成危险协议链接或自动请求外部图片', () => {
+  const notes = '<script>alert(1)</script>\n\n<img src="https://tracking.example/pixel" onerror="alert(2)">\n\n[脚本](javascript:alert%281%29) [数据](data:text/html,hello) [凭据](https://user:password@example.com)\n\n![说明图](https://tracking.example/image.png)';
+  const html = renderToStaticMarkup(React.createElement(ReleaseNotes, {}, notes));
+  assert.doesNotMatch(html, /<script|<img|onerror|href="(?:javascript:|data:)|user:password|tracking\.example/);
+  assert.match(html, /说明图/);
+});
+
+test('更新检查失败与限流可见，不冒充无需更新；英文界面有对应提示', () => {
+  for (const [locale, expected] of [['zh', 'GitHub 请求受限'], ['en', 'GitHub is limiting requests']]) {
+    const html = renderToStaticMarkup(React.createElement(AppUpdateDialog, {
+      locale, report: { currentVersion: '0.1.3', status: 'error', error: 'rate-limit' }, busy: false, failed: true,
+    }));
+    assert.ok(html.includes(expected));
+    assert.match(html, /role="alert"/);
+    assert.doesNotMatch(html, /当前无需更新|No update is needed|下载新版本|Download update/);
+  }
+});
 
 test('Windows 与 IANA 时区按同一地区比较，真实不匹配仍提醒', () => {
   const report = { phase: 'active', enabled: true, issues: [], history: [], systemTimezone: 'Korea Standard Time' };

@@ -9,7 +9,7 @@ const root = path.resolve(__dirname, '..');
 const nativeResolve = Module._resolveFilename;
 Module._resolveFilename = function(id, parent, ...rest) { return nativeResolve.call(this, id.startsWith('@/') ? path.join(root,'src',id.slice(2)) : id, parent, ...rest); };
 require.extensions['.ts'] = (module, filename) => module._compile(ts.transpileModule(fs.readFileSync(filename,'utf8'), {compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2020}}).outputText,filename);
-require.extensions['.tsx'] = (module, filename) => module._compile(ts.transpileModule(fs.readFileSync(filename,'utf8'), {compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2020,jsx:ts.JsxEmit.ReactJSX}}).outputText,filename);
+require.extensions['.tsx'] = (module, filename) => module._compile(ts.transpileModule(fs.readFileSync(filename,'utf8'), {compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2020,jsx:ts.JsxEmit.ReactJSX,esModuleInterop:true}}).outputText,filename);
 const {buildGatewayCheck} = require(path.join(root,'src/detection/gateway-check.ts'));
 const {signalConfig} = require(path.join(root,'src/detection/config/signals.ts'));
 test('节点及供应商切换等待后台完成，避免请求超时后实际已切换', async t => {
@@ -164,6 +164,79 @@ const fixtures = () => ({
   exit:{primary:{source:'test',ip:'1.2.3.4',countryCode:'KR',city:'Seoul',regionName:'Seoul',timezone:'Asia/Seoul',asn:'AS1',org:'Example'},sources:[{source:'test',countryCode:'KR'}],ipv4:'1.2.3.4',ipv6:null,consistentCountry:null,ipv6Error:'ENETUNREACH'},
 });
 const index = result => Object.fromEntries(result.signals.map(signal=>[signal.id,signal]));
+
+test('BIGLOBE 出口使用同 IP、同 ASN 的运营商情报，住宅结果不再悬置', () => {
+  const report = fixtures();
+  const primary = { ...report.exit.primary, source: 'ipwho.is', countryCode: 'JP', asn: 'AS2518', org: 'Japan Network Information Center' };
+  const secondary = { ...primary, source: 'ipapi.co', asn: '2518', org: 'BIGLOBE Inc.' };
+  report.exit = { ...report.exit, primary, sources: [primary, secondary], consistentCountry: true };
+  report.checkedAt = '2026-11-09T00:00:00Z';
+  report.testedSignals = ['exitType'];
+  const before = JSON.stringify(report);
+  for (const locale of ['zh', 'en']) {
+    const signal = index(buildGatewayCheck(report, locale)).exitType;
+    assert.equal(signal.assessment, 'ok');
+    assert.equal(signal.score, 0);
+    assert.equal(signal.contribution, 0);
+    assert.equal(signal.observation, undefined);
+    assert.equal(signal.testedAt, report.checkedAt);
+    assert.match(signal.value, locale === 'zh' ? /家庭网络（推断）/ : /Residential \(inferred\)/);
+    assert.match(signal.detail, /BIGLOBE/);
+    assert.match(signal.detail, /ipapi\.co/);
+    const { verificationSampleStatus } = require(path.join(root, 'src/detection/verification-score.ts'));
+    assert.equal(verificationSampleStatus(signal), 'passed');
+  }
+  assert.equal(JSON.stringify(report), before, 'classification must preserve raw source evidence');
+});
+
+test('组织名兜底只补充缺失或注册局名称，不混用其它出口的情报', () => {
+  const report = fixtures();
+  const primary = { ...report.exit.primary, asn: 'AS2518', org: 'Japan Network Information Center' };
+  const secondary = { ...primary, source: 'ipapi.co', org: 'BIGLOBE Inc.' };
+  report.testedSignals = ['exitType'];
+  for (const org of [null, '', '  ', 'APNIC', 'American Registry for Internet Numbers']) {
+    report.exit = { ...report.exit, primary: { ...primary, org }, sources: [secondary] };
+    assert.equal(index(buildGatewayCheck(report, 'zh')).exitType.assessment, 'ok', String(org));
+  }
+  for (const source of [
+    { ...secondary, ip: '5.6.7.8' },
+    { ...secondary, asn: 'AS999999' },
+    { ...secondary, asn: null },
+    { ...secondary, org: 'APNIC' },
+    { ...secondary, org: null },
+  ]) {
+    report.exit = { ...report.exit, primary, sources: [source] };
+    const signal = index(buildGatewayCheck(report, 'zh')).exitType;
+    assert.equal(signal.assessment, 'unknown');
+    assert.equal(signal.observation, 'inconclusive');
+    assert.equal(signal.contribution, 0);
+  }
+  report.exit = { ...report.exit, primary: { ...primary, org: 'Unknown company' }, sources: [secondary] };
+  assert.equal(index(buildGatewayCheck(report, 'zh')).exitType.assessment, 'unknown');
+  report.exit = { ...report.exit, primary: { ...primary, org: 'Cloud Hosting' }, sources: [secondary] };
+  assert.equal(index(buildGatewayCheck(report, 'zh')).exitType.assessment, 'warning');
+  report.exit = { ...report.exit, primary: null, sources: [secondary] };
+  assert.equal(index(buildGatewayCheck(report, 'zh')).exitType.assessment, 'unknown');
+});
+
+test('网关网络类型保留住宅、机房、未知三态及原有风险权重', () => {
+  for (const [org, asn, assessment, score] of [
+    ['BIGLOBE Inc.', 'AS2518', 'ok', 0],
+    ['Comcast Cable Communications', 'AS7922', 'ok', 0],
+    ['Japan Network Information Center', 'AS2518', 'unknown', 0],
+    ['Example', 'AS999999', 'unknown', 0],
+    [null, null, 'unknown', 0],
+    ['BIGLOBE Inc.', 'AS16509', 'warning', 1],
+  ]) {
+    const report = fixtures();
+    report.exit.primary = { ...report.exit.primary, org, asn };
+    const signal = index(buildGatewayCheck(report, 'zh')).exitType;
+    assert.equal(signal.assessment, assessment, String(org));
+    assert.equal(signal.score, score);
+    assert.equal(signal.contribution, score * 13);
+    if (assessment !== 'unknown') assert.ok(signal.testedAt);
+  }
+});
 
 test('49 enabled signals exclude the removed API check; offline and non-applicable are not passes',()=>{
   assert.equal(Object.values(signalConfig).filter(config=>config.enabled).length,49);

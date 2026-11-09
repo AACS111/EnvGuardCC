@@ -498,6 +498,49 @@
 .workspace-side-links { display: grid; gap: 8px; justify-items: start; }
 .workspace-side-links .workspace-text-link { color: var(--repair-muted); font-size: 11px; }
 .workspace-side-links .workspace-text-link:hover { color: var(--repair-accent); }
+.workspace-update { display: grid; gap: 4px; }
+.workspace-update__button { flex-wrap: wrap; }
+.workspace-update__button > svg { flex-shrink: 0; }
+.workspace-update__version { padding-left: 22px; color: var(--repair-muted); font-size: 10px; }
+.workspace-update__badge { padding: 1px 5px; border-radius: 999px; background: var(--workspace-sidebar-selected); color: var(--repair-muted); font-size: 10px; line-height: 1.6; }
+.workspace-update__badge[data-available="true"] { background: #e5eee6; color: #356047; }
+.check-workspace .workspace-updates { width: min(600px, calc(100vw - 32px)); max-height: calc(100dvh - 40px); }
+.workspace-updates .repair-dialog__header h2 { display: flex; align-items: center; gap: 8px; margin: 0; font-size: 18px; font-weight: 600; }
+.workspace-updates .repair-dialog__header p { margin: 5px 0 0; color: var(--repair-muted); font-size: 12px; }
+.workspace-updates .repair-dialog__header > button { min-width: 32px; min-height: 32px; font-size: 20px; line-height: 1; }
+.workspace-updates__body { display: grid; gap: 16px; color: var(--repair-text); font-size: 13px; }
+.workspace-updates__body h3, .workspace-updates__body h4, .workspace-updates__body p { margin: 0; }
+.workspace-updates__body h3 { font-size: 17px; }
+.workspace-updates__body p { line-height: 1.8; }
+.workspace-updates__notes { min-width: 0; padding-top: 14px; border-top: 1px solid var(--repair-border); }
+.workspace-updates__notes h4 { margin-bottom: 8px; font-size: 13px; }
+.workspace-release-notes { min-width: 0; overflow-wrap: anywhere; line-height: 1.8; }
+.workspace-release-notes :is(h1, h2, h3, h4, h5, h6) { margin: 20px 0 10px; font-weight: 650; line-height: 1.5; }
+.workspace-release-notes h1 { font-size: 20px; }
+.workspace-release-notes h2 { padding-bottom: 6px; border-bottom: 1px solid var(--repair-border); font-size: 17px; }
+.workspace-release-notes h3 { font-size: 15px; }
+.workspace-release-notes :is(h4, h5, h6) { font-size: 13px; }
+.workspace-release-notes > :first-child { margin-top: 0; }
+.workspace-release-notes p { margin: 10px 0; }
+.workspace-release-notes :is(ul, ol) { margin: 10px 0; padding-left: 1.6em; }
+.workspace-release-notes ul { list-style: disc; }
+.workspace-release-notes ol { list-style: decimal; }
+.workspace-release-notes li + li { margin-top: 5px; }
+.workspace-release-notes li > p { margin: 5px 0; }
+.workspace-release-notes a { color: var(--repair-accent); text-decoration: underline; text-underline-offset: 3px; }
+.workspace-release-notes code { padding: 2px 5px; border-radius: 4px; background: var(--workspace-sidebar-surface); font-size: .92em; }
+.workspace-release-notes pre { margin: 12px 0; padding: 12px; max-width: 100%; overflow: auto; border: 1px solid var(--repair-border); border-radius: 8px; background: var(--workspace-sidebar-surface); white-space: pre; }
+.workspace-release-notes pre code { padding: 0; background: none; }
+.workspace-release-notes blockquote { margin: 12px 0; padding: 0 12px; border-left: 3px solid var(--repair-border); color: var(--repair-muted); }
+.workspace-release-notes hr { margin: 16px 0; border: 0; border-top: 1px solid var(--repair-border); }
+.workspace-release-notes table { display: block; max-width: 100%; overflow-x: auto; margin: 12px 0; border-collapse: collapse; }
+.workspace-release-notes :is(th, td) { padding: 6px 10px; border: 1px solid var(--repair-border); text-align: left; }
+.workspace-release-notes th { background: var(--workspace-sidebar-surface); font-weight: 600; }
+.workspace-release-notes .contains-task-list { list-style: none; padding-left: 0; }
+.workspace-release-notes .task-list-item input { margin-right: 6px; }
+.workspace-updates__error { color: var(--repair-danger); }
+.workspace-updates__hint { color: var(--repair-muted); font-size: 12px; }
+.workspace-updates__actions { display: flex; justify-content: flex-end; flex-wrap: wrap; gap: 8px; }
 .workspace-text-link { display: inline-flex; align-items: center; gap: 6px; padding: 0; border: 0; background: transparent; color: var(--repair-accent); font: inherit; font-size: 12px; text-align: left; cursor: pointer; }
 .workspace-text-link:hover { text-decoration: underline; text-underline-offset: 3px; }
 .workspace-text-link:disabled { opacity: .5; cursor: not-allowed; }
