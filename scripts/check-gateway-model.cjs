@@ -1309,6 +1309,52 @@ test('检测项分层：出口类型与 IP 情报交叉核对属于链路项',()
   for (const id of ['chineseFonts','emojiStyle','vendorFonts','domesticDevice']) assert.equal(signalRequirement(id),'environment',id);
 });
 
+test('保护检测采样前自动同步浏览器环境，普通扫描保持原样，同步失败可重试', async () => {
+  const source = fs.readFileSync(path.join(root, 'src/components/detector/Detector.tsx'), 'utf8');
+  const file = ts.createSourceFile('Detector.tsx', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
+  let callback;
+  const visit = node => {
+    if (ts.isVariableDeclaration(node) && node.name.getText(file) === 'runAll') callback = node.initializer.arguments[0].getText(file);
+    ts.forEachChild(node, visit);
+  };
+  visit(file);
+  assert.ok(callback);
+  const script = ts.transpile(`const scan = ${callback}`, { target: ts.ScriptTarget.ES2022 }) + '\nscan;';
+  for (const scenario of ['protected', 'ordinary', 'failed']) {
+    const events = [];
+    const scanTask = { current: null }, scanLock = { current: false };
+    let fail = scenario === 'failed';
+    const scan = require('node:vm').runInNewContext(script, {
+      scanTask, scanLock, scanVersion: { current: 0 },
+      async synchronizeBrowserCloak() {
+        events.push('sync');
+        if (fail) throw new Error('browser sync failed');
+        await Promise.resolve();
+        events.push('synced');
+        return { enabled: true };
+      },
+      setBrowserCloak: () => events.push('report'),
+      async runBrowserScan() { events.push('scan'); return { signals: [] }; },
+      async checkGateway() { return { signals: [] }; },
+      normalizeRegion: value => value, locale: 'zh', detectorText: {},
+      crypto: { randomUUID: () => 'sample' },
+      setRunning() {}, setCheckError() {}, setBrowserScan() {}, setClaudeCheck() {},
+      setOptimization() {}, setPointResults() {}, setExitGeo() {}, setCompletedSample() {},
+    });
+    const options = scenario === 'ordinary' ? {} : { runId: 'startup-run' };
+    if (fail) {
+      await assert.rejects(scan(options), /browser sync failed/);
+      assert.deepEqual(events, ['sync']);
+      assert.equal(scanTask.current, null);
+      assert.equal(scanLock.current, false);
+      fail = false;
+      events.length = 0;
+    }
+    await scan(options);
+    assert.deepEqual(events, scenario === 'ordinary' ? ['scan'] : ['sync', 'synced', 'report', 'scan']);
+  }
+});
+
 test('浏览器迷惑层：概览里能看见状态与「启动保护浏览器」入口',()=>{
   const {ProtectionWorkspace} = require(path.join(root,'src/components/detector/ProtectionWorkspace.tsx'));
   const {verificationScores} = require(path.join(root,'src/detection/verification-score.ts'));

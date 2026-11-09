@@ -112,7 +112,7 @@ export function createProtectionService({ stateDir, runtime, browserCloak, curre
           if (!sameTimezone(actual, zone)) issues.push(`系统时区未应用：当前 ${actual || '未知'}，目标 ${zone}。`);
         } catch (error) { issues.push('系统时区适配失败：' + error.message); }
       }
-      const report = await browserCloak.sync(origin, { launch: false, force: true });
+      const report = await browserCloak.sync(origin, { launch: true, force: true });
       browserIssues = browserErrors(report);
       issues.push(...browserIssues);
       return issues;

@@ -410,17 +410,22 @@ test('云机房出口在目标里带 hosting 标记，界面可以提示 Claude 
   assert.equal(residential.hosting, false);
 });
 
-test('启动保护不打开浏览器，已有连接继续验证，未连接或验证失败仍报告部分生效', async t => {
-  for (const scenario of ['disconnected', 'verified', 'apply', 'headers']) await t.test(scenario, async t => {
+test('启动保护自动接入浏览器，复用已有连接，启动或验证失败仍报告部分生效', async t => {
+  for (const scenario of ['disconnected', 'verified', 'launch', 'apply', 'headers']) await t.test(scenario, async t => {
     const stateDir = await mkdtemp(path.join(os.tmpdir(), 'checkcc-protection-browser-'));
     const target = targetFromExit({ primary: { ip: '203.0.113.44', countryCode: 'KR', timezone: 'Asia/Seoul' } });
     let appliedTargets = [];
+    let launches = 0;
     const runtime = {
-      clients: new Map(scenario === 'disconnected' ? [] : [['web', {}]]), policy: {}, enabled: false, load: async () => {},
+      clients: new Map(['disconnected', 'launch'].includes(scenario) ? [] : [['web', {}]]), policy: {}, enabled: false, load: async () => {},
       async apply(policy, _origin, kinds) {
         appliedTargets = kinds; this.policy = policy; this.enabled = true;
         const results = kinds.map(kind => {
-          assert.ok(this.clients.has(kind), '启动保护不得创建新浏览器连接');
+          if (!this.clients.has(kind)) {
+            launches++;
+            if (scenario === 'launch') return { target: kind, state: 'failed', detail: 'browser launch failed', pages: 0 };
+            this.clients.set(kind, {});
+          }
           if (scenario === 'apply') return { target: kind, state: 'failed', detail: 'browser configuration failed', pages: 0 };
           return { target: kind, state: 'verified', detail: 'sample verified', pages: 1 };
         });
@@ -445,12 +450,13 @@ test('启动保护不打开浏览器，已有连接继续验证，未连接或�
       try { await session.stop(); } finally { await browserCloak.close(); await rm(stateDir, { recursive: true, force: true }); }
     });
     const report = await session.start('http://localhost:3000');
-    assert.deepEqual(appliedTargets, scenario === 'disconnected' ? [] : ['web']);
+    assert.deepEqual(appliedTargets, ['web']);
+    assert.equal(launches, ['disconnected', 'launch'].includes(scenario) ? 1 : 0);
     assert.equal(report.enabled, true);
-    if (scenario !== 'verified') {
+    if (['launch', 'apply', 'headers'].includes(scenario)) {
       assert.equal(report.phase, 'partial');
-      assert.ok(report.issues.includes(scenario === 'apply' ? 'browser configuration failed' : 'browser headers not verified'));
-      if (scenario === 'disconnected') assert.equal(runtime.clients.size, 0);
+      assert.ok(report.issues.includes(scenario === 'launch' ? 'browser launch failed' : scenario === 'apply' ? 'browser configuration failed' : 'browser headers not verified'));
+      if (scenario === 'launch') assert.equal(runtime.clients.size, 0);
       session.refreshBrowser({ results: [{ target: 'web', state: 'verified', detail: 'sample verified' }], requestProbe: { state: 'verified' } });
       assert.deepEqual(session.report().issues, []);
       assert.equal(session.report().phase, 'active');
@@ -459,6 +465,8 @@ test('启动保护不打开浏览器，已有连接继续验证，未连接或�
       assert.equal(browserCloak.report.results[0].state, 'verified');
       assert.deepEqual(report.issues, []);
       assert.equal(report.phase, 'active');
+      await browserCloak.sync('http://localhost:3000', { launch: true, force: true });
+      assert.equal(launches, scenario === 'disconnected' ? 1 : 0, '同步应复用浏览器连接');
     }
   });
 });

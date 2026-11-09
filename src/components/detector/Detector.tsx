@@ -229,6 +229,11 @@ export function Detector({ locale = "zh" }: { locale?: LocaleCode }) {
     scanLock.current = true; setRunning(true);
     if (!options.background) setCheckError("");
     const task = (async () => { try {
+      if (options.runId) {
+        const report = await synchronizeBrowserCloak();
+        if (!current()) return;
+        setBrowserCloak(report);
+      }
       const [browser, gateway] = await Promise.all([runBrowserScan(normalizeRegion("auto"), locale, detectorText), checkGateway(locale)]);
       if (!current()) return;
       if (gateway.error) throw new Error(gateway.error);
