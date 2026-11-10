@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useSyncExternalStore } from 'react';
+import { useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import type { LocaleCode } from '@/i18n/messages';
 import type { ConnectionRecord, NetCoreReport } from '@/detection/gateway-check';
 import { netCoreView, trafficFlowSamples, activeFlowConnections } from '@/detection/net-core-view.mjs';
@@ -35,7 +35,7 @@ const labelLead = 0.35; // 等光点先走出本机图标，再从右侧显示�
 const labelsPerLoop = 3;
 
 /** Each path uses its own current connection samples; mode alone never creates traffic. */
-export function TrafficFlow({ report, locale, onDetails, onConnection, onRoute }: { report: NetCoreReport | null; locale: LocaleCode; onDetails: () => void; onConnection?: (record: ConnectionRecord) => void; onRoute?: (route: 'proxied' | 'direct' | 'blocked') => void }) {
+export function TrafficFlow({ report, protectionEnabled = false, locale, onDetails, onConnection, onRoute }: { report: NetCoreReport | null; protectionEnabled?: boolean; locale: LocaleCode; onDetails: () => void; onConnection?: (record: ConnectionRecord) => void; onRoute?: (route: 'proxied' | 'direct' | 'blocked') => void }) {
   const zh = locale.startsWith('zh');
   const text = (cn: string, en: string) => zh ? cn : en;
   const view = netCoreView(report, { locale });
@@ -52,6 +52,29 @@ export function TrafficFlow({ report, locale, onDetails, onConnection, onRoute }
     if (!element.matches(':hover') && !element.matches(':focus-visible')) setRevealed(current => current?.id === id ? null : current);
   };
   const motion = useSyncExternalStore(subscribeMotion, canAnimate, () => false);
+  const mascotAt = protectionEnabled && report?.state === 'running' ? 'proxy' : 'gateway';
+  const mascotRef = useRef<HTMLSpanElement>(null);
+  const previousMascotAt = useRef(mascotAt);
+  const mascotTransform = useRef('translate(-50%, 0)');
+  useEffect(() => {
+    const changed = previousMascotAt.current !== mascotAt;
+    previousMascotAt.current = mascotAt;
+    const mascot = mascotRef.current;
+    if (!changed || !motion || !mascot) {
+      mascotTransform.current = 'translate(-50%, 0)';
+      return;
+    }
+    const jump = mascot.animate([
+      { transform: mascotTransform.current },
+      { transform: 'translate(-50%, -42px)', offset: 0.5 },
+      { transform: 'translate(-50%, 0)' },
+    ], { duration: 640, easing: 'ease-in-out' });
+    return () => {
+      // 保留中途高度，反向切换时从当前位置继续跳跃。
+      mascotTransform.current = getComputedStyle(mascot).transform;
+      jump.cancel();
+    };
+  }, [mascotAt, motion]);
   const isFresh = () => {
     const age = Date.now() - Date.parse(report?.routing?.sampledAt ?? '');
     return age >= -5000 && age <= 45000;
@@ -128,10 +151,13 @@ export function TrafficFlow({ report, locale, onDetails, onConnection, onRoute }
 
     </svg>
     {nodes.map(node => <button key={node.id} type="button" className={`workspace-flow__node workspace-flow__node--${node.id}`} data-observed={node.observed} aria-label={node.label} aria-haspopup={node.id !== 'origin' ? 'dialog' : undefined} onClick={() => { if (onRoute && node.id !== 'origin') onRoute(node.id === 'proxy' ? 'proxied' : node.id === 'gateway' ? 'blocked' : 'direct'); else onDetails(); }}>
-      <span className="workspace-flow__symbol"><WorkspaceIcon name={node.icon} />{node.id === 'proxy' && <span className="workspace-flow__mascot" aria-hidden="true"><span /></span>}</span>
+      <span className="workspace-flow__symbol"><WorkspaceIcon name={node.icon} /></span>
       <span className="workspace-flow__label" aria-hidden="true">{node.short}</span>
       <span className="workspace-flow__tooltip" role="tooltip">{node.label}</span>
     </button>)}
+    <div className="workspace-flow__mascot-layer" data-mascot-at={mascotAt} data-motion={motion} aria-hidden="true">
+      <div className="workspace-flow__mascot-position"><span ref={mascotRef} className="workspace-flow__mascot"><span /></span></div>
+    </div>
     {violation && <button type="button" className="workspace-flow__warning" onClick={onDetails} aria-label={view.conclusion.title} title={view.conclusion.title}>!</button>}
     </div>
     <div className="workspace-flow__footer">

@@ -214,7 +214,7 @@ export function ProtectionWorkspace(props: Props) {
             <div className="workspace-flow-status" data-tone={kernel.tone}><span aria-hidden="true" />{kernel.conclusion.title}</div>
             <p className="workspace-flow-description">{text('以已观测连接为准，未覆盖全部系统流量', 'Observed connections only; not all system traffic')}</p>
           </div>
-          <TrafficFlow report={props.netCore} locale={locale} onDetails={() => setTab('network')} onConnection={record => { setTab('network'); transferLogRef.current?.open(record); }} onRoute={route => { setTab('network'); transferLogRef.current?.openRoute(route); }} />
+          <TrafficFlow report={props.netCore} protectionEnabled={protectionEnabled} locale={locale} onDetails={() => setTab('network')} onConnection={record => { setTab('network'); transferLogRef.current?.open(record); }} onRoute={route => { setTab('network'); transferLogRef.current?.openRoute(route); }} />
         </header>
         {noticeItems.length > 0 && <div className="workspace-notices" data-tone={noticeTone} role={noticeTone === 'error' ? 'alert' : 'status'} aria-live={noticeTone === 'error' ? 'assertive' : 'polite'}>
           {noticeItems.map((notice) => <div key={notice.id} className="workspace-alert" data-tone={notice.tone}>
