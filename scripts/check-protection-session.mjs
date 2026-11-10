@@ -410,7 +410,7 @@ test('云机房出口在目标里带 hosting 标记，界面可以提示 Claude 
   assert.equal(residential.hosting, false);
 });
 
-test('启动保护自动接入浏览器，复用已有连接，启动或验证失败仍报告部分生效', async t => {
+test('启动保护按需接入浏览器，复用已有连接，主动接入或验证失败仍报告部分生效', async t => {
   for (const scenario of ['disconnected', 'verified', 'launch', 'apply', 'headers']) await t.test(scenario, async t => {
     const stateDir = await mkdtemp(path.join(os.tmpdir(), 'checkcc-protection-browser-'));
     const target = targetFromExit({ primary: { ip: '203.0.113.44', countryCode: 'KR', timezone: 'Asia/Seoul' } });
@@ -449,7 +449,17 @@ test('启动保护自动接入浏览器，复用已有连接，启动或验证�
     t.after(async () => {
       try { await session.stop(); } finally { await browserCloak.close(); await rm(stateDir, { recursive: true, force: true }); }
     });
-    const report = await session.start('http://localhost:3000');
+    let report = await session.start('http://localhost:3000');
+    if (['disconnected', 'launch'].includes(scenario)) {
+      assert.deepEqual(appliedTargets, [], '启动保护只准备策略，不拉起浏览器');
+      assert.equal(launches, 0);
+      assert.equal(runtime.enabled, true);
+      assert.equal(report.enabled, true);
+      assert.equal(report.phase, 'partial', '未接入浏览器时如实报告尚未验证');
+      const browserReport = await browserCloak.sync('http://localhost:3000', { launch: true, force: true });
+      session.refreshBrowser(browserReport);
+      report = session.report();
+    }
     assert.deepEqual(appliedTargets, ['web']);
     assert.equal(launches, ['disconnected', 'launch'].includes(scenario) ? 1 : 0);
     assert.equal(report.enabled, true);
@@ -587,6 +597,14 @@ test('关闭保护时建立未保护阻断，开启保护先解除阻断', async
   assert.deepEqual(calls.slice(0, 2), ['guard:false', 'tunnel:true'], '开启保护必须先解除阻断');
   assert.equal(service.report().unprotectedBlock.active, false);
   await service.stop();
+  await service.start('http://localhost:3000');
+  calls.length = 0;
+  await service.stop({ shutdown: true, kernelWillStop: true });
+  assert.deepEqual(calls, [], '退出由内核停止统一恢复，不先解除阻断和重载隧道');
+  await service.start('http://localhost:3000');
+  calls.length = 0;
+  await service.stop({ shutdown: true });
+  assert.deepEqual(calls, ['guard:false', 'tunnel:false'], '独立调用者仍负责释放隧道');
 });
 
 test('未保护阻断建立失败时如实报告原因，不阻止关闭保护', async t => {

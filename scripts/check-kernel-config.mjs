@@ -2,7 +2,7 @@
 // 只用 RFC 5737 保留地址，不依赖真实订阅、网络或内核二进制。
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { buildKernelConfig, strictKernelConfig, assertStrictKernelConfig, assertKernelConfig, CLAUDE_DOMAINS, DEFAULT_GROUP, DEFAULT_AUTO_GROUP } from './net-core/config.mjs';
+import { buildKernelConfig, strictKernelConfig, assertStrictKernelConfig, assertKernelConfig, CLAUDE_DOMAINS, DEFAULT_GROUP, DEFAULT_AUTO_GROUP, CLAUDE_GUARD_GROUP } from './net-core/config.mjs';
 
 const proxies = [
   { name: 'node-a', type: 'ss', server: '203.0.113.10', port: 443, cipher: 'aes-128-gcm', password: 'test' },
@@ -40,10 +40,13 @@ test('规则模式：Claude 置顶、固定出口、strict-route、fake-ip 与�
   assert.equal(config.dns['respect-rules'], true);
   assert.deepEqual(
     config.rules.slice(0, CLAUDE_DOMAINS.length * 2),
-    [...CLAUDE_DOMAINS.map((domain) => `AND,((NETWORK,udp),(DST-PORT,443),(DOMAIN-SUFFIX,${domain})),REJECT`), ...CLAUDE_DOMAINS.map((domain) => `DOMAIN-SUFFIX,${domain},${DEFAULT_GROUP}`)],
+    [...CLAUDE_DOMAINS.map((domain) => `AND,((NETWORK,udp),(DST-PORT,443),(DOMAIN-SUFFIX,${domain})),REJECT`), ...CLAUDE_DOMAINS.map((domain) => `DOMAIN-SUFFIX,${domain},${CLAUDE_GUARD_GROUP}`)],
   );
   const groups = new Map(config['proxy-groups'].map((group) => [group.name, group]));
   assert.equal(groups.get(DEFAULT_GROUP).type, 'select');
+  // 守卫组只包含固定出口组与 REJECT：运行时切一次选择就能阻断/放行 Claude，不需要重载配置。
+  assert.deepEqual(groups.get(CLAUDE_GUARD_GROUP).proxies, [DEFAULT_GROUP, 'REJECT']);
+  assert.equal(groups.get(CLAUDE_GUARD_GROUP).type, 'select');
   const auto = groups.get(DEFAULT_AUTO_GROUP);
   assert.ok(['fallback', 'url-test'].includes(auto.type));
   assert.deepEqual([...auto.proxies].sort(), proxies.map((node) => node.name).sort());
@@ -112,13 +115,14 @@ test('固定出口探测只钉探测主机到专用组，不新增入站', () =>
 
 test('区域锁定：Claude 域名在置顶代理规则之前被 REJECT，严格模式同样生效', () => {
   const locked = build({ blockClaude: true });
-  const firstClaude = locked.rules.findIndex((rule) => rule.endsWith(',CLAUDE-PIN') && rule.includes('claude.ai'));
+  const firstClaude = locked.rules.findIndex((rule) => rule.endsWith(`,${CLAUDE_GUARD_GROUP}`) && rule.includes('claude.ai'));
   const firstReject = locked.rules.findIndex((rule) => rule === 'DOMAIN-SUFFIX,claude.ai,REJECT');
   assert.ok(firstReject >= 0 && firstReject < firstClaude, 'REJECT 必须排在代理规则之前');
   assert.doesNotThrow(() => assertKernelConfig(locked, { egressMode: 'rule', blockClaude: true }));
-  // 严格模式重写规则后仍然保留封禁。
+  // 严格模式重写规则后仍然保留封禁，并且裁掉运行时守卫组（它本来就要断全部）。
   const strict = strictKernelConfig(build({ blockClaude: true, secret: 'x'.repeat(40) }), { blockClaude: true });
   assert.ok(strict.rules.includes('DOMAIN-SUFFIX,claude.ai,REJECT'));
+  assert.equal(strict['proxy-groups'].some((group) => group.name === CLAUDE_GUARD_GROUP), false);
   assert.equal(strict.rules.at(-1), `MATCH,${DEFAULT_GROUP}`);
   assert.doesNotThrow(() => assertStrictKernelConfig(strict));
 });

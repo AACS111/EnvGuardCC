@@ -24,14 +24,14 @@
 
 ## 下载安装
 
-当前版本：**0.2.1**。下载其他版本或查看发布说明，请前往 [GitHub Releases](https://github.com/AACS111/EnvGuardCC/releases)。
+当前版本：**0.2.2**。下载其他版本或查看发布说明，请前往 [GitHub Releases](https://github.com/AACS111/EnvGuardCC/releases)。
 
 | 平台                  | 安装包                                                                                                    | 其他形式                                                                                              |
 | --------------------- | --------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
-| Windows x64           | [EXE 安装器](https://github.com/AACS111/EnvGuardCC/releases/download/v0.2.1/EnvGuardCC-Setup-0.2.1.exe)   | [便携 ZIP](https://github.com/AACS111/EnvGuardCC/releases/download/v0.2.1/EnvGuardCC-Windows-x64.zip) |
-| macOS · Apple Silicon | [DMG 安装镜像](https://github.com/AACS111/EnvGuardCC/releases/download/v0.2.1/EnvGuardCC-0.2.1-arm64.dmg) | [应用 ZIP](https://github.com/AACS111/EnvGuardCC/releases/download/v0.2.1/EnvGuardCC-macOS-arm64.zip) |
+| Windows x64           | [EXE 安装器](https://github.com/AACS111/EnvGuardCC/releases/download/v0.2.2/EnvGuardCC-Setup-0.2.2.exe)   | [便携 ZIP](https://github.com/AACS111/EnvGuardCC/releases/download/v0.2.2/EnvGuardCC-Windows-x64.zip) |
+| macOS · Apple Silicon | [DMG 安装镜像](https://github.com/AACS111/EnvGuardCC/releases/download/v0.2.2/EnvGuardCC-0.2.2-arm64.dmg) | [应用 ZIP](https://github.com/AACS111/EnvGuardCC/releases/download/v0.2.2/EnvGuardCC-macOS-arm64.zip) |
 
-[SHA-256 校验值](https://github.com/AACS111/EnvGuardCC/releases/download/v0.2.1/SHA256SUMS.txt)
+[SHA-256 校验值](https://github.com/AACS111/EnvGuardCC/releases/download/v0.2.2/SHA256SUMS.txt)
 
 - **Windows**：运行安装器，或完整解压便携包后运行 `EnvGuardCC.exe`，保留同目录文件。需要系统 WebView2；安装器会在缺失时联网安装，便携版需自行准备。安装包尚未进行代码签名。
 - **macOS**：打开 DMG，将应用拖入 Applications，再从“应用程序”启动。当前采用 ad-hoc 签名，尚未进行 Developer ID 签名和公证；首次打开可能需要在“系统设置 → 隐私与安全性”中允许。
@@ -144,7 +144,7 @@ Claude 专用出口由用户明确选择，不因测速自动切换。普通流�
 
 - **代理与环境防护可分开使用**：系统流量接管可独立开启；开启 TUN 不代表已适配时区或浏览器环境。应用不读取或改写第三方代理客户端配置。
 - **防护关闭时的 Claude 访问**：在受本应用内核规则控制的路径上，关闭环境防护会阻断 Claude 域名；这不代表应用能阻断内核以外的全部系统连接。
-- **网络异常处置**：默认仅阻断 Claude 域名，其他直连和代理出口不受影响；恢复后自动复检并解除限制。选择“阻断全部网络”才使用严格断流能力，受平台支持范围限制。
+- **网络异常处置**：默认仅阻断 Claude 域名，其他直连和代理出口不受影响；断开后的 5 分钟内每 5 秒自动复检，网络一恢复就立即解除，不需要手动点「复检」。选择“阻断全部网络”才使用严格断流能力，受平台支持范围限制。
 - **macOS 严格模式**：将全部出站固定到同一节点，阻断其他路径及普通内网连接。退出应用或内核崩溃后仍保留系统阻断，必须明确关闭严格模式或使用恢复工具解除。操作与恢复方式见[网络内核文档](docs/NET-CORE.md)。
 - **普通模式的限制**：普通代理模式和 Windows 不提供内核崩溃后的独立系统阻断。字体、Emoji、节点质量和服务端策略等也不属于可回滚环境适配的范围。
 
@@ -160,7 +160,7 @@ Claude 专用出口由用户明确选择，不因测速自动切换。普通流�
 
 ### 关闭窗口后，为什么应用仍在运行？
 
-关闭窗口会保留后台运行和当前保护。要结束应用，请从托盘或应用菜单退出；正常退出会先尝试恢复原始配置。恢复失败时会保留备份并报告原因，不会将未完成的恢复标记为成功。
+关闭窗口会保留后台运行和当前保护。要结束应用，请从托盘或应用菜单退出；正常退出会先尝试恢复原始配置。启动时托盘图标与页面先出现，网络内核启动和「启动后自动开启保护」在后台继续执行：首次启动要等特权宿主就绪、建立 TUN 并验证出口，这期间网络页显示「启动中」，完成后自动刷新；退出不会等待这两个后台步骤。恢复失败时会保留备份并报告原因，不会将未完成的恢复标记为成功。
 
 ### 为什么开启防护后仍有异常或未判定？
 
@@ -246,7 +246,7 @@ pnpm desktop:installer
 | [网络兼容性](docs/NETWORK-COMPATIBILITY.md)               | 网络场景与兼容性说明。               |
 | [时区服务](docs/timezone-service.md)                      | macOS 时区辅助服务、授权及恢复。     |
 | [环境操作](docs/environment-actions.md)                   | 环境检测与操作说明。                 |
-| [0.2.1 发布说明](docs/releases/v0.2.1.md)                 | 当前发布版本的变更记录。             |
+| [0.2.2 发布说明](docs/releases/v0.2.2.md)                 | 当前发布版本的变更记录。             |
 
 ## 技术栈与许可证
 

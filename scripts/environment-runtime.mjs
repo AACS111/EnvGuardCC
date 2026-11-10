@@ -199,9 +199,14 @@ export class EnvironmentRuntime {
             await client.send("Page.enable", {}, sessionId);
             const registration = await client.send("Page.addScriptToEvaluateOnNewDocument", { source: this.source(origin) }, sessionId);
             instance.sessions.set(sessionId, { script: registration.identifier, type: targetInfo.type, targetId: targetInfo.targetId });
-            await this.configure(instance, sessionId);
+            await this.configure(instance, sessionId, { evaluate: false });
             // Recursively catch cross-origin renderer frames before their scripts run.
             await client.send("Target.setAutoAttach", { autoAttach: true, waitForDebuggerOnStart: true, flatten: true }, sessionId).catch(() => {});
+            // A replacement iframe can defer evaluation while waiting for the
+            // debugger. Its document script and emulation are already installed,
+            // so resume before evaluating the current document.
+            await client.send("Runtime.runIfWaitingForDebugger", {}, sessionId);
+            await client.send("Runtime.evaluate", { expression: this.source(origin), returnByValue: true }, sessionId);
           }
         } catch (error) { instance.errors.push(error.message); }
         finally { await client.send("Runtime.runIfWaitingForDebugger", {}, sessionId).catch(() => {}); }
@@ -231,7 +236,7 @@ export class EnvironmentRuntime {
     }
     return instance;
   }
-  async configure(instance, sessionId) {
+  async configure(instance, sessionId, { evaluate = true } = {}) {
     const { client } = instance;
     const registration = instance.sessions.get(sessionId);
     if (registration && !registration.baseline) {
@@ -248,7 +253,7 @@ export class EnvironmentRuntime {
       await client.send("Emulation.setUserAgentOverride", { userAgent, acceptLanguage: this.policy.languages.join(",") }, sessionId);
     }
     if (this.enabled && this.policy.locale) await client.send("Emulation.setLocaleOverride", { locale: this.policy.locale }, sessionId);
-    return client.send("Runtime.evaluate", { expression: this.source(instance.origin), returnByValue: true }, sessionId);
+    if (evaluate) return client.send("Runtime.evaluate", { expression: this.source(instance.origin), returnByValue: true }, sessionId);
   }
   async apply(delta, origin, kinds = ["web", "desktop"]) {
     if (!/^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)) throw new Error("仅支持本机检测页面。");

@@ -1578,3 +1578,16 @@ test('路径图独立显示普通代理采样，不依赖 Claude 活动，也不
     if (originalDocument === undefined) delete global.document; else global.document = originalDocument;
   }
 });
+
+test('路径图螃蟹随保护与网关状态往返，不受旧连接采样影响', () => {
+  const {TrafficFlow} = require(path.join(root,'src/components/detector/TrafficFlow.tsx'));
+  const render = (protectionEnabled, state = 'running') => renderToStaticMarkup(React.createElement(TrafficFlow, {
+    report: {state, mode:'rule', routing:{sampledAt:new Date().toISOString(), proxied:3}},
+    protectionEnabled, locale:'zh', onDetails:()=>{},
+  }));
+  assert.match(render(false), /data-mascot-at="gateway"/);
+  assert.match(render(true), /data-mascot-at="proxy"/);
+  assert.match(render(true, 'stopped'), /data-mascot-at="gateway"/);
+  assert.match(render(false), /data-mascot-at="gateway"/);
+  assert.equal((render(true).match(/class="workspace-flow__mascot"/g) ?? []).length, 1);
+});

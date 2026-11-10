@@ -158,7 +158,7 @@ function resetLifecycleForReuse() {
   desktopLauncher.error = null;
 }
 
-async function closeRuntime({ reusable = false } = {}) {
+async function closeRuntime({ reusable = false, kernelWillStop = false } = {}) {
   if (closePending) return closePending;
   closing = true;
   const pending = (async () => {
@@ -167,7 +167,7 @@ async function closeRuntime({ reusable = false } = {}) {
     const attempt = async operation => { try { return await operation(); } catch (error) { issues.push(error.message); } };
     await attempt(() => browserCloak.close());
     await attempt(() => desktopLauncher.close());
-    const protectionReport = await attempt(() => protection.stop({ shutdown: true }));
+    const protectionReport = await attempt(() => protection.stop({ shutdown: true, kernelWillStop }));
     if (protectionReport?.phase === "restore_failed") issues.push(...protectionReport.issues);
     const runtimeReport = await attempt(() => environmentRuntime.close());
     for (const result of runtimeReport?.results ?? []) if (result.state !== "restored") issues.push(result.detail);

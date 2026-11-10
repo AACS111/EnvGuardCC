@@ -89,7 +89,7 @@ export function NetCoreSettings({ locale, report, busy, error, tunnelLocked, net
             <button type="button" className="netcore-mode" aria-pressed={report?.networkFailurePolicy === 'all'} disabled={busy} onClick={() => onNetworkFailureChange('all')}>{text("阻断全部网络", "Block all")}</button>
           </div>
         </div>
-        <p className="netcore-detail">{text("默认只拒绝 Claude 域名，直连与其他代理出口不受影响；断开后 3 分钟内每 5 秒自动复检，一恢复就立即解除。选择「阻断全部网络」才使用严格断流封禁其他流量。", "By default only Claude domains are rejected; direct and other proxy traffic keeps working. After a drop it re-probes every 5 seconds for 3 minutes and unlocks as soon as the network returns. Choose \"Block all\" to engage the strict kill switch.")}</p>
+        <p className="netcore-detail">{text("默认只拒绝 Claude 域名，直连与其他代理出口不受影响；断开后 5 分钟内每 5 秒自动复检，一恢复就立即解除。选择「阻断全部网络」才使用严格断流封禁其他流量。", "By default only Claude domains are rejected; direct and other proxy traffic keeps working. After a drop it re-probes every 5 seconds for 5 minutes and unlocks as soon as the network returns. Choose \"Block all\" to engage the strict kill switch.")}</p>
       </section>}
 
       {onStrictChange && <section className="netcore-block" aria-label={text("严格连接保护", "Strict connection protection")}>

@@ -247,12 +247,14 @@ function explainNetworkError(error) {
   return error?.message || "订阅下载失败。";
 }
 
-export async function fetchSubscription(url, { download = defaultFetch, timeoutMs = 15000 } = {}) {
+export async function fetchSubscription(url, { download = defaultFetch, timeoutMs = 15000, signal } = {}) {
+  signal?.throwIfAborted();
   let target;
   try { target = new URL(String(url)); }
   catch { throw new Error("订阅地址无效。"); }
   if (!["http:", "https:"].includes(target.protocol)) throw new Error("订阅地址必须是 http 或 https。");
-  const text = await download(target.href, { timeoutMs });
+  const text = await download(target.href, { timeoutMs, signal });
+  signal?.throwIfAborted();
   if (typeof text !== "string" || !text.trim()) throw new Error("订阅返回内容为空。");
   if (Buffer.byteLength(text) > MAX_SUBSCRIPTION_BYTES) throw new Error("订阅内容过大。");
   return text;
@@ -262,24 +264,29 @@ export async function fetchSubscription(url, { download = defaultFetch, timeoutM
  * 经本地代理（FlClash / Clash Verge 等的混合端口）取文本。
  * 用户机器上已有的代理工具往往能下到本程序直连下不到的订阅，借它一用比让用户手动折腾更实际。
  */
-export function fetchTextViaProxy(url, { proxy, userAgent = "EnvGuardCC/1.0", timeoutMs = 15000 } = {}) {
+export function fetchTextViaProxy(url, { proxy, userAgent = "EnvGuardCC/1.0", timeoutMs = 15000, signal } = {}) {
+  if (signal?.aborted) return Promise.reject(signal.reason);
   const target = new URL(url);
   if (target.protocol !== "https:" && target.protocol !== "http:") return Promise.reject(new Error("只支持 http/https。"));
   const proxyUrl = new URL(proxy.includes("://") ? proxy : `http://${proxy}`);
   return new Promise((resolve, reject) => {
+    const onAbort = () => request.destroy(signal.reason);
+    const cleanup = () => { clearTimeout(timer); signal?.removeEventListener('abort', onAbort); };
     const timer = setTimeout(() => { request.destroy(new Error("PROXY_TIMEOUT")); }, timeoutMs);
     const request = proxyRequest(target, { method: "GET", headers: { "User-Agent": userAgent, Accept: "*/*" } }, (response) => {
       const chunks = [];
       response.on("data", (chunk) => chunks.push(chunk));
       response.on("end", () => {
-        clearTimeout(timer);
+        cleanup();
         const body = Buffer.concat(chunks).toString("utf8");
         if (response.statusCode >= 300) { const error = new Error(`HTTP ${response.statusCode}`); error.status = response.statusCode; reject(error); return; }
         resolve(body);
       });
-      response.on("error", (error) => { clearTimeout(timer); reject(error); });
+      response.on("error", (error) => { cleanup(); reject(error); });
     }, { url: proxyUrl, source: "local-proxy" });
-    request.once("error", (error) => { clearTimeout(timer); reject(error); });
+    request.once("error", (error) => { cleanup(); reject(error); });
+    signal?.addEventListener('abort', onAbort, { once: true });
+    if (signal?.aborted) { onAbort(); return; }
     request.end();
   });
 }
@@ -297,16 +304,18 @@ export function looksLikeSubscription(text) {
   return SHARE_SCHEMES.test(decoded) || /(^|\n)\s*proxies\s*:/m.test(decoded);
 }
 
-export async function defaultFetch(url, { timeoutMs = 15000, fetchImpl = globalThis.fetch, userAgents, scan, proxyFetch = fetchTextViaProxy } = {}) {
+export async function defaultFetch(url, { timeoutMs = 15000, fetchImpl = globalThis.fetch, userAgents, scan, proxyFetch = fetchTextViaProxy, signal } = {}) {
   const override = typeof process.env.CHECKCC_SUBSCRIPTION_UA === "string" ? process.env.CHECKCC_SUBSCRIPTION_UA.trim() : "";
   const profiles = userAgents ?? (override ? [override] : SUBSCRIPTION_UA_PROFILES);
   let lastStatus = null;
   let directFailure = null;
   for (const userAgent of profiles) {
+    signal?.throwIfAborted();
     let response;
     try {
-      response = await fetchImpl(url, { redirect: "follow", signal: AbortSignal.timeout(timeoutMs), headers: { "User-Agent": userAgent } });
+      response = await fetchImpl(url, { redirect: "follow", signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)]) : AbortSignal.timeout(timeoutMs), headers: { "User-Agent": userAgent } });
     } catch (error) {
+      signal?.throwIfAborted();
       // 单个 UA 的连接被重置不代表订阅不可用：换下一个 UA 继续试。
       directFailure = explainNetworkError(error);
       continue;
@@ -324,6 +333,7 @@ export async function defaultFetch(url, { timeoutMs = 15000, fetchImpl = globalT
       break;
     }
     const text = await response.text();
+    signal?.throwIfAborted();
     if (looksLikeSubscription(text)) return text;
     // 200 但内容是错误页/不兼容格式：记录原因并换下一个 UA。
     directFailure = "订阅返回内容不是可识别的 Clash 配置或分享链接。";
@@ -332,31 +342,37 @@ export async function defaultFetch(url, { timeoutMs = 15000, fetchImpl = globalT
   const directReason = directFailure ?? `HTTP ${lastStatus ?? "未知"}`;
   // 直连拿不到时借本地代理（FlClash / Clash Verge 等）再试一次：
   // 用户机器上那两个客户端能下到的订阅，本程序直连未必下得到（节点、DNS、UA 都可能不一样）。
-  const borrowed = await tryLocalProxies(url, { profiles, timeoutMs, scan, proxyFetch });
+  signal?.throwIfAborted();
+  const borrowed = await tryLocalProxies(url, { profiles, timeoutMs, scan, proxyFetch, signal });
   if (borrowed.text) return borrowed.text;
   const tries = borrowed.failures.length ? `；已尝试本地代理：${borrowed.failures.join("、")}` : "";
   throw new Error(`订阅下载失败：${directReason}${tries}`);
 }
 
 /** 依次尝试扫描到的本地代理端口；成功返回文本，失败则记录每个端口的原因。 */
-async function tryLocalProxies(url, { profiles, timeoutMs, scan, proxyFetch }) {
+async function tryLocalProxies(url, { profiles, timeoutMs, scan, proxyFetch, signal }) {
   const failures = [];
   let list = [];
   try {
     const { scanLocalProxies } = await import("./local-proxy.mjs");
     list = await (scan ?? scanLocalProxies)();
   } catch (error) {
+    signal?.throwIfAborted();
     return { text: null, failures: [`扫描失败（${error.message}）`] };
   }
+  signal?.throwIfAborted();
   // 只用 HTTP 协议端口：CONNECT 通道对 https 订阅才成立。
   for (const item of list.filter((entry) => entry.protocol === "http")) {
     for (const userAgent of profiles) {
+      signal?.throwIfAborted();
       try {
-        const body = await proxyFetch(url, { proxy: `http://127.0.0.1:${item.port}`, userAgent, timeoutMs });
+        const body = await proxyFetch(url, { proxy: `http://127.0.0.1:${item.port}`, userAgent, timeoutMs, signal });
+        signal?.throwIfAborted();
         if (looksLikeSubscription(body)) return { text: body, failures };
         failures.push(`${item.tool}:${item.port}（返回内容不是可识别的订阅格式）`);
         break;
       } catch (error) {
+        signal?.throwIfAborted();
         if (error?.status && [401, 403, 406].includes(error.status) && userAgent !== profiles[profiles.length - 1]) continue;
         failures.push(`${item.tool}:${item.port}（${error.message}）`);
         break;

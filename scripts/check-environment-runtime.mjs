@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import vm from "node:vm";
 import http from "node:http";
+import dgram from "node:dgram";
 import path from "node:path";
 import { mkdtemp, readFile, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -136,7 +137,27 @@ test("字体屏蔽改变实际 Canvas/FontFaceSet 访问，支持数量配置和
   } finally { vm.runInContext(`(${restoreRuntimePolicy.toString()})()`, context); }
 });
 
-test("实际 Chromium 首次页面脚本、刷新、变更、撤销都使用目标接口；本地验证不冒充 Claude 端验证", { timeout: 180000 }, async () => {
+test("实际 Chromium 首次页面脚本、刷新、变更、撤销都使用目标接口；本地验证不冒充 Claude 端验证", { timeout: 180000 }, async (t) => {
+  // Keep ICE gathering independent of public DNS and STUN availability.
+  // A real Binding response also lets the unprotected control prove that the
+  // relay policy, rather than a broken STUN server, prevents candidate leaks.
+  const stun = dgram.createSocket("udp4");
+  stun.on("message", (request, remote) => {
+    if (request.length < 20 || request.readUInt16BE(0) !== 1 || request.readUInt32BE(4) !== 0x2112a442) return;
+    const response = Buffer.alloc(32);
+    response.writeUInt16BE(0x0101, 0);
+    response.writeUInt16BE(12, 2);
+    request.copy(response, 4, 4, 20);
+    response.writeUInt16BE(0x0020, 20); // XOR-MAPPED-ADDRESS
+    response.writeUInt16BE(8, 22);
+    response[25] = 1; // IPv4
+    response.writeUInt16BE(remote.port ^ 0x2112, 26);
+    response.writeUInt32BE((0xcb00710a ^ 0x2112a442) >>> 0, 28); // 203.0.113.10
+    stun.send(response, remote.port, remote.address);
+  });
+  await new Promise((resolve, reject) => { stun.once("error", reject); stun.bind(0, "127.0.0.1", resolve); });
+  t.after(() => new Promise(resolve => stun.close(resolve)));
+  const stunUrl = `stun:127.0.0.1:${stun.address().port}`;
   const directory = await mkdtemp(path.join(tmpdir(), "checkcc-runtime-test-"));
   const server = http.createServer((_request, response) => {
     response.writeHead(200, { "Content-Type": "text/html" });
@@ -180,10 +201,10 @@ test("实际 Chromium 首次页面脚本、刷新、变更、撤销都使用目�
     assert.equal(linked.enabled, true);
     assert.equal(linked.policy.webrtcDisabled, false);
     assert.equal(linked.policy.webrtcRelayOnly, true);
-    const ice = await page.instance.client.send("Runtime.evaluate", {expression: `(async () => {
-      const pc = new RTCPeerConnection({iceServers:[{urls:"stun:stun.l.google.com:19302"}],iceTransportPolicy:"all"});
+    const iceExpression = `(async () => {
+      const pc = new RTCPeerConnection({iceServers:[{urls:${JSON.stringify(stunUrl)}}],iceTransportPolicy:"all"});
       try {
-        pc.setConfiguration({iceServers:[{urls:"stun:stun.l.google.com:19302"}],iceTransportPolicy:"all"});
+        pc.setConfiguration({iceServers:[{urls:${JSON.stringify(stunUrl)}}],iceTransportPolicy:"all"});
         pc.createDataChannel("privacy-test");
         const candidates = [];
         await new Promise(async (resolve,reject) => {
@@ -193,7 +214,8 @@ test("实际 Chromium 首次页面脚本、刷新、变更、撤销都使用目�
         });
         return {policy:pc.getConfiguration().iceTransportPolicy,candidates,native:pc instanceof RTCPeerConnection};
       } finally {pc.close();}
-    })()`, awaitPromise:true, returnByValue:true}, page.sessionId);
+    })()`;
+    const ice = await page.instance.client.send("Runtime.evaluate", {expression: iceExpression, awaitPromise:true, returnByValue:true}, page.sessionId);
     assert.equal(ice.exceptionDetails, undefined);
     assert.deepEqual(ice.result.value,{policy:"relay",candidates:[],native:true});
     assert.equal(linked.requestProbe.state, "verified");
@@ -203,6 +225,10 @@ test("实际 Chromium 首次页面脚本、刷新、变更、撤销都使用目�
     const disabled = await controller.sync(origin, { force: true });
     assert.equal(disabled.enabled, false);
     assert.equal(runtime.enabled, false);
+    const unprotectedIce = await page.instance.client.send("Runtime.evaluate", {expression: iceExpression, awaitPromise:true, returnByValue:true}, page.sessionId);
+    assert.equal(unprotectedIce.exceptionDetails, undefined);
+    assert.equal(unprotectedIce.result.value.policy, "all");
+    assert.ok(unprotectedIce.result.value.candidates.some(candidate => candidate.includes("203.0.113.10") && candidate.includes(" typ srflx")), "the local STUN fixture must produce a server-reflexive candidate without protection");
     await page.instance.client.send("Page.reload", {}, page.sessionId);
     assert.equal((await findPage((probe) => probe?.protected === false)).probe.protected, false);
     await writeFile(profileFile, JSON.stringify({ target: { language: "en", locale: "en-US" }, updatedAt: "second" }));
@@ -290,7 +316,7 @@ test("跨域 iframe 刷新与关闭后仍能恢复原始接口，重复恢复幂
   const directory = await mkdtemp(path.join(tmpdir(), "checkcc-restore-frames-"));
   const server = http.createServer((req, response) => {
     response.writeHead(200, { "Content-Type": "text/html" });
-    response.end(req.url === "/child" ? "<html>child</html>" : '<html><iframe src="http://localhost:' + server.address().port + '/child"></iframe></html>');
+    response.end(req.url === "/child" ? "<html><script>window.firstLanguage=navigator.language;</script>child</html>" : '<html><iframe src="http://localhost:' + server.address().port + '/child"></iframe></html>');
   });
   await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
   const origin = 'http://127.0.0.1:' + server.address().port;
@@ -307,12 +333,30 @@ test("跨域 iframe 刷新与关闭后仍能恢复原始接口，重复恢复幂
       throw new Error("cross-origin frame did not attach");
     };
     await waitForFrame();
-    for (const [sessionId, registration] of instance.sessions) {
-      if (registration.type === "page") await instance.client.send("Page.reload", {}, sessionId);
+    for (const [sessionId, registration] of [...instance.sessions]) {
+      if (registration.type !== "page") continue;
+      const location = await instance.client.send("Runtime.evaluate", { expression: "location.origin", returnByValue: true }, sessionId);
+      if (location.result.value !== origin) continue;
+      // Reload acknowledges navigation before its replacement iframe is ready.
+      // Observe the actual test page's load, excluding the initial blank tab.
+      let loaded, timer;
+      const navigation = new Promise((resolve, reject) => {
+        timer = setTimeout(() => reject(new Error("iframe reload did not finish")), 10000);
+        loaded = event => { if (event.sessionId === sessionId && event.method === "Page.loadEventFired") resolve(); };
+        instance.client.listeners.add(loaded);
+      });
+      try { await Promise.all([instance.client.send("Page.reload", {}, sessionId), navigation]); }
+      finally { clearTimeout(timer); instance.client.listeners.delete(loaded); }
     }
     await waitForFrame();
     assert.ok([...instance.sessions.values()].every(item => item.baseline), "every attached frame needs native restoration values");
-    assert.ok((await runtime.restore()).results.every(item => item.state === "restored"));
+    for (const [sessionId, registration] of instance.sessions) {
+      if (registration.type !== "iframe") continue;
+      const first = await instance.client.send("Runtime.evaluate", { expression: "window.firstLanguage", returnByValue: true }, sessionId);
+      assert.equal(first.result.value, "ko-KR", "the replacement iframe's first script must see the language override");
+    }
+    const restored = await runtime.restore();
+    assert.ok(restored.results.every(item => item.state === "restored"), JSON.stringify(restored));
     for (const [sessionId, registration] of instance.sessions) {
       const observed = await instance.client.send("Runtime.evaluate", { expression: "({languages:[...navigator.languages],locale:Intl.DateTimeFormat().resolvedOptions().locale,protected:!!globalThis[Symbol.for('checkcc.runtime-policy.v1')]})", returnByValue: true }, sessionId);
       assert.deepEqual(observed.result.value, { ...registration.baseline, protected: false });

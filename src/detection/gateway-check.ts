@@ -96,6 +96,8 @@ export type NetCoreReport = {
   /** 未保护阻断：保护关闭时仍保持 TUN 接管并拒绝 Claude 域名。 */
   unprotectedGuard?: { active: boolean; at?: string | null; reason?: string | null } | null;
   claudeBlocked?: boolean;
+  /** Claude 守卫组状态：blocked 表示内核里已把 Claude 域名切到 REJECT（未重载配置）。 */
+  claudeGuard?: "blocked" | "open";
   takeover?: { phase: "idle" | "checking" | "quitting" | "waiting" | "ready" | "blocked"; closed: string[]; reason: string | null; checkedAt: string | null };
   guard?: { provider: string | null; supported: boolean; armed: boolean; phase: string; checkedAt: string | null; reason: string | null } | null;
   binary?: string; apiPort?: number;

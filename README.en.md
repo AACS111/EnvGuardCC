@@ -6,16 +6,16 @@ A Claude runtime environment inspection and protection workspace with browser an
 
 ## Download
 
-- [Apple Silicon Mac DMG](https://github.com/AACS111/EnvGuardCC/releases/download/v0.2.1/EnvGuardCC-0.2.1-arm64.dmg)
-- [Apple Silicon Mac ZIP](https://github.com/AACS111/EnvGuardCC/releases/download/v0.2.1/EnvGuardCC-macOS-arm64.zip)
-- [Windows x64 installer (.exe)](https://github.com/AACS111/EnvGuardCC/releases/download/v0.2.1/EnvGuardCC-Setup-0.2.1.exe)
-- [Windows x64 portable package (.zip)](https://github.com/AACS111/EnvGuardCC/releases/download/v0.2.1/EnvGuardCC-Windows-x64.zip)
-- [SHA-256 checksums](https://github.com/AACS111/EnvGuardCC/releases/download/v0.2.1/SHA256SUMS.txt) · [All releases](https://github.com/AACS111/EnvGuardCC/releases)
+- [Apple Silicon Mac DMG](https://github.com/AACS111/EnvGuardCC/releases/download/v0.2.2/EnvGuardCC-0.2.2-arm64.dmg)
+- [Apple Silicon Mac ZIP](https://github.com/AACS111/EnvGuardCC/releases/download/v0.2.2/EnvGuardCC-macOS-arm64.zip)
+- [Windows x64 installer (.exe)](https://github.com/AACS111/EnvGuardCC/releases/download/v0.2.2/EnvGuardCC-Setup-0.2.2.exe)
+- [Windows x64 portable package (.zip)](https://github.com/AACS111/EnvGuardCC/releases/download/v0.2.2/EnvGuardCC-Windows-x64.zip)
+- [SHA-256 checksums](https://github.com/AACS111/EnvGuardCC/releases/download/v0.2.2/SHA256SUMS.txt) · [All releases](https://github.com/AACS111/EnvGuardCC/releases)
 
 Run the installer directly, or extract the entire portable package and launch EnvGuardCC.exe with its accompanying files. Both packages include Node.js. Windows also needs system WebView2; the installer downloads it when missing, while portable users must install it first. The installer is not code-signed.
 
 
-> Version 0.2.1 uses Tauri 2 with the system WebView and bundled Node.js for smaller desktop packages.
+> Version 0.2.2 uses Tauri 2 with the system WebView and bundled Node.js for smaller desktop packages.
 
 ## Screenshots
 
@@ -138,7 +138,7 @@ On macOS 13+, the first protection activation requests system approval to bind i
 
 ### Desktop startup and background operation
 
-Installed Windows and macOS apps offer launch-at-login and automatic protection switches in Protection configuration. Development previews do not register login items. Closing the window keeps protection running in the background; quitting from the tray or app menu restores configuration before exiting.
+Installed Windows and macOS apps offer launch-at-login and automatic protection switches in Protection configuration. Development previews do not register login items. Closing the window keeps protection running in the background; quitting from the tray or app menu restores configuration before exiting. On launch the tray icon and window appear first while the network kernel and "enable protection on startup" keep running in the background: the first start waits for the privileged host, brings up the TUN and verifies the exit, so the network page shows "Starting" until it finishes; quitting does not wait for these background steps.
 
 ### Reset Claude Desktop
 
@@ -152,4 +152,4 @@ Tauri 2 desktop development requires Rust stable, Windows C++ Build Tools and Wi
 
 Publish a higher `v<version>` stable GitHub Release with the matching platform packages to make it discoverable. Drafts and prereleases are excluded. The app distinguishes missing packages, unsupported platforms and failed checks, and does not automatically install or restart. Quit normally and wait for configuration restoration before installing an update. Forks can set the backend environment variable `CHECKCC_UPDATE_REPOSITORY=owner/repository` to use their own public releases with the existing asset names.
 
-See the [0.2.1 release notes](docs/releases/v0.2.1.md).
+See the [0.2.2 release notes](docs/releases/v0.2.2.md).

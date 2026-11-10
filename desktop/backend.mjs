@@ -7,6 +7,9 @@ import { createDesktopSettings } from '../scripts/desktop-settings.mjs';
 import { createClaudeReset } from '../scripts/claude-reset.mjs';
 import { createClaudeProxySettings } from '../scripts/claude-proxy-settings.mjs';
 
+// Windows GUI launches can inherit a closed stderr pipe. Logging failure must
+// leave the control service and its network recovery loop running.
+process.stderr.on('error', () => {});
 console.log = console.info = console.debug = console.error;
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const devURL = process.env.CHECKCC_DESKTOP_DEV_URL;
@@ -15,7 +18,7 @@ if (devURL && new URL(devURL).origin !== origin) throw new Error('开发页面�
 if (!process.env.CHECKCC_DESKTOP_USER_DATA) throw new Error('缺少桌面用户数据目录。');
 process.env.CHECKCC_STATE_DIR ||= path.join(process.env.CHECKCC_DESKTOP_USER_DATA, 'state');
 process.env.CHECKCC_NODE_EXECUTABLE = process.execPath;
-let helper, gateway, site, settings, powerTimer, stopping, kernel, resetPending = false;
+let helper, gateway, site, settings, powerTimer, stopping, kernel, servicesReady, resetPending = false;
 let queue = Promise.resolve(), shutdownRequested = false;
 let finishStartup;
 const startupFinished = new Promise(resolve => { finishStartup = resolve; });
@@ -40,7 +43,7 @@ async function report() {
   if (!response.ok) throw new Error('无法确认保护状态。');
   return response.json();
 }
-const closeRuntime = createShutdown({ restore: () => helper?.closeRuntime(), closeServices: async () => {
+const closeRuntime = createShutdown({ restore: () => helper?.closeRuntime({ kernelWillStop: true }), closeServices: async () => {
     clearInterval(powerTimer);
     // 退出时必须把定时器与内核一并关掉：否则进程退了、内核仍在接管流量（实测事故）。
     kernel?.stopAutoRefresh?.();
@@ -53,6 +56,10 @@ const closeRuntime = createShutdown({ restore: () => helper?.closeRuntime(), clo
     await closeServer(site);
 } });
 async function close() {
+  kernel?.cancelPending?.();
+  // 启动中的后台任务会在下一个检查点看到 stopping 后退出；这里不等待它，
+  // 否则退出会被内核/TUN 启动拖住几十秒。
+  void servicesReady?.catch(() => {});
   stopping = closeRuntime().catch(error => { stopping = null; throw error; });
   return stopping;
 }
@@ -97,14 +104,6 @@ try {
     root,
     logger: (line) => console.error('[net-core]', line),
   });
-  if (kernel.enabled) {
-    if (!await kernel.start()) console.error('[net-core] 内核未能启动，页面会显示未启用原因。');
-    else kernel.connectionLog?.start();
-    kernel.startAutoRefresh?.();
-    kernel.startPublicDnsSync?.();
-  } else {
-    console.error('[net-core] 未启用：', kernel.reason);
-  }
   gateway = createGateway({ netCore: kernel });
   await new Promise((resolve, reject) => { gateway.once('error', reject); gateway.listen(devURL ? 3010 : 0, '127.0.0.1', resolve); });
   process.env.CHECKCC_GATEWAY_URL = `http://127.0.0.1:${gateway.address().port}`;
@@ -117,17 +116,11 @@ try {
     origin = `http://127.0.0.1:${site.address().port}`;
     headers.Origin = origin;
   }
-  // 每次启动都执行启动策略：已有会话要 resume 重新应用（退出时已恢复系统时区），不能只看状态。
-  await report();
-  {
-    const response = await fetch(helper.url + '/session?tokenOnly=1', { headers });
-    const session = await response.json();
-    const configured = await fetch(helper.url + '/protection', { method: 'POST', headers: { ...headers, 'Content-Type': 'application/json', 'X-CheckCC-Token': session.token }, body: JSON.stringify({ action: 'startup', enabled: settings.autoStartProtection }), signal: AbortSignal.timeout(120000) });
-    if (!configured.ok) throw new Error('无法应用启动保护设置：' + (await configured.json()).error);
-  }
-  powerTimer = setInterval(() => { void report().then(value => protocol.send({ type: 'power', enabled: Boolean(value.enabled || value.desiredEnabled) })).catch(() => {}); }, 2500);
-  powerTimer.unref();
+  // 页面能访问就先出窗口：内核启动与应用启动保护可能耗时几十秒（等宿主、建 TUN、验证出口），
+  // 不能把它们挡在窗口前面，否则用户看到托盘图标却半分钟没有界面。
   protocol.send({ type: 'ready', url: origin, ports });
+  finishStartup();
+  servicesReady = startServices().catch(error => console.error('[desktop] 后台启动未完成：', error.message));
 } catch (error) {
   console.error('[desktop] 启动失败：', error.message);
   try { await close(); } catch (cleanup) { console.error('[desktop] 配置恢复未完成，备份已保留：', cleanup.message); }
@@ -135,5 +128,29 @@ try {
   process.exitCode = 1;
   protocol.close();
 } finally { finishStartup(); }
+
+// 内核启动与「应用启动保护」放在窗口之后执行；出错只记录真实原因，页面会按时轮询到。
+async function startServices() {
+  if (stopping) return;
+  if (kernel.enabled) {
+    if (!await kernel.start()) console.error('[net-core] 内核未能启动，页面会显示未启用原因。');
+    else kernel.connectionLog?.start();
+    if (stopping) return;
+    kernel.startAutoRefresh?.();
+    kernel.startPublicDnsSync?.();
+  } else {
+    console.error('[net-core] 未启用：', kernel.reason);
+  }
+  // 每次启动都执行启动策略：已有会话要 resume 重新应用（退出时已恢复系统时区），不能只看状态。
+  await report();
+  if (stopping) return;
+  const response = await fetch(helper.url + '/session?tokenOnly=1', { headers });
+  const session = await response.json();
+  const configured = await fetch(helper.url + '/protection', { method: 'POST', headers: { ...headers, 'Content-Type': 'application/json', 'X-CheckCC-Token': session.token }, body: JSON.stringify({ action: 'startup', enabled: settings.autoStartProtection }), signal: AbortSignal.timeout(120000) });
+  if (!configured.ok) throw new Error('无法应用启动保护设置：' + (await configured.json()).error);
+  if (stopping) return;
+  powerTimer = setInterval(() => { void report().then(value => protocol.send({ type: 'power', enabled: Boolean(value.enabled || value.desiredEnabled) })).catch(() => {}); }, 2500);
+  powerTimer.unref();
+}
 process.once('SIGTERM', () => { void orphaned(); });
 process.once('SIGINT', () => { void orphaned(); });

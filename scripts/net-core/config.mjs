@@ -22,6 +22,9 @@ export const CLAUDE_DOMAINS = [
 ];
 
 export const DEFAULT_GROUP = "CLAUDE-PIN";
+// Claude 专用闸门：成员只有「固定出口组」和内置 REJECT。运行时用一次 PUT 切换选择，
+// 就能在不重载配置（force 重载会关掉全部连接）的前提下阻断/放行 Claude 域名。
+export const CLAUDE_GUARD_GROUP = "CLAUDE-GUARD";
 // 非 Claude 流量的兜底组：必须能自动故障转移，绝不能是只含一个节点的 select。
 export const DEFAULT_AUTO_GROUP = "AUTO-PROXY";
 export const DEFAULT_AUTO_GROUP_TYPE = "fallback";
@@ -134,6 +137,7 @@ export function buildKernelConfig({
   proxies,
   selected,
   groupName = DEFAULT_GROUP,
+  guardGroupName = CLAUDE_GUARD_GROUP,
   apiPort = 9090,
   secret = "",
   domains = CLAUDE_DOMAINS,
@@ -223,6 +227,9 @@ export function buildKernelConfig({
   if (autoGroupName === groupName) throw new Error("自动出口组不能与 Claude 专用出口组同名。");
   if (!AUTO_GROUP_TYPES.has(autoGroupType)) throw new Error(`自动出口组类型必须是 fallback 或 url-test（当前 ${autoGroupType}）；固定出口无法在节点故障时转移，会让境外流量整体中断。`);
   if (names.includes(autoGroupName) || autoGroupName === LOCAL_DNS_PROXY || autoGroupName === LOCAL_DIRECT_PROXY) throw new Error(`自动出口组名称 ${autoGroupName} 与节点或保留名称冲突。`);
+  if (typeof guardGroupName !== "string" || !guardGroupName.trim()) throw new Error("Claude 守卫组名称必须是非空字符串。");
+  if (guardGroupName === groupName || guardGroupName === autoGroupName) throw new Error("Claude 守卫组不能与固定出口组或兜底组同名。");
+  if (names.includes(guardGroupName) || guardGroupName === LOCAL_DNS_PROXY || guardGroupName === LOCAL_DIRECT_PROXY) throw new Error(`Claude 守卫组名称 ${guardGroupName} 与节点或保留名称冲突。`);
   const check = { ...DEFAULT_HEALTH_CHECK, ...healthCheck };
   if (!/^https?:\/\/\S+$/.test(String(check.url))) throw new Error("健康检查 url 必须是 http/https 地址。");
   if (!Number.isInteger(check.interval) || check.interval < 30 || check.interval > 3600) throw new Error("健康检查 interval 必须是 30 到 3600 秒之间的整数。");
@@ -230,7 +237,9 @@ export function buildKernelConfig({
   if (typeof check.lazy !== "boolean") throw new Error("健康检查 lazy 必须是布尔值。");
 
   // 置顶规则在前，订阅规则在后：mihomo 按顺序匹配，先命中的生效。
-  const pinnedRules = pinned.map((domain) => `DOMAIN-SUFFIX,${domain},${groupName}`);
+  // Claude 域名走守卫组而不是直接走出口组：守卫组可以在运行时被切到 REJECT，
+  // 既不重载配置也不影响其他流量，出口探测仍固定走出口组。
+  const pinnedRules = pinned.map((domain) => `DOMAIN-SUFFIX,${domain},${guardGroupName}`);
   // 区域锁定：Claude 域名的 TCP 也直接拒绝，必须排在置顶代理规则之前。
   const claudeBlockRules = blockClaude ? pinned.map((domain) => `DOMAIN-SUFFIX,${domain},REJECT`) : [];
   // 出口探测：把探测主机钉死到 Claude 专用组，探测走已有混合入口即可复用主内核的
@@ -334,6 +343,12 @@ export function buildKernelConfig({
         type: "select",
         proxies: [initial, ...names.filter((name) => name !== initial)],
       },
+      {
+        // 阻断 Claude 只需把这里切到 REJECT；放行则切回固定出口组。
+        name: guardGroupName,
+        type: "select",
+        proxies: [groupName, "REJECT"],
+      },
       ...(usesAutoGroup ? [{
         name: autoGroupName,
         type: effectiveAutoType,
@@ -396,6 +411,8 @@ export function strictKernelConfig(config, { blockClaude = false } = {}) {
   const candidate = structuredClone(config);
   if (typeof candidate.secret !== "string" || candidate.secret.length < 32) throw new Error("严格模式需要有效的控制器及本机代理认证。");
   candidate.authentication = [`egcc:${candidate.secret}`];
+  // 严格模式本来就要断掉全部非节点流量，不需要运行时闸门；规则直接指向固定出口组。
+  candidate["proxy-groups"] = (candidate["proxy-groups"] ?? []).filter(item => item?.name !== CLAUDE_GUARD_GROUP);
   const group = candidate["proxy-groups"]?.find(item => item.name === DEFAULT_GROUP && item.type === "select");
   if (!group?.proxies?.length) throw new Error("严格模式缺少固定出口。");
   group.proxies = [group.proxies[0]];
@@ -431,7 +448,7 @@ export function assertStrictKernelConfig(config) {
   if (config.listeners?.length) throw new Error("严格模式不得暴露额外的本机入站。");
   return config;
 }
-export function assertKernelConfig(config, { groupName = DEFAULT_GROUP, domains = CLAUDE_DOMAINS, strictRoute = true, egressMode, autoGroupName = DEFAULT_AUTO_GROUP, sniffer = true, blockStun = true, requireTlsFingerprint = true, blockClaude = false } = {}) {
+export function assertKernelConfig(config, { groupName = DEFAULT_GROUP, guardGroupName = CLAUDE_GUARD_GROUP, domains = CLAUDE_DOMAINS, strictRoute = true, egressMode, autoGroupName = DEFAULT_AUTO_GROUP, sniffer = true, blockStun = true, requireTlsFingerprint = true, blockClaude = false } = {}) {
   if (!config || typeof config !== "object") throw new Error("内核配置为空。");
   assertIpv6Config(config);
   if (sniffer) {
@@ -455,13 +472,22 @@ export function assertKernelConfig(config, { groupName = DEFAULT_GROUP, domains 
   const names = new Set((config.proxies ?? []).map((node) => node?.name));
   if (!group.proxies?.length) throw new Error("出口组没有节点。");
   for (const name of group.proxies) if (!names.has(name)) throw new Error(`出口组引用了不存在的节点 ${name}。`);
+  if (guardGroupName) {
+    const guard = groups.find((item) => item?.name === guardGroupName);
+    if (!guard) throw new Error(`缺少 Claude 守卫组 ${guardGroupName}。`);
+    if (guard.type !== "select") throw new Error("Claude 守卫组必须是 select，否则不能在运行时零重载切换阻断。");
+    const members = guard.proxies ?? [];
+    if (members.length !== 2 || !members.includes(groupName) || !members.includes("REJECT")) throw new Error("Claude 守卫组只能包含固定出口组与 REJECT。");
+  }
+  // Claude 域名的置顶规则指向守卫组；没有守卫组时（严格模式/旧配置）仍指向出口组。
+  const ruleTarget = guardGroupName || groupName;
 
   const rules = config.rules ?? [];
   if (!rules.length) throw new Error("规则列表为空。");
   const pinnedDomains = normalizeDomains(domains);
-  const pinned = pinnedDomains.map((domain) => `DOMAIN-SUFFIX,${domain},${groupName}`);
+  const pinned = pinnedDomains.map((domain) => `DOMAIN-SUFFIX,${domain},${ruleTarget}`);
   for (const domain of pinnedDomains) {
-    const rule = `DOMAIN-SUFFIX,${domain},${groupName}`;
+    const rule = `DOMAIN-SUFFIX,${domain},${ruleTarget}`;
     if (!rules.includes(rule)) throw new Error(`缺少置顶规则 ${rule}。`);
     const quic = `AND,((NETWORK,udp),(DST-PORT,443),(DOMAIN-SUFFIX,${domain})),REJECT`;
     if (!rules.includes(quic)) throw new Error(`缺少 QUIC 阻断规则 ${quic}。`);
