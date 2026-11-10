@@ -48,6 +48,7 @@ const STATE_LABELS = {
   running: ["运行中", "Running"],
   unavailable: ["状态不可读", "Status unavailable"],
   off: ["未接入", "Not connected"],
+  starting: ["启动中", "Starting"],
 };
 
 function normalizeViolation(item) {
@@ -159,6 +160,14 @@ export function netCoreView(report, { locale = "zh", exitHistory = null } = {}) 
       tone: "danger",
       title: t("内核启动失败", "Kernel failed to start"),
       detail: report.reason || t("未提供失败原因。", "No failure reason reported."),
+    };
+  } else if (state === "starting") {
+    // 启动阶段（建隧道、验证出口）比页面加载慢：告诉用户正在做什么，而不是报未启动。
+    tone = "muted";
+    conclusion = {
+      tone: "muted",
+      title: t("网络内核正在启动", "Network kernel is starting"),
+      detail: report.reason || t("正在建立隧道并验证出口，完成后自动刷新。", "Establishing the tunnel and verifying the exit; this view refreshes automatically."),
     };
   } else if (state === "idle") {
     // 内核停止 = 没有 TUN 接管：这是「关闭保护后恢复直连」的正常态，不是故障。

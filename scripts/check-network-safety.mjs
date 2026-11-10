@@ -138,6 +138,8 @@ async function fakeRuntime(t, takeover = { prepare: async () => {}, status: () =
   let failRestore = false;
   let failDisable = false;
   let selectedNode = null;
+  // Claude 守卫组的当前选择：切 REJECT 不应影响固定出口节点。
+  let guardSelection = 'CLAUDE-PIN';
   const runtime = await createKernelRuntime({
     stateDir: dir,
     takeover,
@@ -172,6 +174,8 @@ async function fakeRuntime(t, takeover = { prepare: async () => {}, status: () =
       if (options.configPath.endsWith("probe.yaml")) return { start: async () => { if (!ipv6Supported) throw new Error("test probe disabled"); }, stop: async () => {} };
       capturedSecret = options.secret;
       let running = false, config;
+      // 守卫组选择与固定出口节点分开记：切 REJECT 不应该影响出口选择。
+      const proxiesState = () => ({ 'CLAUDE-PIN': { type: 'Selector', now: selectedNode }, 'CLAUDE-GUARD': { type: 'Selector', now: guardSelection } });
       return {
         start: async () => {
           starts++; maxStarts = Math.max(maxStarts, starts);
@@ -180,6 +184,7 @@ async function fakeRuntime(t, takeover = { prepare: async () => {}, status: () =
             if (failNext) { failNext = false; throw new Error("injected launch failure"); }
             config = yaml(await readFile(options.configPath, "utf8"));
             selectedNode = config['proxy-groups'][0].proxies[0];
+            guardSelection = 'CLAUDE-PIN';
             running = true;
             healthBroken = false;
             launches++;
@@ -189,15 +194,18 @@ async function fakeRuntime(t, takeover = { prepare: async () => {}, status: () =
         state: () => ({ running }),
         status: async () => {
           if (!running || healthBroken) throw new Error("not running");
-          return { version: "test", connections: [], proxies: { proxies: { "CLAUDE-PIN": { now: config["proxy-groups"][0].proxies[0] } } } };
+          return { version: "test", connections: [], proxies: { proxies: proxiesState() } };
         },
         request: async url => {
           if (url === '/configs') return config;
-          if (url === '/proxies') return { proxies: { 'CLAUDE-PIN': { now: selectedNode } } };
+          if (url === '/proxies') return { proxies: proxiesState() };
           const name = decodeURIComponent(url.split('/')[2] ?? '');
           return { delay: Object.hasOwn(nodeDelays, name) ? nodeDelays[name] : 1 };
         },
-        selectProxy: async (_group, name) => { config['proxy-groups'][0].proxies = [name]; selectedNode = name; },
+        selectProxy: async (group, name) => {
+          if (group === 'CLAUDE-GUARD') { guardSelection = name; return true; }
+          config['proxy-groups'][0].proxies = [name]; selectedNode = name;
+        },
         tunnelStatus: async () => ({ active: tunnelActive }),
         reloadFromFile: async () => {
           config = yaml(await readFile(options.configPath, "utf8"));
@@ -213,6 +221,7 @@ async function fakeRuntime(t, takeover = { prepare: async () => {}, status: () =
     tick: async () => { await scheduled?.(); }, disconnect: () => { healthBroken = true; },
     switchNetwork: () => { interfaceAddress = "192.0.2.11"; }, launches: () => launches,
     ipv6Disabled: () => ipv6Disabled, setIpv6Supported: value => { ipv6Supported = value; },
+    guard: () => guardSelection,
     failIpv6Restore: value => { failRestore = value; },
     failIpv6Disable: value => { failDisable = value; },
   };
@@ -375,7 +384,9 @@ test('供应商筛选失败回滚后仍保持原来的未保护阻断', async t 
   await assert.rejects(f.runtime.activateSource(imported.sourceId), /没有.*Claude.*节点/);
   assert.equal((await f.runtime.report()).unprotectedGuard.active, true);
   const config = yaml(await readFile(path.join(f.dir, 'net-core/config.yaml'), 'utf8'));
-  assert.ok(config.rules.includes('DOMAIN-SUFFIX,claude.ai,REJECT'));
+  // 回滚后阻断必须还在，但要走运行时守卫组，而不是把 REJECT 写进配置（写配置会全量重载、断掉所有连接）。
+  assert.equal(f.guard(), 'REJECT');
+  assert.equal(config.rules.includes('DOMAIN-SUFFIX,claude.ai,REJECT'), false);
 });
 
 test('IPv6 支持时启用双栈，换到未确认节点时关闭系统 IPv6，停止时恢复', async t => {
@@ -560,8 +571,10 @@ test("未保护阻断保持系统接管并拒绝 Claude 域名", async t => {
   assert.equal(blocked.claudeBlocked, true);
   assert.equal(blocked.tunEnabled, true, "阻断必须建立在真实的系统接管上");
   const config = yaml(await readFile(path.join(f.dir, "net-core/config.yaml"), "utf8"));
+  // Claude 阻断走运行时守卫组：零重载切换，其他流量完全不受影响。
+  assert.equal(f.guard(), 'REJECT');
   for (const domain of ["anthropic.com", "claude.ai", "claude.com", "claudeusercontent.com"]) {
-    assert.ok(config.rules.includes(`DOMAIN-SUFFIX,${domain},REJECT`), `${domain} 必须被拒绝`);
+    assert.equal(config.rules.includes(`DOMAIN-SUFFIX,${domain},REJECT`), false, `${domain} 不得把阻断写进配置`);
   }
   await assert.rejects(f.runtime.setTunnel(false), /保护未开启/);
 
@@ -592,6 +605,25 @@ test("节点配置启动失败恢复旧文件，不能返回导入成功", async
   assert.equal(await readFile(path.join(f.dir, "net-nodes.json"), "utf8"), before);
   assert.deepEqual((await f.runtime.report()).nodes, ["a"]);
   assert.equal((await f.runtime.report()).state, "running");
+});
+
+test("网络抖动只阻断 Claude，不重建内核（重建会断掉全部流量且耗时长）", async t => {
+  const f = await fakeRuntime(t, undefined, { host: true });
+  await f.runtime.importNodes([node("a")]);
+  await f.runtime.setTunnel(true);
+  const launches = f.launches();
+  // 模拟断网 1 秒：隧道探测失败，但内核进程本身是好的。
+  f.setTunnelActive(false);
+  await f.tick();
+  assert.equal(f.launches(), launches, "网络抖动不得重建内核");
+  assert.equal(f.guard(), "REJECT", "抖动期间只阻断 Claude");
+  assert.equal((await f.runtime.report()).regionLock?.type, "network", "按自动复检的网络锁处理");
+  // 网络恢复：出口复检通过就立刻放行，全程不重启内核。
+  f.setTunnelActive(true);
+  const released = await f.runtime.unlockRegion();
+  assert.equal(released.exit?.countryCode, "SG");
+  assert.equal(f.guard(), "CLAUDE-PIN");
+  assert.equal(f.launches(), launches, "放行同样不重建内核");
 });
 
 test("后台脱离页面恢复内核，切网使旧证据失效，显式停止后不自动重启", async t => {

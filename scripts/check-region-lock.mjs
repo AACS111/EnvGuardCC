@@ -68,19 +68,39 @@ async function runLockFlow(t, platform, scenario) {
       CHECKCC_NET_CORE_DNS: "https://192.0.2.53/dns-query",
       CHECKCC_NET_CORE_API_PORT: String(apiPort), CHECKCC_NET_CORE_MIXED_PORT: String(mixedPort),
       CHECKCC_NET_CORE_EXIT_PROBE_URL: endpoint,
-      // 缩短自动复检间隔，让回归测试不必真的等 10 秒。
+      // 缩短自动复检间隔与抢修窗口，让回归测试不必真的等几分钟。
       CHECKCC_NET_CORE_EXIT_CHECK_MS: "400",
+      CHECKCC_NET_CORE_RECOVERY_WINDOW_MS: "0",
     },
     healthScheduler: { every: callback => { scheduled = callback; return { unref() {} }; }, clear: () => { scheduled = null; } },
   });
   const configFile = path.join(dir, "net-core", "config.yaml");
   const hasReject = async () => (await fs.readFile(configFile, "utf8").catch(() => "")).includes("DOMAIN-SUFFIX,claude.ai,REJECT");
-  // 等过一个复检周期再触发健康检查，模拟时间推进。
-  const tick = async () => { await new Promise((resolve) => setTimeout(resolve, 450)); await scheduled?.(); };
+  // 阻断改走运行时守卫组：断言它真的切到了 REJECT，而不是靠重载配置。
+  const guardBlocked = async () => (await runtime.report()).claudeGuard === "blocked";
+  // 等过一个复检周期再触发健康检查，模拟时间推进；并行跑测试时不能只靠固定延时（健康检查可能被上一轮占用）。
+  const lockProgress = async () => { const lock = (await runtime.report()).regionLock; return lock?.locked ? (lock.recheckAttempts ?? 0) : -1; };
+  const tick = async () => {
+    const before = await lockProgress();
+    const deadline = Date.now() + 8000;
+    while (Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 120));
+      await scheduled?.();
+      if (await lockProgress() !== before) return;
+    }
+    throw new Error("自动复检未在 8 秒内产生新证据。");
+  };
   try {
     await runtime.importNodes([{ name: "fake-node", type: "http", server: "127.0.0.1", port: proxy.port }], { selected: "fake-node" });
     assert.equal(await runtime.start(), true);
-    await scenario({ runtime, proxy, hasReject, tick });
+    // 并行跑整套测试时首次出口探测可能超时（内核启动慢）：多复检几轮，直到拿到「网络锁 + 明确出口国家」。
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      const lock = (await runtime.report()).regionLock;
+      if (lock?.locked && lock.countryCode) break;
+      await tick();
+    }
+    assert.equal((await runtime.report()).regionLock?.countryCode, "HK", "测试前置：网络锁必须记录到出口国家");
+    await scenario({ runtime, proxy, hasReject, guardBlocked, tick });
   } finally {
     await runtime.stop().catch(() => {});
     await proxy.close();
@@ -88,30 +108,37 @@ async function runLockFlow(t, platform, scenario) {
   }
 }
 
-const autoRecoverScenario = async ({ runtime, proxy, hasReject, tick }) => {
+const autoRecoverScenario = async ({ runtime, proxy, hasReject, guardBlocked, tick }) => {
   const locked = await runtime.report();
   assert.equal(locked.regionLock?.locked, true, "HK 出口必须锁定");
   // 启动时的一次探测失败/异常只能算是「无法确认出口」，不能一步跳到必须人工解除的地区锁。
   assert.equal(locked.regionLock?.type, "network", "单次异常先按网络锁处理");
   assert.equal(locked.regionLock?.autoRecover, true);
   assert.equal(locked.regionLock?.countryCode, "HK");
-  assert.equal(await hasReject(), true, "锁定时必须写入 Claude REJECT");
+  assert.equal(await guardBlocked(), true, "锁定时必须把 Claude 守卫组切到 REJECT");
+  assert.equal(await hasReject(), false, "网络锁不得靠重载配置来阻断 Claude");
   // 网络恢复：用户什么都不点，下一次自动复检通过就立即解除。
   proxy.setCountry("SG");
   await tick();
   const after = await runtime.report();
   assert.equal(after.regionLock?.locked, false, "网络一恢复就自动解除，不需要手动复检");
-  assert.equal(await hasReject(), false, "自动解除后不得残留 REJECT");
+  assert.equal(await guardBlocked(), false, "自动解除后必须把守卫组切回固定出口");
+  assert.equal(await hasReject(), false, "网络锁解除同样不重载配置");
 };
 
-const escalateScenario = async ({ runtime, proxy, hasReject, tick }) => {
-  await tick(); // 第 2 次确认
-  await tick(); // 第 3 次确认：升级为地区锁
+const escalateScenario = async ({ runtime, proxy, hasReject, guardBlocked, tick }) => {
+  // 单次复检不足以升级：第一次仍然是可自动解除的网络锁。
+  await tick();
+  assert.equal((await runtime.report()).regionLock?.type, "network", "一次确认不得升级为地区锁");
+  // 继续确认直到升级（并行负载下每次复检耗时不完全一致，按状态等而不是数次数）。
+  const deadline = Date.now() + 20000;
+  while (Date.now() < deadline && (await runtime.report()).regionLock?.type !== "region") await tick();
   const escalated = await runtime.report();
   assert.equal(escalated.regionLock?.locked, true);
   assert.equal(escalated.regionLock?.type, "region", "连续三次探到不支持地区才升级");
   assert.equal(escalated.regionLock?.autoRecover, false);
-  assert.equal(await hasReject(), true);
+  assert.equal(await guardBlocked(), true);
+  assert.equal(await hasReject(), false, "地区锁同样走守卫组，不重载配置");
   // 地区锁代表出口确实不受支持：网络恢复也不会自动解除，必须人工确认新出口。
   proxy.setCountry("SG");
   await tick();

@@ -11,7 +11,7 @@ import os from "node:os";
 import path from "node:path";
 import { randomBytes } from "node:crypto";
 import { execFile } from "node:child_process";
-import { DEFAULT_AUTO_GROUP, DEFAULT_FAKE_IP_RANGE, DEFAULT_GROUP, DEFAULT_ROUTE_EXCLUSIONS, LOCAL_DIRECT_PROXY, assertKernelConfig, buildKernelConfig, ingressSummary, inIpv4Range, serializeKernelConfig, strictKernelConfig } from "./config.mjs";
+import { DEFAULT_AUTO_GROUP, DEFAULT_FAKE_IP_RANGE, DEFAULT_GROUP, CLAUDE_GUARD_GROUP, DEFAULT_ROUTE_EXCLUSIONS, LOCAL_DIRECT_PROXY, assertKernelConfig, buildKernelConfig, ingressSummary, inIpv4Range, serializeKernelConfig, strictKernelConfig } from "./config.mjs";
 import { migrateStore, pickActive, publicSources, removeSource, renameSource, serializeStore, upsertSource } from "./sources.mjs";
 import { isClaudeHost, listConnections, routingEvidence, routingSummary } from "./routes.mjs";
 import { publicDnsForCountry, resolvePublicDns } from "./public-dns.mjs";
@@ -341,11 +341,13 @@ export async function createKernelRuntime({ stateDir, env = process.env, root, l
   // 区域锁定只保留在本次运行内：出口落回 Claude 不支持地区后，配置里直接 REJECT
   // Claude 域名。应用彻底退出时不留下任何锁定状态，下次启动按当前出口重新检测。
   let regionLock = null;
-  // 复检节奏：未锁定 30 秒一次；断开后前 3 分钟每 5 秒抢修一次，之后降频。
+  // 复检节奏：未锁定 30 秒一次；断开后前 5 分钟每 5 秒抢修一次，之后降频。
   // CHECKCC_NET_CORE_EXIT_CHECK_MS 可供回归/诊断缩短间隔（下限 250ms）。
   const EXIT_CHECK_MS = Math.max(250, Number(env.CHECKCC_NET_CORE_EXIT_CHECK_MS) || 30000);
   const FAST_RECHECK_MS = Math.min(5000, EXIT_CHECK_MS);
-  const FAST_RECHECK_WINDOW_MS = 3 * 60 * 1000;
+  // 抢修窗口默认 5 分钟；可用 CHECKCC_NET_CORE_RECOVERY_WINDOW_MS 缩短（回归测试用）。
+  const RECOVERY_WINDOW_MS = Number(env.CHECKCC_NET_CORE_RECOVERY_WINDOW_MS);
+  const FAST_RECHECK_WINDOW_MS = Number.isFinite(RECOVERY_WINDOW_MS) && RECOVERY_WINDOW_MS >= 0 ? RECOVERY_WINDOW_MS : 5 * 60 * 1000;
   const LOCKED_EXIT_CHECK_MS = Math.min(15000, EXIT_CHECK_MS);
   // 「出口不在支持地区」会把人卡在必须手动处理的路径上，必须连续多次确认才算数。
   const REGION_ESCALATION_STREAK = 3;
@@ -387,8 +389,11 @@ export async function createKernelRuntime({ stateDir, env = process.env, root, l
   // 出口复检证据：单次探测结果不足以判定锁/解锁，只有连续结果才做决定。
   let nextExitCheckAt = 0;
   let exitEvidence = { supported: 0, unsupported: 0, failures: 0, lastAt: null, lastError: null };
-  // 锁定开始时间：用于「断开 3 分钟内 5 秒抢修」的窗口计算。
+  // 锁定开始时间：用于「断开 5 分钟内 5 秒抢修」的窗口计算。
   let guardBlockedAt = null;
+  // Claude 守卫组的当前选择：true=已切到 REJECT（只影响 Claude 域名），false=走固定出口。
+  // 守卫组切换是内核 API 调用，不重载配置，因此不会断开其他流量。
+  let claudeGuardBlocked = false;
   // 最近一次验证通过的节点：出口异常时先回切到它，而不是直接升级成地区锁。
   let lastVerifiedNode = null;
   const connectionLog = await createConnectionLog({ stateDir, logger,
@@ -405,6 +410,8 @@ export async function createKernelRuntime({ stateDir, env = process.env, root, l
       systemKillSwitch: Boolean(guardFresh), strictTravel: Boolean(strictEnabled && guardFresh && state === "verified"), strictEnabled,
       regionLocked: Boolean(regionLock), regionLock: regionLock ? { ...regionLock } : null,
       claudeBlocked: claudeBlocked(), unprotectedGuard: unprotectedLock ? { ...unprotectedLock } : null,
+      // 守卫组真实选择：blocked 表示 Claude 域名在内核里被切到了 REJECT（不重载配置）。
+      claudeGuard: claudeGuardBlocked ? "blocked" : "open",
     };
   }
   const serialize = (action, mutating = true) => (...args) => {
@@ -438,7 +445,7 @@ export async function createKernelRuntime({ stateDir, env = process.env, root, l
   const currentGroupNode = async () => (await core?.request("/proxies").catch(() => null))?.proxies?.[DEFAULT_GROUP]?.now ?? null;
   /** 网络变化/换节点后旧证据作废，并允许立刻复检。 */
   const resetExitEvidence = () => { exitEvidence = { supported: 0, unsupported: 0, failures: 0, lastAt: null, lastError: null }; nextExitCheckAt = 0; };
-  /** 探测失败按 5→10→20 秒退避；断开后前 3 分钟 5 秒一次，之后 15 秒，未锁定 30 秒。 */
+  /** 探测失败按 5→10→20 秒退避；断开后前 5 分钟 5 秒一次，之后 15 秒，未锁定 30 秒。 */
   function scheduleExitCheck() {
     const now = Date.now();
     const locked = Boolean(regionLock) || (strictEnabled && hostGuard?.phase !== "active");
@@ -454,12 +461,36 @@ export async function createKernelRuntime({ stateDir, env = process.env, root, l
     guardBlockedAt = Date.now();
     return hostAction("guard-block");
   }
-  /** 记录锁定期间的一次自动复检：只更新进度，不重建内核配置（避免每轮都重载）。 */
+  /**
+   * 网络恢复窗口：网络刚断开/刚锁定的 5 分钟。期间只重试连接与出口复检，不重建内核、
+   * 不升级地区锁——重建内核和全量重载都会把全部流量断掉，正是「一波动就全断」的来源。
+   */
+  const recoveryWindowStart = () => (regionLock ? Date.parse(regionLock.at ?? "") : guardBlockedAt ?? 0) || 0;
+  function inFastRecoveryWindow() {
+    const at = recoveryWindowStart();
+    return at > 0 && Date.now() - at < FAST_RECHECK_WINDOW_MS;
+  }
+  /** 只切换 Claude 守卫组：阻断/放行 Claude 域名，不重载配置、不影响其他连接。 */
+  async function setClaudeGuard(blocked) {
+    if (!core || typeof core.selectProxy !== "function") return false;
+    await core.selectProxy(CLAUDE_GUARD_GROUP, blocked ? "REJECT" : DEFAULT_GROUP);
+    claudeGuardBlocked = blocked;
+    return true;
+  }
+  /** 锁定期间把守卫组切到 REJECT；失败只记日志，锁状态仍然生效。 */
+  async function applyClaudeGuard(blocked) {
+    if (!core || strictEnabled) return false;
+    try { return await setClaudeGuard(blocked); }
+    catch (error) { logger(`[net-core] Claude 守卫组切换失败：${error.message}`); return false; }
+  }
   function noteLockRecheck(exit) {
     if (!regionLock) return null;
     const supported = claudeRegionSupport(exit?.countryCode) === "supported";
     regionLock = {
       ...regionLock,
+      // 复检一旦看到明确出口就把国家/IP 补上：界面和升级判定都靠它。
+      ...(exit?.countryCode ? { countryCode: exit.countryCode.toUpperCase() } : {}),
+      ...(exit?.ip ? { ip: exit.ip } : {}),
       recheckAttempts: (regionLock.recheckAttempts ?? 0) + 1,
       recheckAt: new Date().toISOString(),
       recheckProbe: exit?.ip ? { ip: exit.ip, countryCode: exit.countryCode ?? null } : null,
@@ -538,7 +569,7 @@ export async function createKernelRuntime({ stateDir, env = process.env, root, l
     await failbackToVerifiedNode().catch((error) => logger(`[net-core] 回切验证节点失败：${error.message}`));
     if (!regionLock) await lockRegion(exit, { type: "network", reason: unsupportedExitReason(exit.countryCode, exitEvidence.unsupported) });
     else noteLockRecheck(exit);
-    if (regionLock?.type === "network" && exitEvidence.unsupported >= REGION_ESCALATION_STREAK) {
+    if (regionLock?.type === "network" && exitEvidence.unsupported >= REGION_ESCALATION_STREAK && !inFastRecoveryWindow()) {
       await lockRegion(exit, { type: "region" });
       logger(`[net-core] 连续 ${exitEvidence.unsupported} 次确认出口不受支持，升级为地区锁。`);
     }
@@ -547,6 +578,7 @@ export async function createKernelRuntime({ stateDir, env = process.env, root, l
   }
   async function checkHealth() {
     if (!healthTimer || !core) return;
+    let failureStage = "probe";
     const key = interfacesKey();
     if (networkKey !== key) {
       networkKey = key;
@@ -577,8 +609,11 @@ export async function createKernelRuntime({ stateDir, env = process.env, root, l
       }
       // 出口复检对严格模式同样生效：锁定期间节奏更快，验证通过后自动放行；未保护阻断时不叠加。
       if (!unprotectedLock && Date.now() >= nextExitCheckAt) await recheckExit();
-      if (strictEnabled && hostGuard?.phase !== "active") throw new Error("严格模式保持阻断，等待连接复检。");
+      if (strictEnabled && hostGuard?.phase !== "active") { failureStage = "guard"; throw new Error("严格模式保持阻断，等待连接复检。"); }
+      // 到这里之后的失败才可能是内核本身的问题；之前的都只是网络/出口探测。
+      failureStage = "kernel";
       await core.status();
+      failureStage = "tunnel";
       lastTunnelCaptured = tunEnabled ? (await core.tunnelStatus()).active : null;
       if (tunEnabled && !lastTunnelCaptured) {
         // 未保护阻断已开启时不再叠加区域锁：两条规则都拦 Claude，错误原因会互相覆盖。
@@ -589,13 +624,21 @@ export async function createKernelRuntime({ stateDir, env = process.env, root, l
       lastError = null;
       healthFailures = 0;
     } catch (error) {
+      // 只有内核接口不可用/进程不在了才算内核坏了；隧道或出口探测失败多半只是网络刚断，
+      // 重建内核会断开全部流量而且耗时很长（用户实测：网络断 1 秒也要等半天）。
+      const kernelUnhealthy = failureStage === "kernel" || !core?.state().running;
       lastHealthAt = null;
       lastTunnelCaptured = null;
       lastError = `连接检查失败：${error.message}`;
       if (Date.now() < nextRecoveryAt) return;
       healthFailures++;
-      nextRecoveryAt = Date.now() + Math.min(60000, 2000 * 2 ** Math.min(healthFailures, 5));
+      // 抢修窗口内每 5 秒重试一次；窗口结束后才按退避重试。
+      nextRecoveryAt = Date.now() + (inFastRecoveryWindow() ? FAST_RECHECK_MS : Math.min(60000, 2000 * 2 ** Math.min(healthFailures, 5)));
       logger(`[net-core] ${lastError}，正在恢复（第 ${healthFailures} 次）。`);
+      // 网络波动期只继续复检（每 5 秒重试连接），不重建内核；兜底重建只在两种情况下发生：
+      // 内核进程/接口真的挂了，或 5 分钟抢修窗口已过而隧道仍未恢复。
+      const rebuild = kernelUnhealthy || (failureStage === "tunnel" && !inFastRecoveryWindow());
+      if (!rebuild) return;
       changing = true;
       try { await reloadKernel("后台恢复"); }
       finally { changing = false; }
@@ -692,7 +735,7 @@ export async function createKernelRuntime({ stateDir, env = process.env, root, l
     return resolvePublicDns({ node, probe: probeCountry });
   }
 
-  async function writeConfig() {
+  async function writeConfig({ forceBlockClaude = false } = {}) {
     const localNetwork = await loadLocalNetworkConfig(stateDir, env);
     appliedNetwork = fingerprintNetwork(localNetwork);
     const publicDns = strictEnabled ? (env.CHECKCC_NET_CORE_DNS?.split(",").filter(Boolean) || ["https://1.1.1.1/dns-query"]) : await publicDnsForSelection();
@@ -721,12 +764,13 @@ export async function createKernelRuntime({ stateDir, env = process.env, root, l
         // 订阅域名直连：机场按来源 IP 放行，走节点会被 403。放在 MATCH 之前即可生效。
         ...directHosts.map((host) => `DOMAIN-SUFFIX,${host},DIRECT`),
       ],
-      blockClaude: claudeBlocked(),
+      // 配置里 Claude 域名走守卫组；只有严格模式（或守卫组不可用的兜底）才把 REJECT 写进规则。
+      blockClaude: forceBlockClaude || (strictEnabled && claudeBlocked()),
       ipv6: shouldProtectIpv6(),
     });
     // 生成即校验：配置一旦不再满足置顶/select/故障转移的不变量，就在这里拒绝启动，
     // 而不是让内核带着“兜底单节点”跑起来、等节点掉线才暴露成境外全断。
-    assertKernelConfig(config, { egressMode, strictRoute: localNetwork.strictRoute ?? true, blockClaude: claudeBlocked() });
+    assertKernelConfig(config, { egressMode, strictRoute: localNetwork.strictRoute ?? true, blockClaude: forceBlockClaude || (strictEnabled && claudeBlocked()) });
     // 开发者默认不接管系统路由；显式设置 CHECKCC_NET_CORE_TUN=1 才启用。
     config.tun.enable = tunEnabled;
     const effective = strictEnabled ? strictKernelConfig(config, { blockClaude: claudeBlocked() }) : config;
@@ -913,6 +957,9 @@ export async function createKernelRuntime({ stateDir, env = process.env, root, l
     } else if (tunEnabled) await networkTakeover.prepare({ ports: [apiPort, mixedPort], proxyPort: mixedPort });
     core = createCore({ binary, homeDir, configPath, apiPort, secret: controllerSecret, verifyTunnel: () => tunEnabled && !strictEnabled && env.CHECKCC_NET_CORE_VERIFY_TUN !== "0", manageProcess: !hostMode, spawn, fetchImpl, lookup, logger });
     await core.start();
+    // 内核重启后选择器回到默认第一项（固定出口组）：已有的锁定/未保护阻断必须马上把
+    // 守卫组切回 REJECT，否则重启到健康检查之间的几秒内 Claude 会被放出去。
+    if (!strictEnabled && (regionLock || unprotectedLock)) await applyClaudeGuard(true);
     await confirmIpv6Protection();
     connectionLog.start();
     // 启动时就检查一次出口地区：配置已经落盘，但出口可能刚被故障转移到封禁地区。
@@ -993,6 +1040,7 @@ export async function createKernelRuntime({ stateDir, env = process.env, root, l
     lastTunnelCaptured = null;
     // 停止内核即停止接管：未保护阻断随内核一起结束，下次启动由保护服务重新建立。
     unprotectedLock = null;
+    claudeGuardBlocked = false;
     clearInterval(hostHeartbeat);
     hostHeartbeat = null;
     stopPublicDnsSync();
@@ -1266,6 +1314,8 @@ export async function createKernelRuntime({ stateDir, env = process.env, root, l
       ipv6: ipv6Probe ? { ...ipv6Probe, protected: false, system: ipv6Guard && !ipv6Guard.unconfirmed ? "disabled" : ipv6Protected ? "unchanged" : "unknown" } : null,
       regionLock: regionLock ? { ...regionLock } : { locked: false },
       claudeBlocked: claudeBlocked(),
+      // 守卫组真实选择：blocked=Claude 域名在内核里被切到 REJECT（不重载配置）。
+      claudeGuard: claudeGuardBlocked ? "blocked" : "open",
       unprotectedGuard: unprotectedLock ? { ...unprotectedLock } : null,
       strictMode: strictEnabled, guard: hostGuard,
       takeover: networkTakeover.status(),
@@ -1276,6 +1326,8 @@ export async function createKernelRuntime({ stateDir, env = process.env, root, l
     };
     if (reason) return { ...base, state: "disabled", reason };
     if (changing) {
+      // 启动阶段内核还没建起来：这是「启动中」，不能报成「状态不可读」吓人。
+      if (!core) return { ...base, state: "starting", reason: "网络内核正在启动，首次启动需要建立隧道并验证出口。" };
       const phase = networkTakeover.status().phase;
       const reason = phase === "quitting" ? "正在退出其他代理客户端，等待网络交接。" : phase === "waiting" ? "正在等待其他代理释放网络资源。" : phase === "checking" ? "正在检查其他 VPN 与端口占用。" : "网络配置正在切换，旧验证结果已失效。";
       return { ...base, state: "unavailable", reason };
@@ -1823,6 +1875,8 @@ export async function createKernelRuntime({ stateDir, env = process.env, root, l
           ...regionLock, type: "region", autoRecover: false, ip: exit?.ip ?? regionLock.ip, countryCode: code,
           reason: reason || defaultReason, recovered: 0, recheckAt: new Date().toISOString(),
         };
+        // 升级只需保持守卫组在 REJECT，不重载配置。
+        await applyClaudeGuard(true);
         logger(`[net-core] ${regionLock.reason}`);
         notifyClaude("EnvGuardCC：Claude 已阻断", regionLock.reason);
       }
@@ -1842,14 +1896,26 @@ export async function createKernelRuntime({ stateDir, env = process.env, root, l
       recheckAt: null,
     };
     if (core) {
-      try {
-        await writeConfig();
-        await core.reloadFromFile();
-        // 已建立的 Claude 连接也要断掉；只断 Claude，不动其他连接。
-        await closeClaudeConnections();
-      } catch (error) {
-        // 网络波动时热加载可能失败；锁状态保留，下一次健康检查会再次落盘并重载。
-        logger(`[net-core] 锁定配置热加载失败：${error.message}`);
+      if (strictEnabled) {
+        // 严格模式：REJECT 必须写进规则，它本来就要断掉全部非节点流量。
+        try {
+          await writeConfig();
+          await core.reloadFromFile();
+          // 已建立的 Claude 连接也要断掉；只断 Claude，不动其他连接。
+          await closeClaudeConnections();
+        } catch (error) {
+          logger(`[net-core] 锁定配置热加载失败：${error.message}`);
+        }
+      } else {
+        // 默认路径：只把 Claude 守卫组切到 REJECT。不重载配置、不重建内核，
+        // 除 Claude 以外的流量和已建立的连接完全不受影响（force 重载会全断）。
+        const blocked = await applyClaudeGuard(true);
+        await closeClaudeConnections().catch((error) => logger(`[net-core] 关闭 Claude 连接失败：${error.message}`));
+        if (!blocked) {
+          // 守卫组切换失败时才退回旧路径：写 REJECT 规则并重载，宁可短暂断开也要保证 Claude 被阻断。
+          try { await writeConfig({ forceBlockClaude: true }); await core.reloadFromFile(); }
+          catch (error) { logger(`[net-core] 锁定配置热加载失败：${error.message}`); }
+        }
       }
     }
     logger(`[net-core] ${regionLock.reason}`);
@@ -1875,8 +1941,17 @@ export async function createKernelRuntime({ stateDir, env = process.env, root, l
     exitEvidence = { supported: NETWORK_RECOVERY_STREAK, unsupported: 0, failures: 0, lastAt: new Date().toISOString(), lastError: null };
     lastVerifiedNode = { name: await currentGroupNode() ?? nodes.selected, ip: measured.ip ?? null, countryCode: measured.countryCode ?? null, at: new Date().toISOString() };
     if (core) {
-      await writeConfig();
-      await core.reloadFromFile();
+      if (strictEnabled) {
+        await writeConfig();
+        await core.reloadFromFile();
+      } else {
+        // 放行只需要把守卫组切回固定出口组：不重载配置，已建立的连接不会被重置。
+        const released = await applyClaudeGuard(false);
+        if (!released) {
+          await writeConfig();
+          await core.reloadFromFile();
+        }
+      }
     }
     // 严格模式：出口与基线一致且已验证，才自动放行系统阻断。
     if (strictEnabled && hostGuard?.phase !== "active") await hostAction("guard-activate");
@@ -1932,6 +2007,8 @@ export async function createKernelRuntime({ stateDir, env = process.env, root, l
         if (!core) throw new Error("网络内核未运行，Claude 阻断未生效。");
         await writeConfig();
         await core.reloadFromFile();
+        // 非严格模式不把 REJECT 写进规则，改用守卫组切换：只断 Claude，不影响其他流量。
+        if (!strictEnabled && !(await setClaudeGuard(true))) throw new Error("Claude 守卫组切换失败，Claude 阻断未生效。");
         await closeClaudeConnections();
         lastTunnelCaptured = await core.tunnelStatus().then(value => value.active).catch(() => null);
         if (lastTunnelCaptured !== true) throw new Error("系统流量接管未建立，Claude 阻断未生效。");
@@ -1950,10 +2027,8 @@ export async function createKernelRuntime({ stateDir, env = process.env, root, l
     }
     if (!unprotectedLock) return report();
     unprotectedLock = null;
-    if (core) {
-      await writeConfig();
-      await core.reloadFromFile();
-    }
+    // 放行 Claude 只需要把守卫组切回固定出口组，不需要重载配置。
+    await applyClaudeGuard(false);
     logger("[net-core] 未保护阻断已解除");
     return report();
   }
