@@ -1,10 +1,24 @@
 // 第三方订阅的兼容性：同一链接按 UA 返回不同格式、200 错误页、anytls 协议。
 import test from "node:test";
 import assert from "node:assert/strict";
-import { parseSubscription, parseShareLinks, shareLinkToProxy, defaultFetch, looksLikeSubscription } from "./net-core/subscription.mjs";
+import { parseSubscription, parseShareLinks, shareLinkToProxy, defaultFetch, looksLikeSubscription, fetchTextViaProxy } from "./net-core/subscription.mjs";
 import { buildKernelConfig, assertKernelConfig, TLS_PROXY_TYPES } from "./net-core/config.mjs";
 
 const ANYTLS = "anytls://3da76b98-ee66-4dbb-8bca-2a7919fb741f@sg-aws-stable.private.example:28997?sni=cache.example.com&insecure=1#Hong%20Kong%2001";
+
+test('退出取消下载后不重试客户端或扫描代理，已取消的出口请求立即结束', async () => {
+  const controller = new AbortController();
+  let requests = 0, scans = 0;
+  await assert.rejects(defaultFetch('https://sub.example/sub', {
+    signal: controller.signal,
+    userAgents: ['first', 'second'],
+    fetchImpl: async () => { requests++; controller.abort(); throw controller.signal.reason; },
+    scan: async () => { scans++; return []; },
+  }), { name: 'AbortError' });
+  assert.equal(requests, 1);
+  assert.equal(scans, 0);
+  await assert.rejects(fetchTextViaProxy('https://exit.example/', { proxy: 'http://127.0.0.1:1', signal: controller.signal }), { name: 'AbortError' });
+});
 
 test("anytls 分享链接与 base64 列表可解析", () => {
   const proxy = shareLinkToProxy(ANYTLS, 0);

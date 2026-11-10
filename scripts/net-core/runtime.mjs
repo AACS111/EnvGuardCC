@@ -9,7 +9,7 @@
 import { access, mkdir, mkdtemp, readFile, writeFile, rename, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { execFile } from "node:child_process";
 import { DEFAULT_AUTO_GROUP, DEFAULT_FAKE_IP_RANGE, DEFAULT_GROUP, CLAUDE_GUARD_GROUP, DEFAULT_ROUTE_EXCLUSIONS, LOCAL_DIRECT_PROXY, assertKernelConfig, buildKernelConfig, ingressSummary, inIpv4Range, serializeKernelConfig, strictKernelConfig } from "./config.mjs";
 import { migrateStore, pickActive, publicSources, removeSource, renameSource, serializeStore, upsertSource } from "./sources.mjs";
@@ -341,10 +341,10 @@ export async function createKernelRuntime({ stateDir, env = process.env, root, l
   // 区域锁定只保留在本次运行内：出口落回 Claude 不支持地区后，配置里直接 REJECT
   // Claude 域名。应用彻底退出时不留下任何锁定状态，下次启动按当前出口重新检测。
   let regionLock = null;
-  // 复检节奏：未锁定 30 秒一次；断开后前 5 分钟每 5 秒抢修一次，之后降频。
+  // 复检节奏：未锁定 30 秒一次；断开后前 5 分钟每秒复检，之后降频。
   // CHECKCC_NET_CORE_EXIT_CHECK_MS 可供回归/诊断缩短间隔（下限 250ms）。
   const EXIT_CHECK_MS = Math.max(250, Number(env.CHECKCC_NET_CORE_EXIT_CHECK_MS) || 30000);
-  const FAST_RECHECK_MS = Math.min(5000, EXIT_CHECK_MS);
+  const FAST_RECHECK_MS = Math.min(1000, EXIT_CHECK_MS);
   // 抢修窗口默认 5 分钟；可用 CHECKCC_NET_CORE_RECOVERY_WINDOW_MS 缩短（回归测试用）。
   const RECOVERY_WINDOW_MS = Number(env.CHECKCC_NET_CORE_RECOVERY_WINDOW_MS);
   const FAST_RECHECK_WINDOW_MS = Number.isFinite(RECOVERY_WINDOW_MS) && RECOVERY_WINDOW_MS >= 0 ? RECOVERY_WINDOW_MS : 5 * 60 * 1000;
@@ -372,8 +372,11 @@ export async function createKernelRuntime({ stateDir, env = process.env, root, l
   let core = null;
   let ipv6Guard = null;
   let ipv6Probe = null;
+  let ipv6Task = null;
+  let workController = new AbortController();
+  const ipv6CacheFile = path.join(stateDir, 'node-ipv6-cache.json');
   let ipv6Protected = false;
-  const shouldProtectIpv6 = () => tunEnabled && ipv6Probe?.supported === true && ipv6Probe.node === nodes.selected;
+  const shouldProtectIpv6 = () => tunEnabled && ipv6Probe?.supported === true && ipv6Probe.node === nodes.selected && ipv6Probe.key === ipv6ContextKey();
   let hostHeartbeat = null;
   let lastError = null;
   let operation = Promise.resolve();
@@ -394,8 +397,10 @@ export async function createKernelRuntime({ stateDir, env = process.env, root, l
   // Claude 守卫组的当前选择：true=已切到 REJECT（只影响 Claude 域名），false=走固定出口。
   // 守卫组切换是内核 API 调用，不重载配置，因此不会断开其他流量。
   let claudeGuardBlocked = false;
+  let claudeGuardFallback = false;
   // 最近一次验证通过的节点：出口异常时先回切到它，而不是直接升级成地区锁。
   let lastVerifiedNode = null;
+  let lastVerifiedExit = null;
   const connectionLog = await createConnectionLog({ stateDir, logger,
     readConnections: () => core?.state().running ? core.request("/connections") : null,
   });
@@ -427,6 +432,44 @@ export async function createKernelRuntime({ stateDir, env = process.env, root, l
   // 只跟踪 IPv4：内核关闭了 IPv6，macOS 的 IPv6 隐私地址轮换不应被当成“网络变化”。
   const interfacesKey = () => JSON.stringify(Object.entries(interfaces()).flatMap(([name, entries]) =>
     (entries ?? []).filter(item => !item.internal && item.family !== "IPv6" && item.family !== 6 && !inIpv4Range(item.address)).map(item => `${name}:${item.address}`)).sort());
+  const ipv6ContextKey = () => {
+    const selected = nodes.proxies.find(node => node.name === nodes.selected);
+    return createHash('sha256').update(JSON.stringify([selected, interfacesKey()])).digest('hex');
+  };
+  const freshIpv6Probe = () => {
+    const age = Date.now() - Date.parse(ipv6Probe?.checkedAt ?? '');
+    return ipv6Probe?.supported === true && ipv6Probe.key === ipv6ContextKey() && age >= 0 && age < 10 * 60 * 1000;
+  };
+  function cancelPending() {
+    workController.abort();
+    stopHealthMonitor();
+    stopAutoRefresh();
+    stopPublicDnsSync();
+  }
+  function startIpv6Probe() {
+    if (!tunEnabled || ipv6Task || freshIpv6Probe() || workController.signal.aborted) return;
+    const signal = workController.signal;
+    ipv6Task = (async () => {
+      const result = await probeSelectedNodeIpv6({ signal });
+      signal.throwIfAborted();
+      if (result?.supported !== true) return;
+      await serialize(async () => {
+        signal.throwIfAborted();
+        if (!core?.state().running || !tunEnabled || result.key !== ipv6ContextKey()) return;
+        try {
+          await writeConfig();
+          await core.reloadFromFile({ force: false });
+          await confirmIpv6Protection();
+        } catch (error) {
+          ipv6Probe = null;
+          await enableIpv6Guard();
+          await writeConfig();
+          await core.reloadFromFile({ force: false });
+          throw error;
+        }
+      })();
+    })().catch(error => { if (!signal.aborted) logger(`[net-core] 后台 IPv6 探测：${error.message}`); }).finally(() => { ipv6Task = null; });
+  }
   function startHealthMonitor() {
     if (healthTimer) return;
     networkKey = interfacesKey();
@@ -434,7 +477,7 @@ export async function createKernelRuntime({ stateDir, env = process.env, root, l
       if (healthPending) return;
       healthPending = true;
       return serialize(checkHealth, false)().catch(error => logger(`[net-core] 健康检查失败：${error.message}`)).finally(() => { healthPending = false; });
-    }, 5000);
+    }, 1000);
     healthTimer.unref?.();
   }
   function stopHealthMonitor() {
@@ -445,15 +488,15 @@ export async function createKernelRuntime({ stateDir, env = process.env, root, l
   const currentGroupNode = async () => (await core?.request("/proxies").catch(() => null))?.proxies?.[DEFAULT_GROUP]?.now ?? null;
   /** 网络变化/换节点后旧证据作废，并允许立刻复检。 */
   const resetExitEvidence = () => { exitEvidence = { supported: 0, unsupported: 0, failures: 0, lastAt: null, lastError: null }; nextExitCheckAt = 0; };
-  /** 探测失败按 5→10→20 秒退避；断开后前 5 分钟 5 秒一次，之后 15 秒，未锁定 30 秒。 */
+  /** 网络锁每秒复检，恢复即放行；其他状态按常规周期检查。 */
   function scheduleExitCheck() {
     const now = Date.now();
     const locked = Boolean(regionLock) || (strictEnabled && hostGuard?.phase !== "active");
     // 抢修窗口从「刚断开」开始算：网络已经恢复过一次就不必再高频探测。
     const since = regionLock ? Date.parse(regionLock.at) : guardBlockedAt ?? now;
-    const fast = locked && now - since < FAST_RECHECK_WINDOW_MS;
+    const fast = regionLock?.type === "network" || (locked && now - since < FAST_RECHECK_WINDOW_MS);
     const base = fast ? FAST_RECHECK_MS : locked ? LOCKED_EXIT_CHECK_MS : EXIT_CHECK_MS;
-    const backoff = exitEvidence.failures > 0 ? 2 ** Math.min(exitEvidence.failures - 1, 2) : 1;
+    const backoff = !fast && exitEvidence.failures > 0 ? 2 ** Math.min(exitEvidence.failures - 1, 2) : 1;
     nextExitCheckAt = now + Math.min(EXIT_CHECK_MS, base * backoff);
   }
   /** 严格断流：只有用户显式选择「阻断全部网络」时才使用；默认只阻断 Claude。 */
@@ -517,7 +560,7 @@ export async function createKernelRuntime({ stateDir, env = process.env, root, l
     return true;
   }
   /**
-   * 出口复检：锁定期间 10 秒一次，网络恢复后连续 NETWORK_RECOVERY_STREAK 次通过才自动解除。
+   * 出口复检：恢复窗口内每秒一次，通过 NETWORK_RECOVERY_STREAK 次后自动解除。
    * 单次「无法确认出口」只维持网络锁并继续复检；连续 REGION_ESCALATION_STREAK 次明确探到
    * 不支持地区才升级为地区锁。注意这里不按 tunEnabled 门控：未开 TUN 时 Claude 仍经内核 REJECT。
    */
@@ -525,15 +568,17 @@ export async function createKernelRuntime({ stateDir, env = process.env, root, l
     lastExitCheck = Date.now();
     exitEvidence.lastAt = new Date().toISOString();
     let exit = null, failure = null;
-    try { exit = await probeSelectedExit(); } catch (error) { failure = error; }
+    // 后台探测快速失败并让下一轮重试，避免两次长超时堵住串行恢复队列。
+    try { exit = await probeSelectedExit({ timeoutMs: 3000, attempts: 1 }); } catch (error) { failure = error; }
     if (failure) {
       exitEvidence.failures += 1;
       exitEvidence.supported = 0;
       exitEvidence.unsupported = 0;
       exitEvidence.lastError = failure.message;
       logger(`[net-core] 出口复检失败（第 ${exitEvidence.failures} 次）：${failure.message}`);
-      // 无法确认出口 = 不信任当前网络：先阻断 Claude，网络恢复后自动解除。
-      if (!regionLock) await lockRegion(null, { type: "network" });
+      // 检测服务报错不能证明断网。默认仅在超时后阻断，严格模式继续验证出口。
+      const timedOut = /timeout|timed\s*out|ETIMEDOUT|deadline|超时/i.test(failure.message);
+      if (!regionLock && (strictEnabled || timedOut)) await lockRegion(null, { type: "network" });
       else noteLockRecheck(null);
       scheduleExitCheck();
       return null;
@@ -589,10 +634,10 @@ export async function createKernelRuntime({ stateDir, env = process.env, root, l
       lastExitCheck = 0;
       // 网络变了：旧复检证据作废，并立刻重新复检，不等下一个周期。
       resetExitEvidence();
-      // 网络接口变化（Wi-Fi/有线切换、断网重连）时先阻断 Claude，验证通过后再自动放行。
+      // 默认在接口变化时立即复检；严格模式先阻断，验证通过后再放行。
       // 默认只阻断 Claude；只有用户显式选择「阻断全部网络」时才启用系统断流（严格模式）。
       if (strictEnabled && networkFailurePolicy === "all") await blockSystemTraffic();
-      if (tunEnabled && !regionLock && !unprotectedLock) await lockRegion(null, { type: "network", reason: "网络接口变化，Claude 流量已暂时阻断；网络恢复并复检通过后自动解除。" });
+      if (strictEnabled && tunEnabled && !regionLock && !unprotectedLock) await lockRegion(null, { type: "network", reason: "网络接口变化，Claude 流量已暂时阻断；网络恢复并复检通过后自动解除。" });
     }
     try {
       if (strictEnabled) {
@@ -632,10 +677,10 @@ export async function createKernelRuntime({ stateDir, env = process.env, root, l
       lastError = `连接检查失败：${error.message}`;
       if (Date.now() < nextRecoveryAt) return;
       healthFailures++;
-      // 抢修窗口内每 5 秒重试一次；窗口结束后才按退避重试。
+      // 抢修窗口内每秒重试一次；窗口结束后才按退避重试。
       nextRecoveryAt = Date.now() + (inFastRecoveryWindow() ? FAST_RECHECK_MS : Math.min(60000, 2000 * 2 ** Math.min(healthFailures, 5)));
       logger(`[net-core] ${lastError}，正在恢复（第 ${healthFailures} 次）。`);
-      // 网络波动期只继续复检（每 5 秒重试连接），不重建内核；兜底重建只在两种情况下发生：
+      // 网络波动期只继续复检，不重建内核；兜底重建只在两种情况下发生：
       // 内核进程/接口真的挂了，或 5 分钟抢修窗口已过而隧道仍未恢复。
       const rebuild = kernelUnhealthy || (failureStage === "tunnel" && !inFastRecoveryWindow());
       if (!rebuild) return;
@@ -859,16 +904,28 @@ export async function createKernelRuntime({ stateDir, env = process.env, root, l
   }
 
   /** 用一个临时内核 + IPv6-only 端点判断当前节点能否承载 IPv6；结果缓存 10 分钟。 */
-  async function probeSelectedNodeIpv6() {
+  async function probeSelectedNodeIpv6({ signal = workController.signal } = {}) {
+    const key = ipv6ContextKey();
+    signal.throwIfAborted();
+    let result;
     try {
-      return await probeSelectedNodeIpv6Inner();
+      result = await probeSelectedNodeIpv6Inner({ signal });
     } catch (error) {
-      ipv6Probe = { supported: null, ip: null, node: nodes.selected ?? null, checkedAt: new Date().toISOString(), reason: `探测失败：${error.message}` };
-      return ipv6Probe;
+      result = { supported: null, ip: null, node: nodes.selected ?? null, checkedAt: new Date().toISOString(), reason: `探测失败：${error.message}` };
     }
+    signal.throwIfAborted();
+    if (key !== ipv6ContextKey()) return null;
+    ipv6Probe = { ...result, key };
+    if (ipv6Probe.supported === true) {
+      const temporary = `${ipv6CacheFile}.${randomBytes(8).toString('hex')}.tmp`;
+      try { await writeFile(temporary, JSON.stringify(ipv6Probe), { mode: 0o600 }); await rename(temporary, ipv6CacheFile); }
+      catch (error) { logger(`[net-core] IPv6 缓存写入失败：${error.message}`); }
+      finally { await rm(temporary, { force: true }).catch(() => {}); }
+    }
+    return ipv6Probe;
   }
 
-  async function probeSelectedNodeIpv6Inner() {
+  async function probeSelectedNodeIpv6Inner({ signal }) {
     const list = Array.isArray(nodes.proxies) ? nodes.proxies : [];
     let name = nodes.selected;
     if (core?.state().running) {
@@ -877,11 +934,9 @@ export async function createKernelRuntime({ stateDir, env = process.env, root, l
     }
     const node = list.find((item) => item?.name === name) ?? list[0];
     if (!node) {
-      ipv6Probe = { supported: null, ip: null, node: name ?? null, checkedAt: new Date().toISOString(), reason: "没有可探测的节点" };
-      return ipv6Probe;
+      return { supported: null, ip: null, node: name ?? null, checkedAt: new Date().toISOString(), reason: "没有可探测的节点" };
     }
-    const now = Date.now();
-    if (ipv6Probe?.supported !== null && ipv6Probe?.node === node.name && now - Date.parse(ipv6Probe.checkedAt) < 10 * 60 * 1000) return ipv6Probe;
+    if (freshIpv6Probe() && ipv6Probe.node === node.name) return ipv6Probe;
     const { buildProbeConfig } = await import("./config.mjs");
     const { pickPortBlock } = await import("./ports.mjs");
     const dir = await mkdtemp(path.join(os.tmpdir(), "checkcc-ipv6-"));
@@ -892,25 +947,23 @@ export async function createKernelRuntime({ stateDir, env = process.env, root, l
     config.dns.ipv6 = true;
     const configPath = path.join(dir, "probe.yaml");
     await writeFile(configPath, serializeKernelConfig(config), { mode: 0o600 });
-    const probeCore = createCore({ binary, homeDir: dir, configPath, apiPort: probeApiPort, secret, manageProcess: true, spawn, fetchImpl, logger });
+    const probeCore = createCore({ binary, homeDir: dir, configPath, apiPort: probeApiPort, secret, manageProcess: true, readyTimeoutMs: 3000, spawn, fetchImpl, logger });
     let reason = null;
     try {
       await probeCore.start();
       for (const url of ["https://api6.ipify.org", "https://ipv6.icanhazip.com"]) {
+        signal.throwIfAborted();
         try {
-          const body = (await ipv6Fetch(url, { proxy: `http://127.0.0.1:${basePort}`, userAgent: "EnvGuardCC/1.0", timeoutMs: 9000 })).trim();
+          const body = (await ipv6Fetch(url, { proxy: `http://127.0.0.1:${basePort}`, userAgent: "EnvGuardCC/1.0", timeoutMs: 9000, signal })).trim();
           if (body.includes(":") && /^[0-9a-f:]+$/i.test(body)) {
-            ipv6Probe = { supported: true, ip: body, node: node.name, checkedAt: new Date().toISOString(), reason: null };
-            return ipv6Probe;
+            return { supported: true, ip: body, node: node.name, checkedAt: new Date().toISOString(), reason: null };
           }
           reason = "IPv6-only 端点返回的内容不是 IPv6 地址。";
         } catch (error) { reason = error.message; }
       }
-      ipv6Probe = { supported: null, ip: null, node: node.name, checkedAt: new Date().toISOString(), reason };
-      return ipv6Probe;
+      return { supported: null, ip: null, node: node.name, checkedAt: new Date().toISOString(), reason };
     } catch (error) {
-      ipv6Probe = { supported: null, ip: null, node: node.name, checkedAt: new Date().toISOString(), reason: `探测内核启动失败：${error.message}` };
-      return ipv6Probe;
+      return { supported: null, ip: null, node: node.name, checkedAt: new Date().toISOString(), reason: `探测内核启动失败：${error.message}` };
     } finally {
       await probeCore.stop().catch(() => {});
       await rm(dir, { recursive: true, force: true }).catch(() => {});
@@ -918,6 +971,8 @@ export async function createKernelRuntime({ stateDir, env = process.env, root, l
   }
 
   async function launch() {
+    const signal = workController.signal;
+    signal.throwIfAborted();
     // 每次启动都重新探测宿主：否则「先开应用、后装宿主」的次序会让 TUN 一直被当成未启用。
     const nextHostMode = await detectHost();
     if (nextHostMode !== hostMode) logger(`[net-core] 特权宿主状态变化：${hostMode ? "可用 → 不可用" : "不可用 → 可用"}。`);
@@ -944,7 +999,6 @@ export async function createKernelRuntime({ stateDir, env = process.env, root, l
       }
     }
     if (tunEnabled) {
-      await probeSelectedNodeIpv6().catch((error) => logger(`[net-core] IPv6 能力探测失败：${error.message}`));
       await enableIpv6Guard();
     }
     await writeConfig();
@@ -999,8 +1053,10 @@ export async function createKernelRuntime({ stateDir, env = process.env, root, l
         await hostAction("guard-activate");
       }
     }
+    signal.throwIfAborted();
     scheduleExitCheck();
     lastTunnelCaptured = tunEnabled ? await core.tunnelStatus().then(value => value.active).catch(() => null) : null;
+    signal.throwIfAborted();
     lastHealthAt = new Date().toISOString();
     startHealthMonitor();
     startAutoRefresh();
@@ -1009,6 +1065,7 @@ export async function createKernelRuntime({ stateDir, env = process.env, root, l
     // 内核可用后，把本进程的出站流量指向我们自己的代理端口；停止时恢复，避免影响其它功能。
     if (!env.CHECKCC_PROXY || strictEnabled || tunEnabled) { env.CHECKCC_PROXY = strictEnabled ? strictProxy : localProxy; ownedProxyEnv = true; }
     await claudeProxy?.apply(strictEnabled ? strictProxy : localProxy);
+    startIpv6Probe();
   }
 
   async function start() {
@@ -1203,7 +1260,7 @@ export async function createKernelRuntime({ stateDir, env = process.env, root, l
       const due = Date.parse(target.updatedAt) + Number(target.intervalHours ?? intervalMs / 3600000) * 3600000;
       if (Number.isFinite(due) && Date.now() < due) return { skipped: true, reason: "尚未到更新时间", nextAt: new Date(due).toISOString() };
     }
-    const parsed = parseSubscription(await fetchSubscription(target.url, download ? { download } : {}));
+    const parsed = parseSubscription(await fetchSubscription(target.url, { ...(download ? { download } : {}), signal: workController.signal }));
     if (target.id === nodes.activeId && target.selected && !parsed.proxies.some(node => node.name === target.selected)) {
       throw new Error("订阅已移除当前固定出口，已保留原配置。请手动导入并明确选择新节点。");
     }
@@ -1382,9 +1439,10 @@ export async function createKernelRuntime({ stateDir, env = process.env, root, l
 
   /** 节点延迟：直接读内核的延迟测试结果，超时/失败按 null 返回，不编造毫秒数。 */
   async function delay(name, timeoutMs = 5000) {
+    workController.signal.throwIfAborted();
     if (!core) throw new Error("内核未运行，无法测速。");
     const target = encodeURIComponent("http://www.gstatic.com/generate_204");
-    const value = await core.request(`/proxies/${encodeURIComponent(name)}/delay?url=${target}&timeout=${timeoutMs}`);
+    const value = await core.request(`/proxies/${encodeURIComponent(name)}/delay?url=${target}&timeout=${timeoutMs}`, { signal: workController.signal });
     return Number.isFinite(value?.delay) ? value.delay : null;
   }
 
@@ -1625,14 +1683,12 @@ export async function createKernelRuntime({ stateDir, env = process.env, root, l
     if (next === tunEnabled && tunOverride !== null) {
       if (next && !(await core.tunnelStatus()).active) throw new Error("隧道未接管，不能复用旧的开启状态。");
       if (next) {
-        await probeSelectedNodeIpv6();
         await enableIpv6Guard();
-        await writeConfig();
-        await core.reloadFromFile();
-        await confirmIpv6Protection();
+        if (ipv6Protected) await confirmIpv6Protection();
       } else await restoreIpv6Guard();
       lastTunnelCaptured = next ? true : null;
       lastHealthAt = new Date().toISOString();
+      if (next) startIpv6Probe();
       return { tunEnabled, changed: false };
     }
     const previous = { override: tunOverride, enabled: tunEnabled };
@@ -1647,9 +1703,8 @@ export async function createKernelRuntime({ stateDir, env = process.env, root, l
         try { await launch(); } catch (error) { lastError = `隧道回滚后重启失败：${error.message}`; }
       };
       try {
-        // 开启前先探测节点 IPv6 能力并关系统 IPv6；关闭后等 TUN 退出再恢复。
+        // Unknown IPv6 capability stays blocked while the independent probe runs.
         if (next) {
-          await probeSelectedNodeIpv6();
           await enableIpv6Guard();
         }
         await writeConfig();
@@ -1669,6 +1724,7 @@ export async function createKernelRuntime({ stateDir, env = process.env, root, l
         if (next) { env.CHECKCC_PROXY = localProxy; ownedProxyEnv = true; }
         if (!next) await restoreIpv6Guard();
         logger(`[net-core] TUN ${next ? "已接管" : "已退出"}（内核保持运行）。`);
+        if (next) startIpv6Probe();
       } catch (error) {
         // 回滚成进入本次调用前的状态，避免「保护显示开启但流量没进隧道」。
         // 不写 lastError：内核可能仍在以代理模式运行，让 report() 继续如实显示运行状态，
@@ -1802,37 +1858,48 @@ export async function createKernelRuntime({ stateDir, env = process.env, root, l
    * 经主内核的混合入口探测：配置里已有 `exitProbeHost → CLAUDE-PIN` 的规则，
    * 出站由主内核完成（TUN 模式下已绑定物理网卡），因此不会被自己的 TUN 截获。
    */
-  async function probeFixedExitViaKernel({ timeoutMs = 8000 } = {}) {
+  async function probeFixedExitViaKernel({ timeoutMs = 8000, signal = workController.signal } = {}) {
     const text = await exitFetch(exitProbeUrl, {
       proxy: localProxy,
       userAgent: "EnvGuardCC/1.0",
       timeoutMs,
+      signal,
     });
     return parseExitPayload(text);
   }
 
-  async function probeSelectedExit() {
+  async function probeSelectedExit({ timeoutMs = 8000, attempts = 2, reuseMs = 0 } = {}) {
+    const signal = workController.signal;
+    signal.throwIfAborted();
     if (!core?.state().running) throw new Error("内核未运行，无法检测固定出口。");
-    const actual = await core.request("/proxies");
+    const actual = await core.request("/proxies", { signal });
     const name = actual?.proxies?.[DEFAULT_GROUP]?.now;
     if (!nodes.proxies.some(node => node.name === name)) throw new Error("固定出口组没有可验证的实际节点。");
+    const network = interfacesKey();
+    const key = JSON.stringify([name, network, strictEnabled, nodes.proxies.find(node => node.name === name)]);
+    const age = Date.now() - (lastVerifiedExit?.at ?? 0);
+    if (!regionLock && lastVerifiedExit?.key === key && age >= 0 && age < Math.min(reuseMs, 5000)) return { ...lastVerifiedExit.exit };
     // 第三方节点常抖：单次握手失败不代表出口不可用，重试一次再判定。
     let result = null;
     let failure = null;
-    for (let attempt = 0; attempt < 2 && !result; attempt += 1) {
+    for (let attempt = 0; attempt < attempts && !result; attempt += 1) {
       try {
         if (strictEnabled) {
           // 严格配置的所有规则只引用一个固定组；回环混合入口也明确使用该节点。
-          result = parseExitPayload(await fetchTextViaProxy(env.CHECKCC_NET_CORE_EXIT_PROBE_URL || "https://ipwho.is/", { proxy: strictProxy, timeoutMs: 8000 }));
-        } else result = await probeFixedExitViaKernel();
+          result = parseExitPayload(await fetchTextViaProxy(env.CHECKCC_NET_CORE_EXIT_PROBE_URL || "https://ipwho.is/", { proxy: strictProxy, timeoutMs, signal }));
+        } else result = await probeFixedExitViaKernel({ timeoutMs, signal });
       } catch (error) {
+        signal.throwIfAborted();
         failure = error;
-        if (attempt === 0) await new Promise((resolve) => setTimeout(resolve, 400));
+        if (attempt + 1 < attempts) await new Promise((resolve) => setTimeout(resolve, 400));
       }
     }
     if (!result?.ip || !result.countryCode) {
       throw new Error(`固定出口探测失败，未使用普通流量组的出口代替。${failure ? `原因：${failure.message}` : ""}`);
     }
+    signal.throwIfAborted();
+    if (interfacesKey() !== network) throw new Error('出口探测期间网络已变化，请重新验证。');
+    lastVerifiedExit = { key, at: Date.now(), exit: { ...result } };
     return result;
   }
 
@@ -1895,6 +1962,8 @@ export async function createKernelRuntime({ stateDir, env = process.env, root, l
       recheckAttempts: 0,
       recheckAt: null,
     };
+    // 隧道失败也会直接进入这里，必须覆盖锁定前尚未到期的常规检查时间。
+    nextExitCheckAt = Date.now() + FAST_RECHECK_MS;
     if (core) {
       if (strictEnabled) {
         // 严格模式：REJECT 必须写进规则，它本来就要断掉全部非节点流量。
@@ -1913,6 +1982,7 @@ export async function createKernelRuntime({ stateDir, env = process.env, root, l
         await closeClaudeConnections().catch((error) => logger(`[net-core] 关闭 Claude 连接失败：${error.message}`));
         if (!blocked) {
           // 守卫组切换失败时才退回旧路径：写 REJECT 规则并重载，宁可短暂断开也要保证 Claude 被阻断。
+          claudeGuardFallback = true;
           try { await writeConfig({ forceBlockClaude: true }); await core.reloadFromFile(); }
           catch (error) { logger(`[net-core] 锁定配置热加载失败：${error.message}`); }
         }
@@ -1935,26 +2005,35 @@ export async function createKernelRuntime({ stateDir, env = process.env, root, l
     if (strictEnabled && strictBaselineIp && measured.ip && measured.ip !== strictBaselineIp) {
       throw new Error("固定出口 IP 与已确认基线不同，系统保持阻断。请关闭严格模式后明确确认新出口。");
     }
-    const hadLock = Boolean(regionLock);
+    const previousLock = regionLock;
+    const hadLock = Boolean(previousLock);
     regionLock = null;
-    // 解除即视为已验证：保持连续通过计数，不让紧接着的下一次探测把刚放行的连接又锁回去。
-    exitEvidence = { supported: NETWORK_RECOVERY_STREAK, unsupported: 0, failures: 0, lastAt: new Date().toISOString(), lastError: null };
-    lastVerifiedNode = { name: await currentGroupNode() ?? nodes.selected, ip: measured.ip ?? null, countryCode: measured.countryCode ?? null, at: new Date().toISOString() };
-    if (core) {
-      if (strictEnabled) {
-        await writeConfig();
-        await core.reloadFromFile();
-      } else {
-        // 放行只需要把守卫组切回固定出口组：不重载配置，已建立的连接不会被重置。
-        const released = await applyClaudeGuard(false);
-        if (!released) {
+    try {
+      if (core) {
+        if (strictEnabled || claudeGuardFallback) {
           await writeConfig();
           await core.reloadFromFile();
+          if (!strictEnabled) await setClaudeGuard(false);
+          claudeGuardFallback = false;
+        } else {
+          // 常规放行只切守卫组；兜底规则存在时必须先清除规则。
+          const released = await applyClaudeGuard(false);
+          if (!released) {
+            await writeConfig();
+            await core.reloadFromFile();
+            await setClaudeGuard(false);
+          }
         }
       }
+      // 严格模式：出口与基线一致且已验证，才自动放行系统阻断。
+      if (strictEnabled && hostGuard?.phase !== "active") await hostAction("guard-activate");
+    } catch (error) {
+      regionLock = previousLock;
+      scheduleExitCheck();
+      throw error;
     }
-    // 严格模式：出口与基线一致且已验证，才自动放行系统阻断。
-    if (strictEnabled && hostGuard?.phase !== "active") await hostAction("guard-activate");
+    exitEvidence = { supported: NETWORK_RECOVERY_STREAK, unsupported: 0, failures: 0, lastAt: new Date().toISOString(), lastError: null };
+    lastVerifiedNode = { name: await currentGroupNode() ?? nodes.selected, ip: measured.ip ?? null, countryCode: measured.countryCode ?? null, at: new Date().toISOString() };
     if (hadLock) {
       logger("[net-core] 固定出口已回到 Claude 支持地区，区域锁定解除。");
       notifyClaude("EnvGuardCC：Claude 已恢复", `固定出口 ${measured.countryCode ?? ""} 已通过复检，Claude 流量恢复。`);
@@ -2138,11 +2217,23 @@ export async function createKernelRuntime({ stateDir, env = process.env, root, l
   }
 
   if (disabledReason()) await claudeProxy?.restore();
+  try {
+    ipv6Probe = JSON.parse(await readFile(ipv6CacheFile, 'utf8'));
+    if (!freshIpv6Probe()) ipv6Probe = null;
+  } catch { ipv6Probe = null; }
   return {
     enabled: !disabledReason(), reason: disabledReason(),
     start: serialize(start),
     connectionLog,
-    stop: serialize(async () => { stopHealthMonitor(); stopAutoRefresh(); stopPublicDnsSync(); await stop(); }),
+    cancelPending,
+    stop: () => {
+      cancelPending();
+      return serialize(async () => {
+        await ipv6Task;
+        await stop();
+        workController = new AbortController();
+      })();
+    },
     report, connectionState, verifyConnection: serialize(verifyConnection, false), select: serialize(select), delay, setMode: serialize(setMode), network,
     saveNetwork: serialize(saveNetwork), verifyDomain: serialize(verifyDomain), importNodes: serialize((...args) => nodeTransaction(() => importNodes(...args))),
     refresh: serialize((...args) => nodeTransaction(() => refresh(...args))), sources,

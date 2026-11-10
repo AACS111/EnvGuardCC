@@ -225,14 +225,14 @@ export function ProtectionWorkspace(props: Props) {
         </div>}
         {props.netCore?.regionLock?.locked && (() => {
           const lock = props.netCore.regionLock;
-          // 网络波动造成的锁定会自动复检，界面只需告知进度，不逼用户手动点。
+          // 自动恢复期间也允许立即复检，复用主动检测并解除锁定的入口。
           const auto = lock.type === 'network' || lock.autoRecover === true;
           const attempts = Number.isInteger(lock.recheckAttempts) ? lock.recheckAttempts : 0;
           return <div className="workspace-notices" data-tone="error" role="alert">
             <p className="workspace-alert" data-tone="error">{lock.reason || text('固定出口未通过复检，Claude 流量已阻断。', 'The pinned exit failed recheck; Claude traffic is blocked.')}</p>
-            {auto
-              ? <p className="workspace-alert" data-tone="info" role="status">{text(`正在自动复检${attempts ? `（第 ${attempts} 次）` : ''}：网络恢复后会立即自动解除，无需手动操作。`, `Automatic recheck${attempts ? ` (attempt ${attempts})` : ''} is running: it unlocks as soon as the network recovers. No manual action needed.`)}</p>
-              : <button type="button" className="repair-button" onClick={() => props.onNetCoreUnlockRegion?.()} disabled={Boolean(props.netCoreBusy) || busy}>{text('复检并解除', 'Recheck and unlock')}</button>}
+            {auto && <p className="workspace-alert" data-tone="info" role="status">{text(`正在自动复检${attempts ? `（第 ${attempts} 次）` : ''}，网络恢复后自动解除；也可点击“立即复检”主动检测。`, `Automatic recheck${attempts ? ` (attempt ${attempts})` : ''} is running and will unlock when the network recovers. You can also select “Recheck now” to check immediately.`)}</p>}
+            {props.netCoreError && <p className="workspace-alert" data-tone="error">{props.netCoreError}</p>}
+            <button type="button" className="repair-button" onClick={() => props.onNetCoreUnlockRegion?.()} disabled={Boolean(props.netCoreBusy) || busy || !props.onNetCoreUnlockRegion} aria-busy={props.netCoreBusy || undefined}>{props.netCoreBusy ? text('复检中…', 'Rechecking…') : auto ? text('立即复检', 'Recheck now') : text('复检并解除', 'Recheck and unlock')}</button>
           </div>;
         })()}
         <div id="panel-basic" role="tabpanel" aria-labelledby="tab-basic" tabIndex={0} hidden={tab !== 'basic'}>

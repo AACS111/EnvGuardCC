@@ -7,7 +7,7 @@ import { mkdtemp, mkdir, writeFile, readFile, rm, cp, symlink } from 'node:fs/pr
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createProtocol } from '../desktop/protocol.mjs';
 import { createShutdown } from '../desktop/lifecycle.mjs';
 import { startSite, closeServer } from '../desktop/site.mjs';
@@ -140,6 +140,19 @@ test('宿主管道异常断开时后台自行恢复并释放所有监听器', { 
   assert.equal((await exited)[0], 1);
   await assert.rejects(fetch(started.url));
   await assert.rejects(fetch(`http://127.0.0.1:${started.ports.gateway}/__checkcc/status`));
+});
+
+test('日志管道 EPIPE 不退出后台，页面和控制服务继续可用', { timeout: 25000 }, async t => {
+  const fixture = await backendFixture(t);
+  const preload = path.join(fixture.fixture, 'stderr-failure.mjs');
+  await writeFile(preload, `setInterval(() => process.stderr.emit('error', Object.assign(new Error('broken log pipe'), { code: 'EPIPE' })), 100).unref();`);
+  const { child, ready, call } = launchBackend(t, fixture, { NODE_OPTIONS: `--import=${pathToFileURL(preload).href}` });
+  const started = await ready;
+  await new Promise(resolve => setTimeout(resolve, 350));
+  assert.equal(child.exitCode, null, '日志输出失败不能终止网络恢复后台');
+  assert.equal((await fetch(started.url)).status, 200);
+  assert.equal((await call('getSettings')).autoStartProtection, false);
+  await call('shutdown'); child.stdin.end();
 });
 
 test('页面端口冲突明确失败，不接管或关闭原来实例', { timeout: 25000 }, async t => {

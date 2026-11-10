@@ -137,12 +137,13 @@ export function createNetCore({
     pipeLines(next.stdout, "kernel");
   }
 
-  async function request(pathname, { method = "GET", body } = {}) {
+  async function request(pathname, { method = "GET", body, signal } = {}) {
+    signal?.throwIfAborted();
     const response = await fetchImpl(`${base}${pathname}`, {
       method,
       headers: { ...authHeaders(), ...(body === undefined ? {} : { "Content-Type": "application/json" }) },
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),
-      signal: AbortSignal.timeout(8000),
+      signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(8000)]) : AbortSignal.timeout(8000),
     });
     if (!response.ok) throw new Error(`内核接口 ${method} ${pathname} 返回 ${response.status}。`);
     if (response.status === 204) return null;
@@ -358,7 +359,7 @@ export function createNetCore({
    * 热加载磁盘上的配置，并恢复各选择器原来的节点。
    * mihomo 重载会把 select 组重置成第一个节点，不恢复的话「换了 DNS」会顺手把出口也换掉。
    */
-  async function reloadFromFile({ removedSelectors = [] } = {}) {
+  async function reloadFromFile({ removedSelectors = [], force = true } = {}) {
     // 读不到当前选择时不得把默认选择当成原选择继续重载。
     const before = await request("/proxies");
     const selections = Object.entries(before?.proxies ?? {})
@@ -376,7 +377,7 @@ export function createNetCore({
       selector.proxies = [name, ...selector.proxies.filter(item => item !== name)];
     }
     const payload = stringifyYaml(candidate);
-    await request("/configs?force=true", { method: "PUT", body: { payload } });
+    await request(`/configs?force=${force}`, { method: "PUT", body: { payload } });
     for (const [group, name] of retained) {
       if (group === "GLOBAL") continue;
       // 重载是异步完成的，选择器列表可能还没就绪，按 selectProxy 的经验重试几次。

@@ -7,6 +7,9 @@ import { createDesktopSettings } from '../scripts/desktop-settings.mjs';
 import { createClaudeReset } from '../scripts/claude-reset.mjs';
 import { createClaudeProxySettings } from '../scripts/claude-proxy-settings.mjs';
 
+// Windows GUI launches can inherit a closed stderr pipe. Logging failure must
+// leave the control service and its network recovery loop running.
+process.stderr.on('error', () => {});
 console.log = console.info = console.debug = console.error;
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const devURL = process.env.CHECKCC_DESKTOP_DEV_URL;
@@ -40,7 +43,7 @@ async function report() {
   if (!response.ok) throw new Error('无法确认保护状态。');
   return response.json();
 }
-const closeRuntime = createShutdown({ restore: () => helper?.closeRuntime(), closeServices: async () => {
+const closeRuntime = createShutdown({ restore: () => helper?.closeRuntime({ kernelWillStop: true }), closeServices: async () => {
     clearInterval(powerTimer);
     // 退出时必须把定时器与内核一并关掉：否则进程退了、内核仍在接管流量（实测事故）。
     kernel?.stopAutoRefresh?.();
@@ -53,6 +56,7 @@ const closeRuntime = createShutdown({ restore: () => helper?.closeRuntime(), clo
     await closeServer(site);
 } });
 async function close() {
+  kernel?.cancelPending?.();
   // 启动中的后台任务会在下一个检查点看到 stopping 后退出；这里不等待它，
   // 否则退出会被内核/TUN 启动拖住几十秒。
   void servicesReady?.catch(() => {});

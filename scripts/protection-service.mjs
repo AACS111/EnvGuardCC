@@ -71,13 +71,16 @@ export function createProtectionService({ stateDir, runtime, browserCloak, curre
       await assertNetwork();
     },
     beforeTest: assertNetwork,
-    afterStop: async ({ shutdown = false } = {}) => {
+    afterStop: async ({ shutdown = false, kernelWillStop = false } = {}) => {
       const kernel = network();
       if (!kernel) return;
       if (shutdown) {
-        // 退出应用即停止接管：阻断不需要跨进程保留，系统流量也不必再走内核。
-        try { if (kernel.setUnprotectedGuard) await kernel.setUnprotectedGuard(false); } catch { /* 内核随后会整体停止 */ }
-        try { if (!kernel.connectionState?.().strictEnabled) await kernel.setTunnel(false); } catch { /* 备份与错误由退出流程继续报告 */ }
+        // The desktop shutdown stops the kernel after restoration. Keep its
+        // current guard and tunnel until then, without an intermediate reload.
+        if (!kernelWillStop) {
+          try { if (kernel.setUnprotectedGuard) await kernel.setUnprotectedGuard(false); } catch { /* Restoration errors remain retryable. */ }
+          try { if (!kernel.connectionState?.().strictEnabled) await kernel.setTunnel(false); } catch { /* The owner reports remaining cleanup errors. */ }
+        }
         unprotectedBlock = { active: false, error: null };
         return;
       }
@@ -86,7 +89,7 @@ export function createProtectionService({ stateDir, runtime, browserCloak, curre
     detect: async () => {
       const kernel = network();
       if (kernel?.probeSelectedExit) {
-        const primary = await kernel.probeSelectedExit();
+        const primary = await kernel.probeSelectedExit({ reuseMs: 5000 });
         // 固定出口必须位于 Claude 官方支持地区：否则宁可拒绝启动，也不把账号暴露给封禁风险。
         assertClaudeSupportedExit(primary);
         return targetFromExit({ primary, consistentCountry: true });
@@ -112,7 +115,9 @@ export function createProtectionService({ stateDir, runtime, browserCloak, curre
           if (!sameTimezone(actual, zone)) issues.push(`系统时区未应用：当前 ${actual || '未知'}，目标 ${zone}。`);
         } catch (error) { issues.push('系统时区适配失败：' + error.message); }
       }
-      const report = await browserCloak.sync(origin, { launch: true, force: true });
+      // Prepare the policy and update connected clients. A new browser is only
+      // launched through the user's explicit browser entry point.
+      const report = await browserCloak.sync(origin, { launch: false, force: true });
       browserIssues = browserErrors(report);
       issues.push(...browserIssues);
       return issues;

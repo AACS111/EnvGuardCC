@@ -175,6 +175,11 @@ test('真实内核控制器要求密钥，热加载保持原选择', { timeout: 
     await fs.writeFile(configPath, serializeKernelConfig(config));
     await core.reloadFromFile();
     assert.equal((await core.request('/proxies/CLAUDE-PIN')).now, 'b');
+    config.ipv6 = true;
+    await fs.writeFile(configPath, serializeKernelConfig(config));
+    await core.reloadFromFile({ force: false });
+    assert.equal((await core.request('/configs')).ipv6, true);
+    assert.equal((await core.request('/proxies/CLAUDE-PIN')).now, 'b');
   } finally { await core.stop(); await fs.rm(directory, {recursive:true,force:true}); }
 });
 

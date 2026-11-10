@@ -34,6 +34,25 @@ const workspace = (phase, props = {}) => {
 };
 const button = (phase, props = {}) => workspace(phase, props).match(/<button[^>]*class="repair-button workspace-power"[^>]*>[^<]*<\/button>/)[0];
 
+test('网络自动恢复告警始终提供立即复检，忙碌时禁用并保留失败原因', () => {
+  const props = {
+    netCore: { state: 'running', nodes: [], regionLock: { locked: true, type: 'network', autoRecover: true, recheckAttempts: 3 } },
+    onNetCoreUnlockRegion: () => {},
+  };
+  const html = workspace('active', props);
+  assert.match(html, /也可点击.*立即复检/);
+  assert.match(html, /<button[^>]*>立即复检<\/button>/);
+  const notice = html.match(/<div class="workspace-notices" data-tone="error" role="alert">([\s\S]*?)<\/div>/)?.[1];
+  assert.ok(notice);
+  assert.doesNotMatch(notice, /无需手动操作/);
+  const pending = workspace('active', { ...props, netCoreBusy: true });
+  assert.match(pending, /<button[^>]*disabled=""[^>]*aria-busy="true"[^>]*>复检中…<\/button>/);
+  const failed = workspace('active', { ...props, netCoreError: '固定出口探测超时' });
+  assert.match(failed, /固定出口探测超时/);
+  assert.match(failed, /<button[^>]*>立即复检<\/button>/);
+  assert.match(workspace('active', { ...props, locale: 'en' }), /Recheck now/);
+});
+
 test('侧栏提供更新入口与当前版本，未检查时不宣称已是最新或可更新', () => {
   const html = workspace('idle');
   assert.match(html, /class="workspace-text-link workspace-update__button" aria-haspopup="dialog"/);
