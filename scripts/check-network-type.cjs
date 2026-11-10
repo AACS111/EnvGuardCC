@@ -30,3 +30,11 @@ test('名称推断明确保留不确定性和依据，支持首页中英文', ()
   assert.match(exitNetworkType('Tencent Cloud', 'en').label, /Datacenter \(inferred\)/);
   assert.equal(exitNetworkType(null, 'en').label, 'Undetermined');
 });
+
+test('BIGLOBE 组织名识别为住宅推断，云厂商证据优先', () => {
+  assert.equal(exitNetworkType('BIGLOBE Inc.', 'zh', 'AS2518').kind, 'residential');
+  assert.equal(exitNetworkType('biglobe inc.', 'en', '2518').label, 'Residential (inferred)');
+  assert.equal(exitNetworkType('BIGLOBE Cloud Hosting', 'en', 'AS2518').kind, 'datacenter');
+  assert.equal(exitNetworkType('BIGLOBE Inc.', 'en', 'AS16509').kind, 'datacenter');
+  assert.equal(exitNetworkType('Japan Network Information Center', 'zh', 'AS2518').kind, 'unknown');
+});

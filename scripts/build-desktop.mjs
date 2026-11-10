@@ -5,6 +5,17 @@ import { createRequire } from 'node:module';
 import { projectRoot as root, run, tauriCli } from './tauri-tools.mjs';
 import { ensureKernel } from './net-core/vendor.mjs';
 
+// Finder can recreate .DS_Store in an emptied directory while rm() walks it, which
+// surfaces as ENOTEMPTY. Retry instead of failing the whole package build.
+async function removeDirectory(target) {
+  for (let attempt = 0; ; attempt += 1) {
+    try { await rm(target, { recursive: true, force: true }); return; }
+    catch (error) {
+      if (!['ENOTEMPTY', 'EBUSY', 'ENOTDIR'].includes(error.code) || attempt >= 5) throw error;
+      await new Promise(resolve => setTimeout(resolve, 200));
+    }
+  }
+}
 const tools = path.join(root, 'node_modules/.tauri-tools');
 const stage = path.join(root, 'node_modules/.checkcc-tauri-backend');
 const output = path.join(root, 'node_modules/.checkcc-dist');
@@ -125,7 +136,7 @@ await writeFile(path.join(stage, '使用说明.txt'), 'EnvGuardCC 使用系统 W
 await run(process.execPath, [tauriCli(), 'build', '--no-bundle', '--', '--locked']);
 const pendingRoot = path.join(output, `.tauri-${platformName}`);
 if (path.dirname(pendingRoot) !== output) throw new Error('无效的产物目录。');
-await rm(pendingRoot, { recursive: true, force: true });
+await removeDirectory(pendingRoot);
 await mkdir(pendingRoot, { recursive: true });
 let application;
 if (isMac) {
@@ -149,7 +160,7 @@ await rm(pendingArchive, { force: true });
 if (isMac) await run('ditto', ['-c', '-k', '--sequesterRsrc', '--keepParent', application, pendingArchive]);
 else await run('pwsh', ['-NoProfile', '-NonInteractive', '-Command', 'Add-Type -AssemblyName System.IO.Compression.FileSystem; [IO.Compression.ZipFile]::CreateFromDirectory($env:CHECKCC_ARCHIVE_SOURCE, $env:CHECKCC_ARCHIVE_DESTINATION, [IO.Compression.CompressionLevel]::Optimal, $true)'], { env: { ...process.env, CHECKCC_ARCHIVE_SOURCE: application, CHECKCC_ARCHIVE_DESTINATION: pendingArchive } });
 if (path.dirname(appRoot) !== output) throw new Error('无效的交付目录。');
-await rm(appRoot, { recursive: true, force: true });
+await removeDirectory(appRoot);
 if (isMac) { await mkdir(appRoot); await rename(application, path.join(appRoot, 'EnvGuardCC.app')); }
 else await rename(application, appRoot);
 await rename(pendingArchive, archive);

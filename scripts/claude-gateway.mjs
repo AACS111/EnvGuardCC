@@ -11,6 +11,7 @@ import { collectEdgeTrace, collectNetworkDiagnostics, extractClientClues, transp
 import { fetchSubscription, parseSubscription } from "./net-core/subscription.mjs";
 import { readExitHistory, recordExit } from "./net-core/exit-history.mjs";
 import { userAgentPlatform } from "../src/detection/environment-profile.mjs";
+import { createUpdateChecker } from "./app-updates.mjs";
 /**
  * 声明面归一化：UA 与 Client Hints 必须自洽。
  * 只修正矛盾，不伪造平台——韩国用户同样使用 Windows，伪造成 macOS 只会与 UA/TLS 指纹冲突。
@@ -138,7 +139,7 @@ function sendJson(response, status, body) {
   response.end(JSON.stringify(body));
 }
 
-export function createGateway({ upstreamBase = "https://api.anthropic.com", profileFile = defaultProfile, stateDir = defaultStateDir, collect = collectNetworkDiagnostics, cacheMs = 15000, netCore = null } = {}) {
+export function createGateway({ upstreamBase = "https://api.anthropic.com", profileFile = defaultProfile, stateDir = defaultStateDir, collect = collectNetworkDiagnostics, cacheMs = 15000, netCore = null, updates = createUpdateChecker() } = {}) {
   const upstream = new URL(upstreamBase);
   if (!["http:", "https:"].includes(upstream.protocol) || upstream.username || upstream.password || upstream.search || upstream.hash) throw new Error("CHECKCC_UPSTREAM 必须是无凭证、无查询参数的 HTTP(S) 地址。");
   const probeTargets = new Map();
@@ -190,7 +191,12 @@ export function createGateway({ upstreamBase = "https://api.anthropic.com", prof
           response.writeHead(204); return response.end();
         }
         if (request.headers["x-checkcc-client"] !== "gateway-ui") return sendJson(response, 403, { error: "缺少诊断客户端标识。" });
-        if (!["/__checkcc/status", "/__checkcc/diagnostics", "/__checkcc/cloak", "/__checkcc/simulation", "/__checkcc/message-probe", "/__checkcc/browser-probe", "/__checkcc/net-core", "/__checkcc/net-core/host", "/__checkcc/net-core/import", "/__checkcc/net-core/sources", "/__checkcc/net-core/refresh", "/__checkcc/net-core/delay", "/__checkcc/net-core/exits", "/__checkcc/net-core/mode", "/__checkcc/net-core/network-failure", "/__checkcc/net-core/network", "/__checkcc/net-core/verify-domain", "/__checkcc/net-core/local-proxies", "/__checkcc/net-core/connections"].includes(pathname)) return sendJson(response, 404, { error: "未知诊断接口。" });
+        if (!["/__checkcc/status", "/__checkcc/updates", "/__checkcc/diagnostics", "/__checkcc/cloak", "/__checkcc/simulation", "/__checkcc/message-probe", "/__checkcc/browser-probe", "/__checkcc/net-core", "/__checkcc/net-core/host", "/__checkcc/net-core/import", "/__checkcc/net-core/sources", "/__checkcc/net-core/refresh", "/__checkcc/net-core/delay", "/__checkcc/net-core/exits", "/__checkcc/net-core/mode", "/__checkcc/net-core/network-failure", "/__checkcc/net-core/network", "/__checkcc/net-core/verify-domain", "/__checkcc/net-core/local-proxies", "/__checkcc/net-core/connections"].includes(pathname)) return sendJson(response, 404, { error: "未知诊断接口。" });
+        if (pathname === "/__checkcc/updates") {
+          if (request.method !== "GET") return sendJson(response, 405, { error: "更新检查仅允许 GET。" });
+          const force = new URL(rawPath, "http://127.0.0.1").searchParams.get("force") === "1";
+          return sendJson(response, 200, await updates.check({ force }));
+        }
         if (pathname === "/__checkcc/net-core/connections") {
           if (!["GET", "POST"].includes(request.method)) return sendJson(response, 405, { error: "传输记录仅允许 GET/POST。" });
           const log = netCore?.connectionLog;

@@ -15,6 +15,18 @@ import { exitNetworkType } from "./network-type";
 type Probe = { status: number | null; error?: string; elapsedMs: number; tls?: { authorized: boolean; protocol: string | null } | null };
 type GeoSource = { source: string; ip: string; countryCode: string; city: string | null; regionName: string | null; timezone: string | null; asn: string | null; org: string | null };
 
+// 注册局名称不能说明运营商归属；仅以同 IP、同 ASN 的其它源补充分类依据，保留原始情报。
+function networkOrganizationSource(primary: GeoSource | null | undefined, sources: GeoSource[]): GeoSource | null {
+  if (!primary) return null;
+  const registry = /network information cent(?:er|re)\b|american registry for internet numbers|ripe network coordination cent(?:er|re)\b|\b(?:apnic|arin|ripe ncc|lacnic|afrinic|jpnic)\b/i;
+  const usefulOrg = (source: GeoSource) => Boolean(source.org?.trim()) && !registry.test(source.org ?? '');
+  if (usefulOrg(primary)) return primary;
+  const normalizeAsn = (asn: string | null) => asn?.trim().toUpperCase().match(/^(?:AS)?([0-9]+)$/)?.[1];
+  const asn = normalizeAsn(primary.asn);
+  if (!primary.ip || !asn) return primary;
+  return sources.find((source) => source.ip === primary.ip && normalizeAsn(source.asn) === asn && usefulOrg(source)) ?? primary;
+}
+
 export type CloakState = {
   enabled: boolean;
   updatedAt: string | null;
@@ -387,8 +399,12 @@ export function buildGatewayCheck(report: GatewayReport | null, locale: LocaleCo
   put("edgeAsnSecondary", asn ?? missing, asn ? "ok" : "unknown", asn ? tr("同一出口 ASN 的第二处展示（报告末行卡片）。", "Same exit ASN shown again in the last row card.") : missing);
   put("edgeOrg", org ?? missing, org ? "ok" : "unknown", org ? tr("出口网络组织，用于判断机房/云厂商特征。", "Exit network organization, used to infer datacenter/cloud traits.") : missing);
 
-  const networkType = exitNetworkType(org, locale, asn);
-  put("exitType", networkType.label, networkType.kind === "datacenter" ? "warning" : "unknown", networkType.detail, networkType.kind === "datacenter" ? 1 : 0);
+  const networkSource = networkOrganizationSource(exit?.primary, sources);
+  const networkType = exitNetworkType(networkSource?.org, locale, asn);
+  const networkSourceDetail = networkSource && networkSource !== exit?.primary
+    ? tr(` 网络类型参考 ${networkSource.source} 的组织名（与主源 IP、ASN 相同）。`, ` Network type uses the organization from ${networkSource.source} (same IP and ASN as the primary source).`)
+    : "";
+  put("exitType", networkType.label, networkType.kind === "datacenter" ? "warning" : networkType.kind === "residential" ? "ok" : "unknown", networkType.detail + networkSourceDetail, networkType.kind === "datacenter" ? 1 : 0);
   put("ipSourceCount", `${sources.length} / ${tr("目标 4 源", "target 4 sources")}`, sources.length ? "ok" : "unknown", sources.length ? tr(`成功返回出口情报的源：${sources.map((item) => item.source).join(", ")}。源多不代表结论更准，仅用于交叉核对。`, `Sources that returned exit intel: ${sources.map((item) => item.source).join(", ")}. More sources do not imply a stronger conclusion; they are used for cross-checking.`) : missing);
   const consistent = exit?.consistentCountry ?? (sources.length > 1 ? countries.length === 1 : null);
   put("multiSourceConsistency", consistent === null ? tr("源不足，无法交叉核对", "Not enough sources to cross-check") : consistent ? tr(`多源一致（${countries.join("/")}）`, `Consistent (${countries.join("/")})`) : tr(`多源不一致（${countries.join("/")}）`, `Inconsistent (${countries.join("/")})`), consistent === null ? (sources.length ? "not_applicable" : "unknown") : consistent ? "ok" : "error", tr("多源出口国家不一致时，实际出口可能不稳定或分流，建议复核代理规则。", "Conflicting exit countries suggest unstable or split routing; review proxy rules."), consistent === false ? 1 : 0);

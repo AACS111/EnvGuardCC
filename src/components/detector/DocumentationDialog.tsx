@@ -38,6 +38,7 @@ export function DocumentationDialog({ locale, onClose }: { locale: LocaleCode; o
     { name: text('测试项目', 'Test items'), detail: text('检测目录与每项依据；可按全部 / 异常 / 未判定 / 通过筛选、搜索，点条目查看详情并做单项处理。', 'The full test catalog with evidence. Filter by All / Issues / Unresolved / Passed, search, and open an item for details and single-item actions.') },
     { name: text('保护对比', 'Comparison'), detail: text('对比启动保护前后的采样：已检测到的变化、仍需关注、缺少基线和未变化项目。', 'Compare samples before and after protection: observed changes, items still needing attention, missing baselines and unchanged items.') },
     { name: text('设置', 'Settings'), detail: text('自动检测开关与间隔、开机自启、Claude 恢复初始化、运行提醒，以及网络和高级选项。', 'Automatic checks and interval, launch at login, Claude reset, runtime notices, plus network and advanced options.') },
+    { name: text('检查更新', 'Updates'), detail: text('左下角显示当前版本，有匹配安装包的新正式版本时提示「可更新」；点击可查看版本说明和下载入口。', 'The lower-left corner shows the current version and flags a newer stable release when a matching download is ready. Open it for release notes and downloads.') },
   ];
 
   const actions = [
@@ -48,6 +49,7 @@ export function DocumentationDialog({ locale, onClose }: { locale: LocaleCode; o
     { name: text('测速 / 检测出口', 'Measure / Probe exits'), detail: text('前者测量节点延迟，后者查询节点实际出口 IP 与地区；结果只作为判断依据，不按节点名称推断。', 'Measure node latency, or query each node’s actual exit IP and region. Results are measured evidence; node names are not used to infer exits.') },
     { name: text('复检路由 / 刷新', 'Recheck routing / Refresh'), detail: text('复检按当前节点重新验证连接路径；刷新重新采集出口与环境数据。', 'Recheck re-verifies the connection path for the selected node; Refresh re-samples exit and environment data.') },
     { name: text('查看检测结果', 'View results'), detail: text('「查看检测结果 / 查看全部 / 查看检测项」都会跳到「测试项目」并套用相应筛选。', '“View results / View all / View test items” jump to Test items with the matching filter applied.') },
+    { name: text('检查更新 / 下载新版本', 'Check updates / Download update'), detail: text('启动后自动检查，每 6 小时复查 GitHub 正式版本，也可手动重查。下载后请先正常退出应用，等待配置恢复，再安装。', 'Checks GitHub stable releases at startup and every 6 hours, with manual rechecks available. After downloading, quit normally and wait for restoration before installing.') },
   ];
 
   const boundaries = [

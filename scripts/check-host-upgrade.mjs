@@ -3,7 +3,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -108,7 +108,9 @@ test("宿主运行包自包含：被 import 的脚本必须在打包清单里", 
 });
 
 test("Windows 宿主文件显式授权，目录继承权限单独设置", async t => {
-  const directory = await mkdtemp(path.join(tmpdir(), "checkcc-host-acl-"));
+  // macOS exposes /var and /tmp through symlinks; this fixture needs a real
+  // directory so the production symlink rejection remains exercised faithfully.
+  const directory = await mkdtemp(path.join(await realpath(tmpdir()), "checkcc-host-acl-"));
   t.after(() => rm(directory, { recursive: true, force: true }));
   const executable = path.join(directory, "executable");
   await writeFile(executable, "fixture");

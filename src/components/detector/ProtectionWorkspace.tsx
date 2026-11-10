@@ -1,6 +1,7 @@
 "use client";
 import Image from 'next/image';
 import { DocumentationDialog } from './DocumentationDialog';
+import { AppUpdateNotice } from './AppUpdateNotice';
 import { WorkspaceIcon, type WorkspaceIconName } from './WorkspaceIcon';
 import type { TransferLogHandle } from './TransferLog';
 import { TrafficFlow } from './TrafficFlow';
@@ -197,6 +198,7 @@ export function ProtectionWorkspace(props: Props) {
         }}><WorkspaceIcon name={id as WorkspaceIconName} /><span className="workspace-tab-label">{label}</span>{id === 'tests' && <span className="workspace-nav-count">{signals.length}</span>}{id === 'network' && kernel.violationCount > 0 && <span className="workspace-nav-count">{kernel.violationCount}</span>}</button>)}
       </div>
       <div className="workspace-side-footer">
+        <AppUpdateNotice locale={locale} connected={connected} />
         <button type="button" className="workspace-text-link" aria-haspopup="dialog" onClick={() => setSettingsSection('general')}><WorkspaceIcon name="settings" />{text('设置', 'Settings')}</button>
         <div className="workspace-side-links">
           <button type="button" className="workspace-text-link" aria-haspopup="dialog" onClick={() => setDocsOpen(true)}><WorkspaceIcon name="document" />{text('使用文档', 'Documentation')}</button>
