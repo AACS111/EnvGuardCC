@@ -140,12 +140,12 @@ test('IPv6 状态放在出口结论内，区分双栈、降级及失败', () => 
   assert.match(protectedHtml, /IPv6.*保护隧道/);
 });
 
-test('关闭请求期间保持加载、禁用；结束后才允许再次操作', () => {
+test('关闭请求期间保持加载并允许用户重试', () => {
   for (const phase of ['active', 'idle']) {
     const html = button(phase, { powerAction: 'stop' });
-    assert.match(html, /disabled=""/);
+    assert.doesNotMatch(html, /disabled=""/);
     assert.match(html, /aria-busy="true"/);
-    assert.match(html, />关闭环境防护<\/button>/);
+    assert.match(html, />重试关闭<\/button>/);
   }
   assert.doesNotMatch(button('idle'), /disabled=""/);
   assert.match(button('idle'), />启动环境防护<\/button>/);
@@ -153,7 +153,7 @@ test('关闭请求期间保持加载、禁用；结束后才允许再次操作',
   assert.match(button('active'), />关闭环境防护<\/button>/);
 });
 
-test('启停和检测分阶段显示；启停完成后自动复检期间仍禁止重复操作', () => {
+test('启停和检测分阶段显示，保护按钮始终保留操作入口', () => {
   for (const powerAction of ['start', 'stop']) {
     const html = workspace('active', { powerAction, busy: true, checking: true });
     assert.doesNotMatch(html, /检测中…/);
@@ -166,7 +166,7 @@ test('启停和检测分阶段显示；启停完成后自动复检期间仍禁�
     const props = { busy: true, checking: true };
     assert.match(workspace(phase, props), /aria-busy="true"[^>]*>检测中…<\/button>/);
     const power = button(phase, props);
-    assert.match(power, /disabled=""/);
+    assert.doesNotMatch(power, /disabled=""/);
     assert.match(power, /aria-busy="false"/);
     assert.ok(power.includes(phase === 'active' ? '>关闭环境防护</button>' : '>启动环境防护</button>'));
   }
@@ -195,14 +195,14 @@ test('节点变化后仍显示关闭保护，先关闭再启动以重新适配',
   const report = { phase: 'restart_required', enabled: true, issues: [], history: [], testState: 'stale' };
   assert.match(button('restart_required', { report }), />关闭环境防护<\/button>/);
   assert.doesNotMatch(button('restart_required', { report }), /disabled=""/);
-  assert.match(button('restart_required', { report, powerAction: 'start' }), />启动环境防护<\/button>/);
-  assert.match(button('restart_required', { report, powerAction: 'start' }), /disabled=""/);
+  assert.match(button('restart_required', { report, powerAction: 'start' }), />启动中<\/button>/);
+  assert.doesNotMatch(button('restart_required', { report, powerAction: 'start' }), /disabled=""/);
 });
 
-test('页面从服务端读到启动或关闭阶段时仍禁用按钮并提供可访问的加载状态', () => {
-  for (const [phase, label] of [['starting', '启动环境防护'], ['stopping', '关闭环境防护']]) {
+test('启动和关闭期间按钮可重试，同时保留可访问的加载状态', () => {
+  for (const [phase, label] of [['starting', '启动中'], ['stopping', '重试关闭']]) {
     const html = button(phase);
-    assert.match(html, /disabled=""/);
+    assert.doesNotMatch(html, /disabled=""/);
     assert.match(html, /aria-busy="true"/);
     assert.ok(html.includes(`>${label}</button>`));
   }
@@ -222,7 +222,7 @@ test('保护控制只有一个按钮和两种文案，部分验证不新增状�
   assert.doesNotMatch(button('restore_failed', { report }), /disabled=""/);
   assert.match(button('restore_failed', { report }), />关闭环境防护<\/button>/);
   assert.match(workspace('idle', { connected: false }), /本机服务未连接/);
-  assert.match(button('idle', { connected: false }), /disabled=""/);
+  assert.doesNotMatch(button('idle', { connected: false }), /disabled=""/);
 });
 
 test('单按钮文案与动作一致，节点变化和恢复失败时点击关闭不会误启动', () => {
@@ -295,8 +295,9 @@ test('保护操作等待配置锁，重复浏览器同步共享进行中的结�
   const post = (endpoint, body) => fetch(helper.url + endpoint, { method: 'POST', headers, body: JSON.stringify(body) });
   const stopping = post('/protection', { action: 'stop' }).then(response => { finished = true; return response; });
   await stopSeen;
-  const duplicate = await post('/protection', { action: 'stop' });
-  assert.equal(duplicate.status, 409);
+  const duplicateSeen = requestSeen();
+  const duplicate = post('/protection', { action: 'stop' });
+  await duplicateSeen;
   assert.equal((await post('/browser-cloak', {})).status, 409);
   assert.equal(finished, false, 'restoration must wait for the running operation');
   held.end(JSON.stringify({ policy: { country: 'KR' } }));
@@ -304,6 +305,7 @@ test('保护操作等待配置锁，重复浏览器同步共享进行中的结�
   const stopped = await stopping;
   assert.equal(stopped.status, 200);
   assert.equal((await stopped.json()).phase, 'idle');
+  assert.equal((await duplicate).status, 200, '重复关闭也可重试，但必须等待系统写入结束');
   holdGateway = true;
   const seen = new Promise(resolve => { gatewaySeen = resolve; });
   const firstSync = post('/browser-cloak', { force: true });
@@ -342,7 +344,7 @@ function protectionHook(t, request) {
     cleanups = effects.map(effect => effect());
   } finally { global.setTimeout = originalTimeout; global.setInterval = originalInterval; }
   t.after(() => cleanups.forEach(cleanup => cleanup?.()));
-  return { ...hook, wake: () => wake(), state: () => ({ report: states[0], connected: states[1], error: states[2], busy: states[3] }) };
+  return { ...hook, wake: (resume = true) => wake({ resume }), state: () => ({ report: states[0], connected: states[1], error: states[2], busy: states[3] }) };
 }
 
 test('页面重开读取保护意愿，自动恢复保护并清除错误', async t => {
@@ -385,9 +387,9 @@ test('服务恢复或普通检测失败时保护仍启用，只读刷新不重�
     return report;
   });
   await hook.refresh(); assert.equal(hook.state().connected, false);
-  offline = false; hook.wake();
+  offline = false; hook.wake(false);
   await new Promise(resolve => setImmediate(resolve));
-  hook.wake(); await hook.refresh(); assert.equal(attempts, 0);
+  hook.wake(false); await hook.refresh(); assert.equal(attempts, 0);
   assert.equal(hook.state().busy, false);
   assert.equal(hook.state().connected, true); assert.equal(hook.state().error, '');
 });
@@ -406,6 +408,65 @@ test('手动关闭成功后忽略先前轮询的旧结果，唤醒不重新开�
   assert.equal(hook.state().report.enabled, false); assert.equal(attempts, 0);
   hold = false; hook.wake(); await new Promise(resolve => setImmediate(resolve));
   assert.equal(attempts, 0); assert.equal(hook.state().report.enabled, false);
+});
+
+test('休眠唤醒时保护仍显示开启，也重新建立网络并适配环境', async t => {
+  let attempts = 0;
+  const active = { enabled: true, desiredEnabled: true, phase: 'active', testState: 'passed' };
+  const hook = protectionHook(t, async action => { if (action === 'resume') attempts++; return active; });
+  await hook.refresh(); assert.equal(attempts, 0);
+  hook.wake(); await new Promise(resolve => setImmediate(resolve));
+  assert.equal(attempts, 1, '开启状态不能跳过唤醒恢复');
+  await hook.refresh(); assert.equal(attempts, 1, '普通轮询不重复适配');
+});
+
+test('唤醒时网络未就绪且保护仍开启，继续重试直至恢复', async t => {
+  const originalNow = Date.now;
+  let now = 1000, attempts = 0;
+  Date.now = () => now; t.after(() => { Date.now = originalNow; });
+  let report = { enabled: true, desiredEnabled: true, phase: 'active', testState: 'passed' };
+  const hook = protectionHook(t, async action => {
+    if (action === 'resume') {
+      attempts++;
+      report = { ...report, phase: attempts > 1 ? 'active' : 'partial', testState: attempts > 1 ? 'passed' : 'failed', testError: attempts > 1 ? null : 'network not ready' };
+    }
+    return report;
+  });
+  await hook.refresh(); hook.wake(); await new Promise(resolve => setImmediate(resolve));
+  assert.equal(attempts, 1);
+  assert.equal(hook.state().error, 'network not ready');
+  now += 1000; await hook.refresh(); assert.equal(attempts, 1);
+  now += 3000; await hook.refresh(); assert.equal(attempts, 2);
+  assert.equal(hook.state().error, '');
+});
+
+test('真正唤醒会取消睡眠前未结束的检测，立即请求恢复', async t => {
+  let attempts = 0;
+  const active = { enabled: true, desiredEnabled: true, phase: 'active', testState: 'passed' };
+  const hook = protectionHook(t, async action => {
+    if (action === 'resume') { attempts++; return active; }
+    return { ...active, testing: true };
+  });
+  await hook.refresh(); assert.equal(attempts, 0, '普通刷新不打断检测');
+  hook.wake(); await new Promise(resolve => setImmediate(resolve));
+  assert.equal(attempts, 1);
+});
+
+test('恢复过程中再次上线，旧响应不能吞掉新网络的恢复请求', async t => {
+  let attempts = 0, release;
+  const active = { enabled: true, desiredEnabled: true, phase: 'active', testState: 'passed' };
+  const hook = protectionHook(t, async action => {
+    if (action === 'resume') {
+      attempts++;
+      if (attempts === 1) return new Promise(resolve => { release = resolve; });
+    }
+    return active;
+  });
+  await hook.refresh(); hook.wake(); await new Promise(resolve => setImmediate(resolve));
+  assert.equal(attempts, 1);
+  hook.wake(); release(active); await new Promise(resolve => setImmediate(resolve));
+  await hook.refresh(); assert.equal(attempts, 2);
+  await hook.refresh(); assert.equal(attempts, 2, '成功覆盖最新网络后不重复适配');
 });
 
 

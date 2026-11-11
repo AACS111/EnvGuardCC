@@ -46,7 +46,7 @@ test("健康检查：认不出版本字段的宿主一律算过旧", () => {
   assert.equal(checkHostHealth({ hostProtocol: 1, capabilities: [...HOST_CAPABILITIES] }).ok, false);
   const partial = checkHostHealth({ hostProtocol: HOST_PROTOCOL, capabilities: [] });
   assert.equal(partial.ok, false);
-  assert.deepEqual(partial.missing, ["ipv6"]);
+  assert.deepEqual(partial.missing, HOST_CAPABILITIES);
 
   const current = checkHostHealth({ hostProtocol: HOST_PROTOCOL, capabilities: [...HOST_CAPABILITIES] });
   assert.equal(current.ok, true);
@@ -72,7 +72,7 @@ test("旧宿主在线时按本机模式运行，并留下过旧标记", async ()
     assert.ok(report.hostStale, "旧宿主必须被标记为过旧");
     assert.equal(report.hostStale.protocol, 0);
     assert.equal(report.hostStale.required, HOST_PROTOCOL);
-    assert.deepEqual(report.hostStale.missing, ["ipv6"]);
+    assert.deepEqual(report.hostStale.missing, HOST_CAPABILITIES);
     assert.ok(logs.some((line) => /版本过旧/.test(line)), "要写一条宿主过旧的日志");
   } finally {
     await cleanup();

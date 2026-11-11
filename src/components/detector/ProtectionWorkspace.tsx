@@ -113,7 +113,7 @@ export function ProtectionWorkspace(props: Props) {
   const compact = useSyncExternalStore(subscribeNavigation, compactNavigation, () => false);
   const protectionEnabled = Boolean(report?.enabled);
   const turnOff = stopping || (!starting && (protectionEnabled || report?.phase === 'restore_failed'));
-  const action = turnOff ? text('关闭环境防护', 'Stop environment protection') : text('启动环境防护', 'Start environment protection');
+  const action = starting ? text('启动中', 'Starting') : stopping ? text('重试关闭', 'Retry stop') : turnOff ? text('关闭环境防护', 'Stop environment protection') : text('启动环境防护', 'Start environment protection');
   const tabs = [['basic', text('概览', 'Overview')], ['network', text('网络', 'Network')], ['tests', text('测试项目', 'Test items')], ['compare', text('保护对比', 'Comparison')]];
   const kernel = netCoreView(props.netCore, { locale });
   const measured = signals.filter(signal => measurementStatus(signal.id, props.browser.find(item => item.id === signal.id), props.claude.find(item => item.id === signal.id)) === 'measured').length;
@@ -186,7 +186,7 @@ export function ProtectionWorkspace(props: Props) {
         <button type="button" className="repair-button workspace-mobile-settings" aria-label={text('设置', 'Settings')} aria-haspopup="dialog" onClick={() => setSettingsSection('general')}><WorkspaceIcon name="settings" /></button>
         <span className="workspace-connection" data-connected={connected}><span aria-hidden="true" />{connected ? text('本机服务已连接', 'Local service connected') : text('本机服务未连接', 'Local service disconnected')}</span>
         <button type="button" className="repair-button repair-button--primary" disabled={busy || checking} aria-busy={checking} onClick={props.onRefresh}>{checking ? text('检测中…', 'Checking…') : text('检测', 'Check')}</button>
-        <button type="button" className="repair-button workspace-power" data-enabled={protectionEnabled} disabled={busy || !connected || !report} onClick={turnOff ? props.onStop : props.onToggle} aria-busy={stopping || starting} aria-label={text('环境防护：', 'Environment protection: ') + action}>{action}</button>
+        <button type="button" className="repair-button workspace-power" data-enabled={protectionEnabled} onClick={turnOff ? props.onStop : props.onToggle} aria-busy={stopping || starting} aria-label={text('环境防护：', 'Environment protection: ') + action}>{action}</button>
       </div>
     </header>
     <aside className="workspace-sidebar">

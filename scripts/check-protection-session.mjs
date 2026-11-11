@@ -8,6 +8,76 @@ import { createProtectionService, targetFromExit } from './protection-service.mj
 import { BrowserCloakController } from './browser-cloak.mjs';
 
 const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+test('启动卡在出口检测时可重试，旧检测晚到不覆盖新启动', async t => {
+  let releaseOld, entered;
+  const waiting = new Promise(resolve => { entered = resolve; });
+  let detects = 0;
+  const target = { ip: '203.0.113.45', language: 'ko-KR', locale: 'ko-KR' };
+  const f = await fixture(t, { detect: async () => {
+    if (++detects === 1) { entered(); return new Promise(resolve => { releaseOld = resolve; }); }
+    return target;
+  } });
+  const old = f.session.start('http://localhost:3000');
+  const cancelled = assert.rejects(old, { name: 'AbortError' });
+  await waiting;
+  const fresh = await Promise.race([f.session.restart('http://localhost:3000'), delay(1000).then(() => { throw new Error('重试仍被旧检测阻塞'); })]);
+  assert.equal(fresh.enabled, true);
+  assert.equal(fresh.target.ip, target.ip);
+  releaseOld({ ...target, ip: '203.0.113.99' });
+  await cancelled;
+  await delay(0);
+  assert.deepEqual(f.calls, [target.ip]);
+  assert.equal(f.session.report().target.ip, target.ip);
+});
+
+test('重试等待已开始的配置写入安全回滚，保留原始基线', async t => {
+  let release, entered;
+  const writing = new Promise(resolve => { entered = resolve; });
+  const f = await fixture(t);
+  const apply = f.session.apply;
+  let applies = 0;
+  f.session.apply = async (...args) => {
+    if (++applies === 1) { entered(); await new Promise(resolve => { release = resolve; }); }
+    return apply(...args);
+  };
+  const old = f.session.start();
+  const cancelled = assert.rejects(old, { name: 'AbortError' });
+  await writing;
+  let done = false;
+  const retry = f.session.restart().then(report => { done = true; return report; });
+  await delay(10);
+  assert.equal(done, false, '旧写入完成前不能并行启动');
+  release();
+  await cancelled;
+  assert.equal((await retry).enabled, true);
+  await f.session.stop();
+  assert.deepEqual(f.settings(), f.original);
+});
+
+test('连续重试只执行最后一次，随后关闭优先于排队重试', async t => {
+  let entered, release;
+  const waiting = new Promise(resolve => { entered = resolve; });
+  let detects = 0;
+  const f = await fixture(t, { detect: async () => {
+    if (++detects === 1) { entered(); await new Promise(resolve => { release = resolve; }); }
+    return { ip: '203.0.113.45', language: 'ko-KR', locale: 'ko-KR' };
+  } });
+  const old = f.session.start();
+  const cancelled = assert.rejects(old, { name: 'AbortError' });
+  await waiting;
+  const first = f.session.restart();
+  const second = f.session.restart();
+  await Promise.all([first, second, cancelled]);
+  release();
+  assert.equal(f.calls.length, 1);
+  const retry = f.session.restart();
+  const stop = f.session.stop();
+  await Promise.all([retry, stop]);
+  assert.equal(f.session.report().enabled, false);
+  assert.equal(f.session.report().desiredEnabled, false);
+  assert.deepEqual(f.settings(), f.original);
+});
 async function fixture(t, overrides = {}) {
   const stateDir = await mkdtemp(path.join(os.tmpdir(), 'checkcc-protection-'));
   let settings = { timezone: 'Original', language: 'original' };
@@ -267,7 +337,7 @@ test('启动期间排队的唤醒不能越过后续关闭，重新打开网络�
   const wake = f.session.resume('http://localhost:3000');
   const stopping = f.session.stop(); release();
   await Promise.all([starting, wake, stopping]);
-  assert.equal(applies, 1); assert.equal(f.session.report().desiredEnabled, false);
+  assert.equal(applies, 0, '尚未开始的启动被关闭意愿取消'); assert.equal(f.session.report().desiredEnabled, false);
   await f.session.start('http://localhost:3000'); await f.session.stop({ shutdown: true });
   const reopened = new ProtectionSession(f.options);
   t.after(() => clearInterval(reopened.timer));

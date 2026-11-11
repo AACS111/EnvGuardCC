@@ -59,7 +59,9 @@ export async function readHostConfig(stateDir, requested) {
   return config;
 }
 
-export function createKernelHost({ token, binary, stateDir, apiPort = 39090, host = "127.0.0.1", port = 39091, spawn, fetchImpl, lookup, logger = () => {}, requiresAdmin = true, ports = {}, leaseTimeoutMs = 30000, firewall = createFirewallGuard() } = {}) {
+export function createKernelHost({ token, binary, stateDir, apiPort = 39090, host = "127.0.0.1", port = 39091, spawn, fetchImpl, lookup, logger = () => {}, requiresAdmin = true, ports = {}, leaseTimeoutMs = 30000, ownerAlive = (pid) => {
+  try { process.kill(pid, 0); return true; } catch (error) { return error.code === 'ESRCH' ? false : null; }
+}, createCore = createNetCore, systemIpv6 = { disable: disableSystemIpv6, restore: restoreSystemIpv6 }, firewall = createFirewallGuard() } = {}) {
   if (typeof token !== "string" || token.length < 16) throw new Error("宿主令牌太短。");
   if (typeof binary !== "string" || !binary) throw new Error("缺少内核二进制路径。");
   if (typeof stateDir !== "string" || !stateDir) throw new Error("缺少状态目录。");
@@ -71,8 +73,11 @@ export function createKernelHost({ token, binary, stateDir, apiPort = 39090, hos
 
   let core = null;
   let ipv6State = null;
+  let ipv6Operation = Promise.resolve();
   let closing = false;
   let leaseAt = 0;
+  let leaseOwner = null;
+  let leaseSuspect = false;
   let leaseTimer;
   let monitoring = false;
   let lastGuardInspection = 0;
@@ -116,7 +121,7 @@ export function createKernelHost({ token, binary, stateDir, apiPort = 39090, hos
       ipv6State = null;
       if (!state) return { enabled: true, changed: false };
       try {
-        const changed = await restoreSystemIpv6(state);
+        const changed = await systemIpv6.restore(state);
         return { enabled: true, changed, service: state.service };
       } catch (error) {
         ipv6State = state;
@@ -124,8 +129,14 @@ export function createKernelHost({ token, binary, stateDir, apiPort = 39090, hos
       }
     }
     if (ipv6State) return { enabled: false, ...ipv6State };
-    ipv6State = await disableSystemIpv6({ platform: process.platform });
+    try { ipv6State = await systemIpv6.disable({ platform: process.platform }); }
+    catch (error) { ipv6State = error.ipv6State ?? ipv6State; throw error; }
     return { enabled: false, ...ipv6State };
+  }
+  function queueIpv6(enabled) {
+    const pending = ipv6Operation.then(() => applyIpv6(enabled));
+    ipv6Operation = pending.catch(() => {});
+    return pending;
   }
 
   async function start(configPath, strict = false, guardRevision = null) {
@@ -140,7 +151,7 @@ export function createKernelHost({ token, binary, stateDir, apiPort = 39090, hos
     privateHome = await mkdtemp(path.join(tmpdir(), "envguardcc-host-"));
     const snapshot = path.join(privateHome, "config.yaml");
     await writeFile(snapshot, stringifyYaml(config), { mode: 0o600 });
-    core = createNetCore({ binary, homeDir: privateHome, configPath: snapshot, apiPort, secret: config.secret, spawn, fetchImpl, lookup, logger });
+    core = createCore({ binary, homeDir: privateHome, configPath: snapshot, apiPort, secret: config.secret, spawn, fetchImpl, lookup, logger });
     await core.start();
     leaseAt = Date.now();
     networkKey = physicalNetwork();
@@ -159,7 +170,7 @@ export function createKernelHost({ token, binary, stateDir, apiPort = 39090, hos
     const leftover = await clearLeftoverKernel();
     if (leftover) logger(`[host] 停止时清理了遗留内核 ${leftover}。`);
     if (privateHome) { await rm(privateHome, { recursive: true, force: true }); privateHome = null; }
-    await applyIpv6(true).catch((error) => logger(`[host] 恢复 IPv6 失败：${error.message}`));
+    await queueIpv6(true).catch((error) => logger(`[host] 恢复 IPv6 失败：${error.message}`));
     return { running: false, clearedLeftover: leftover };
   }
 
@@ -181,7 +192,7 @@ export function createKernelHost({ token, binary, stateDir, apiPort = 39090, hos
     }
     const url = new URL(request.url ?? "/", "http://127.0.0.1");
     if (request.method === "GET" && url.pathname === "/health") {
-      send(response, 200, { ok: true, running: Boolean(core?.state().running), apiPort, requiresAdmin, guard: firewall.status(), hostProtocol: 2, capabilities: ["ipv6"] });
+      send(response, 200, { ok: true, running: Boolean(core?.state().running), apiPort, requiresAdmin, guard: firewall.status(), hostProtocol: 3, capabilities: ["ipv6", "owner-lease"] });
       return;
     }
     if (request.method !== "POST" || url.pathname !== "/kernel") {
@@ -199,14 +210,20 @@ export function createKernelHost({ token, binary, stateDir, apiPort = 39090, hos
     const action = value?.action;
     if (!ACTIONS.has(action)) { send(response, 400, { error: "未知动作。" }); return; }
     if (action === 'heartbeat') {
-      if (!core?.state().running) { send(response, 409, { ok: false, reason: "内核未运行。" }); return; }
+      if (!core?.state().running) { send(response, 409, { ok: false, code: 'KERNEL_NOT_RUNNING', reason: "内核未运行。" }); return; }
+      if (leaseOwner && (value.leaseOwner?.id !== leaseOwner.id || value.leaseOwner?.pid !== leaseOwner.pid)) {
+        send(response, 409, { ok: false, code: 'LEASE_MISMATCH', reason: '应用实例已变化，请重新连接宿主。' }); return;
+      }
       leaseAt = Date.now();
+      leaseSuspect = false;
       send(response, 200, { ok: true, guard: firewall.status() });
       return;
     }
 
     try {
-      if (action === "ipv6") { send(response, 200, { ok: true, ...await applyIpv6(value.enabled === true) }); return; }
+      if (action === "ipv6") {
+        send(response, 200, { ok: true, ...await queueIpv6(value.enabled === true) }); return;
+      }
       if (action === "guard-status") { send(response, 200, { ok: true, guard: await firewall.inspect() }); return; }
       if (action === "guard-block") { send(response, 200, { ok: true, guard: await firewall.block() }); return; }
       if (action === "guard-release") { send(response, 200, { ok: true, guard: await firewall.release() }); return; }
@@ -216,9 +233,13 @@ export function createKernelHost({ token, binary, stateDir, apiPort = 39090, hos
       }
       if (action === "stop") { send(response, 200, { ok: true, ...await serialize(stop) }); return; }
       const configPath = resolveConfigPath(stateDir, value?.configPath);
+      if (value.leaseOwner && (!Number.isInteger(value.leaseOwner.pid) || value.leaseOwner.pid <= 0 || value.leaseOwner.pid > 2147483647 || typeof value.leaseOwner.id !== 'string' || !/^[\w-]{1,128}$/.test(value.leaseOwner.id))) throw new Error('无效的应用实例标识。');
       const result = await serialize(async () => {
         if (action === "restart") await stop();
-        return start(configPath, value.strict === true, value.guardRevision ?? null);
+        const started = await start(configPath, value.strict === true, value.guardRevision ?? null);
+        leaseOwner = value.leaseOwner ? { pid: value.leaseOwner.pid, id: value.leaseOwner.id } : null;
+        leaseSuspect = false;
+        return started;
       });
       send(response, 200, { ok: true, ...result });
     } catch (error) {
@@ -251,8 +272,16 @@ export function createKernelHost({ token, binary, stateDir, apiPort = 39090, hos
             if (Date.now() - lastGuardInspection >= 5000) { await firewall.inspect(); lastGuardInspection = Date.now(); }
           }
           if (core && Date.now() - leaseAt > leaseTimeoutMs) {
-            logger('[host] 应用心跳超时，回收内核。');
-            await stop();
+            let alive = null;
+            try { if (leaseOwner) alive = await ownerAlive(leaseOwner.pid); } catch { /* 无法确认时保留进程。 */ }
+            if (!leaseOwner || alive === false) {
+              logger('[host] 应用已退出或旧版租约过期，回收内核。');
+              await stop();
+            } else {
+              if (!leaseSuspect) logger('[host] 应用心跳暂时失联，未确认应用退出，保留内核并等待重连。');
+              leaseSuspect = true;
+              leaseAt = Date.now();
+            }
           }
         }).catch(error => logger(`[host] 租约回收失败：${error.message}`)).finally(() => { monitoring = false; });
       }, Math.min(1000, leaseTimeoutMs));

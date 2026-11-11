@@ -61,13 +61,16 @@ export function createProtectionService({ stateDir, runtime, browserCloak, curre
   const browserErrors = report => [...report.results.filter(result => result.state !== "verified").map(result => result.detail), ...(report.requestProbe?.state !== "verified" ? [report.requestProbe?.detail || "浏览器实际请求尚未验证。"] : [])];
   const session = new ProtectionSession({
     stateDir, canTest,
-    beforeActivate: async () => {
+    beforeActivate: async ({ signal } = {}) => {
+      signal?.throwIfAborted();
       const kernel = network();
       if (!kernel) return;
       // 先解除未保护阻断，否则保护自己的模拟测试会被 REJECT 规则挡住。
       if (kernel.setUnprotectedGuard) await kernel.setUnprotectedGuard(false);
+      signal?.throwIfAborted();
       unprotectedBlock = { active: false, error: null };
       await kernel.setTunnel(true, { ensureHost: true });
+      signal?.throwIfAborted();
       await assertNetwork();
     },
     beforeTest: assertNetwork,

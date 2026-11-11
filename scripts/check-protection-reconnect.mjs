@@ -39,6 +39,22 @@ test('浏览器睡眠期间错过事件，计时器恢复后仍触发重连', ()
   close();
 });
 
+test('只有真实唤醒、网络上线和计时器恢复要求重新适配，普通切回窗口只刷新', () => {
+  const target = new EventTarget(), page = new EventTarget(), clock = timers();
+  let now = 0;
+  const events = [];
+  const close = watchProtectionConnection(event => events.push(event), { target, page, now: () => now, ...clock });
+  target.dispatchEvent(new Event('focus')); clock.flush();
+  assert.deepEqual(events.pop(), { resume: false });
+  target.dispatchEvent(new Event('focus')); target.dispatchEvent(new Event('checkcc:resume')); clock.flush();
+  assert.deepEqual(events.pop(), { resume: true }, '合并事件不能丢失唤醒意图');
+  target.dispatchEvent(new Event('online')); clock.flush();
+  assert.deepEqual(events.pop(), { resume: true });
+  now = 60000; [...clock.intervals.values()][0](); clock.flush();
+  assert.deepEqual(events.pop(), { resume: true });
+  close();
+});
+
 test('仅在用户开启保护时防止空闲睡眠，断线不释放，关闭或退出后释放', async () => {
   const monitor = new EventEmitter(), clock = timers();
   let enabled = false, desiredEnabled = false, offline = false, notifications = 0;

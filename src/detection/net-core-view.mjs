@@ -49,6 +49,7 @@ const STATE_LABELS = {
   unavailable: ["状态不可读", "Status unavailable"],
   off: ["未接入", "Not connected"],
   starting: ["启动中", "Starting"],
+  offline: ["等待网络", "Waiting for network"],
 };
 
 function normalizeViolation(item) {
@@ -184,6 +185,14 @@ export function netCoreView(report, { locale = "zh", exitHistory = null } = {}) 
       title: t("内核状态不可读", "Kernel status unavailable"),
       detail: report.reason || t("请确认内核进程仍在运行。", "Confirm the kernel process is still running."),
     };
+  } else if (state === "offline") {
+    // 断网不是内核故障：等 network 回来就自动复检/重建，不能报成「启动失败」吓人。
+    tone = "warn";
+    conclusion = {
+      tone: "warn",
+      title: t("网络已断开 · 等待恢复", "Network down · waiting to recover"),
+      detail: report.reason || t("网络恢复后会自动复检，不需要手动重启。", "Verification resumes automatically when the network returns; no manual restart is needed."),
+    };
   } else if (routing?.state === "violation" || Number(routing?.direct ?? 0) > 0) {
     tone = "danger";
     conclusion = {
@@ -261,6 +270,17 @@ export function netCoreView(report, { locale = "zh", exitHistory = null } = {}) 
       .filter(Boolean).join(zh ? " " : " ");
   } else if (state === "running" && tunEnabled && tunCaptured === null) {
     conclusion.detail += t(" 隧道接管状态未知，不能确认系统流量已受保护。", " Tunnel capture is unknown; system traffic protection is unverified.");
+  }
+  // 有线 + 无线同时在线时默认接口会跳，TUN 跟着重建，表现为“一波动就断”。
+  if (state === "running" && Number(report.network?.links) > 1) {
+    conclusion.detail = [conclusion.detail, t("检测到多个网络同时在线（例如同时连有线和无线），出口可能抖动；建议只保留一条网络。", "Multiple networks are online (e.g. Ethernet and Wi-Fi); the exit may flap. Keeping a single link is recommended.")]
+      .filter(Boolean).join(zh ? " " : " ");
+  }
+  // 宿主暂时探测不到：保持宿主模式，不降级自起内核（否则会抢 39090/TUN）。
+  if (report.hostProbeFailed === true) {
+    conclusion.detail = [conclusion.detail, t("特权宿主暂时无响应，已在保持现有模式；稍后重试即可，不会另起一个内核。", "The privileged helper is temporarily unresponsive; the current mode is kept. Retry shortly — no second kernel is started.")]
+      .filter(Boolean).join(zh ? " " : " ");
+    if (tone === "ok") { tone = "warn"; conclusion.tone = "warn"; }
   }
 
   const violations = dedupeViolations(routing?.violations).map((item) => ({

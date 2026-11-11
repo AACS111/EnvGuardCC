@@ -8,10 +8,10 @@
 //
 // 所以：认不出版本字段（升级前的宿主）一律算过旧，交给应用内授权安装更新。
 
-export const HOST_PROTOCOL = 2;
+export const HOST_PROTOCOL = 3;
 
 /** 界面依赖的宿主动作；缺少任何一个都必须重新授权安装。 */
-export const HOST_CAPABILITIES = ["ipv6"];
+export const HOST_CAPABILITIES = ["ipv6", "owner-lease"];
 
 /**
  * 解析 /health 返回值，判断宿主是否够新。

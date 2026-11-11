@@ -306,11 +306,11 @@ export function createNetCore({
     }
   }
 
-  async function status() {
+  async function status({ includeConnections = true } = {}) {
     if (!ready) throw new Error("内核未就绪。");
     const [version, connections, proxies] = await Promise.all([
       request("/version"),
-      request("/connections"),
+      includeConnections ? request("/connections") : null,
       request("/proxies"),
     ]);
     return {

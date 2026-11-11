@@ -86,6 +86,8 @@ export function Detector({ locale = "zh" }: { locale?: LocaleCode }) {
   const [transitioning, setTransitioning] = useState(false);
   const [powerAction, setPowerAction] = useState<"start" | "stop" | null>(null);
   const powerLock = useRef(false);
+  const powerVersion = useRef(0);
+  const activationBaseline = useRef<Baseline | null>(null);
   const scanLock = useRef(false);
   const scanTask = useRef<Promise<void> | null>(null);
   const scanVersion = useRef(0);
@@ -273,6 +275,7 @@ export function Detector({ locale = "zh" }: { locale?: LocaleCode }) {
       if (Object.keys(baseline.policy).length) installRuntimePolicy(baseline.policy); else restoreRuntimePolicy();
       for (const [key, value] of Object.entries(baseline.storage)) { if (value === null) localStorage.removeItem(key); else localStorage.setItem(key, value); }
       localStorage.removeItem("checkcc.protection-local-pending.v1");
+      activationBaseline.current = null;
     }, 0);
     return () => clearTimeout(timer);
   }, [baseline, protection.report?.phase, protection.connected, transitioning, protection.busy]);
@@ -413,44 +416,67 @@ export function Detector({ locale = "zh" }: { locale?: LocaleCode }) {
     await Promise.all([refreshExit(), enabled ? protectionRequest("test").then(() => protection.refresh()) : runAll({ background: true })]);
   };
   const toggleProtection = async (stop = false) => {
-    if (powerLock.current || transitioning || protection.busy || !protection.connected || !protection.report || protection.report.phase === "starting" || protection.report.phase === "stopping") return;
+    const retrying = powerLock.current || protection.busy || protection.report?.phase === 'starting' || protection.report?.phase === 'stopping';
+    const attempt = ++powerVersion.current;
     powerLock.current = true;
     scanVersion.current++; scanTask.current = null; scanLock.current = false; setRunning(false);
-    const restarting = protection.report.phase === "restart_required" && !stop;
-    const stopping = !restarting && (protection.report.enabled || protection.report.phase === "restore_failed");
+    const restarting = !stop && (retrying || protection.report?.phase === "restart_required");
+    const stopping = stop || (!restarting && (protection.report?.enabled || protection.report?.phase === "restore_failed"));
     setPowerAction(stopping ? "stop" : "start");
     setTransitioning(true); setCheckError("");
     try {
+      // Capture reversible page settings before any asynchronous scan. Retries
+      // share this baseline even when the first scan has not returned yet.
+      if (!stopping && !activationBaseline.current) {
+        if (localStorage.getItem('checkcc.protection-local-pending.v1')) {
+          const saved = JSON.parse(localStorage.getItem(baselineKey) ?? 'null') as Baseline | null;
+          if (!saved?.policy || !saved.storage) throw new Error(zh ? '原始配置备份不可用，请先关闭保护并重试恢复。' : 'The original settings backup is unavailable. Stop protection and retry restoration first.');
+          activationBaseline.current = saved;
+        }
+        if (!activationBaseline.current) {
+          const saved: Baseline = { at: new Date().toISOString(), browser: browserSignals, claude: claudeSignals, score: environmentScores(browserSignals, claudeSignals).combined, policy: activeRuntimePolicy(), storage: Object.fromEntries(storageKeys.map(key => [key, localStorage.getItem(key)])) };
+          localStorage.setItem(baselineKey, JSON.stringify(saved));
+          localStorage.setItem('checkcc.protection-local-pending.v1', 'true');
+          activationBaseline.current = saved; setBaseline(saved);
+        }
+      }
       if (stopping) {
         // 后台先恢复环境，再解除 TUN；页面不再拆分网络与会话事务。
         const report = await protection.act("stop");
+        if (attempt !== powerVersion.current) return;
         if (report.phase === "restore_failed") throw new Error(report.issues.join("；"));
-        if (baseline) {
-          if (Object.keys(baseline.policy).length) installRuntimePolicy(baseline.policy); else restoreRuntimePolicy();
-          for (const [key, value] of Object.entries(baseline.storage)) { if (value === null) localStorage.removeItem(key); else localStorage.setItem(key, value); }
+        const original = activationBaseline.current ?? baseline;
+        if (original) {
+          if (Object.keys(original.policy).length) installRuntimePolicy(original.policy); else restoreRuntimePolicy();
+          for (const [key, value] of Object.entries(original.storage)) { if (value === null) localStorage.removeItem(key); else localStorage.setItem(key, value); }
         }
         localStorage.removeItem("checkcc.protection-local-pending.v1");
+        activationBaseline.current = null;
       } else if (restarting) {
-        await protection.act("start");
+        await protection.act("restart");
       } else {
         const [browser, gateway] = await Promise.all([runBrowserScan(normalizeRegion(region), locale, detectorText), checkGateway(locale)]);
+        if (attempt !== powerVersion.current) return;
         if (!gateway.report) throw new Error(gateway.error ?? "网关未连接。");
-        const saved: Baseline = { at: new Date().toISOString(), browser: browser.signals, claude: gateway.signals, score: environmentScores(browser.signals, gateway.signals).combined, policy: activeRuntimePolicy(), storage: Object.fromEntries(storageKeys.map((key) => [key, localStorage.getItem(key)])) };
+        const saved: Baseline = { ...activationBaseline.current!, browser: browser.signals, claude: gateway.signals, score: environmentScores(browser.signals, gateway.signals).combined };
+        activationBaseline.current = saved;
         localStorage.setItem(baselineKey, JSON.stringify(saved)); setBaseline(saved);
         localStorage.setItem("checkcc.protection-local-pending.v1", "true");
         await protection.act("start");
       }
+      if (attempt !== powerVersion.current) return;
       setPowerAction(null);
       if (stopping) {
         await selfTest.refresh();
       }
       void refreshChecks(!stopping).catch(() => {});
     } catch (error) {
+      if (attempt !== powerVersion.current) return;
       const reason = error instanceof Error ? error.message : String(error);
       setCheckError(reason);
       if (hostPermissionError(reason) && ["darwin", "win32"].includes(netCore?.elevation?.platform ?? "")) setHostAuth({ error: "", purpose: "protection" });
     }
-    finally { powerLock.current = false; setPowerAction(null); setTransitioning(false); }
+    finally { if (attempt === powerVersion.current) { powerLock.current = false; setPowerAction(null); setTransitioning(false); } }
   };
   const recheck = async () => {
     if (powerLock.current || manualChecking || transitioning || protection.busy) return;

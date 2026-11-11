@@ -43,7 +43,7 @@ const backupFile = path.join(stateDir, "timezone-backup.json");
 const profileFile = path.join(stateDir, "region-profile.json");
 const desktopLauncher = new DesktopLauncher({ stateDir });
 let changing = false;
-let protectionChanging = false;
+let protectionChanging = 0;
 let closing = false;
 let closePending = null;
 let initializing = true;
@@ -257,16 +257,30 @@ const server = http.createServer(async (req, res) => {
         if (changing || protectionChanging) return send(409, { error: "配置正在执行，请稍后检测。" });
         return send(200, await protection.retest());
       }
+      if (body.action === 'restart' || body.action === 'stop') {
+        resetTimezoneServiceAuthorization();
+        const handover = protectionChanging > 0;
+        protectionChanging++;
+        try {
+          // A retry may join an existing protection transaction, but never bypass
+          // an unrelated system write while the first request is still waiting.
+          if (!handover || !protection.operationCount) {
+            while (changing && !protection.operationCount) await new Promise(resolve => setTimeout(resolve, 50));
+            if (!handover) changing = true;
+          }
+          return send(200, await protection[body.action](body.action === 'stop' ? undefined : origin));
+        } finally { if (!handover) changing = false; protectionChanging--; }
+      }
       if (!["start", "stop", "test", "resume"].includes(body.action)) return send(400, { error: "无效操作。" });
       if (protectionChanging) return send(409, { error: "配置正在执行，请稍后重试。" });
       if (body.action === 'start' || body.action === 'stop') resetTimezoneServiceAuthorization();
-      protectionChanging = true;
+      protectionChanging++;
       try {
         // Reserve explicit protection actions so background sync cannot starve them.
         while (changing) await new Promise(resolve => setTimeout(resolve, 50));
         changing = true;
         try { return send(200, await protection[body.action](origin, { background: body.background === true })); } finally { changing = false; }
-      } finally { protectionChanging = false; }
+      } finally { protectionChanging--; }
     } catch (error) { return send(400, { error: error.message }); }
   }
   if (req.method === "GET" && req.url === "/session?tokenOnly=1") return send(200, { token: secret });

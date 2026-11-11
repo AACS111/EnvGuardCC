@@ -12,7 +12,10 @@ export function useProtection() {
   const pending = useRef(false);
   const mutating = useRef(false);
   const version = useRef(0);
+  const actionController = useRef<AbortController | null>(null);
   const wasConnected = useRef(false);
+  const wakePending = useRef(false);
+  const wakeVersion = useRef(0);
   const recovery = useRef({ needed: false, retryAt: 0, delay: 3000 });
   const refresh = useCallback(async () => {
     if (pending.current || mutating.current) return;
@@ -26,18 +29,20 @@ export function useProtection() {
       if (!wasConnected.current && !next.enabled) recovery.current.needed = true;
       wasConnected.current = true; setConnected(true); setReport(next);
       const wanted = next.desiredEnabled ?? next.enabled;
-      if (!wanted || next.enabled) { recovery.current = { needed: false, retryAt: 0, delay: 3000 }; setError(''); return; }
+      if (!wanted || (next.enabled && !wakePending.current)) { wakePending.current = false; recovery.current = { needed: false, retryAt: 0, delay: 3000 }; setError(''); return; }
       if (next.phase === 'idle') recovery.current.needed = true;
-      if (!recovery.current.needed || Date.now() < recovery.current.retryAt || next.testing || ['starting', 'stopping', 'restore_failed'].includes(next.phase)) return;
+      if (!recovery.current.needed || Date.now() < recovery.current.retryAt || (next.testing && !wakePending.current) || ['starting', 'stopping', 'restore_failed'].includes(next.phase)) return;
       mutating.current = true; setBusy(true);
       try {
+        const resumingWake = wakeVersion.current;
         next = await protectionRequest('resume', { background: true });
-        if (!alive.current) return;
+        if (!alive.current || current !== version.current) return;
         setReport(next);
         if (next.testState !== 'passed' && !next.testing && (next.desiredEnabled ?? next.enabled)) throw new Error(next.testError || '自动重连检测尚未完成');
-        recovery.current = { needed: false, retryAt: 0, delay: 3000 };
+        wakePending.current = wakeVersion.current !== resumingWake;
+        recovery.current = { needed: wakePending.current, retryAt: 0, delay: 3000 };
         setError('');
-      } finally { mutating.current = false; if (alive.current) setBusy(false); }
+      } finally { if (current === version.current) { mutating.current = false; if (alive.current) setBusy(false); } }
     } catch (failure) {
       if (current !== version.current) return;
       recovery.current.needed = true;
@@ -54,23 +59,27 @@ export function useProtection() {
     alive.current = true;
     const first = setTimeout(() => void refresh(), 0);
     const timer = setInterval(() => void refresh(), 2500);
-    const unwatch = watchProtectionConnection(() => {
+    const unwatch = watchProtectionConnection((event: { resume?: boolean } = {}) => {
+      if (event.resume) { wakePending.current = true; wakeVersion.current++; }
       recovery.current.needed = true; recovery.current.retryAt = 0;
       void refresh();
     });
-    return () => { alive.current = false; clearTimeout(first); clearInterval(timer); unwatch(); };
+    return () => { alive.current = false; actionController.current?.abort(); clearTimeout(first); clearInterval(timer); unwatch(); };
   }, [refresh]);
   const act = async (action: string, data: object = {}) => {
-    if (mutating.current) throw new Error('已有配置操作正在执行，请稍后重试。');
-    version.current++;
+    if (mutating.current && action !== 'restart' && action !== 'stop') throw new Error('已有配置操作正在执行，请稍后重试。');
+    const current = ++version.current;
+    actionController.current?.abort();
+    const controller = new AbortController();
+    actionController.current = controller;
     mutating.current = true; setBusy(true); setError('');
-    if (action === 'stop') recovery.current = { needed: false, retryAt: 0, delay: 3000 };
+    if (action === 'stop') { wakePending.current = false; recovery.current = { needed: false, retryAt: 0, delay: 3000 }; }
     try {
-      const next = await protectionRequest(action, data);
-      if (alive.current) { setReport(next); setConnected(true); wasConnected.current = true; }
+      const next = await protectionRequest(action, data, controller.signal);
+      if (alive.current && current === version.current) { setReport(next); setConnected(true); wasConnected.current = true; }
       return next;
-    } catch (failure) { setError(failure instanceof Error ? failure.message : String(failure)); throw failure; }
-    finally { mutating.current = false; if (alive.current) setBusy(false); void refresh(); }
+    } catch (failure) { if (current === version.current && alive.current) setError(failure instanceof Error ? failure.message : String(failure)); throw failure; }
+    finally { if (current === version.current) { actionController.current = null; mutating.current = false; if (alive.current) setBusy(false); void refresh(); } }
   };
   return { report, connected, error, busy, refresh, act };
 }
