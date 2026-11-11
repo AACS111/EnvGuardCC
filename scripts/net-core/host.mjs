@@ -239,7 +239,7 @@ export function createKernelHost({ token, binary, stateDir, apiPort = 39090, hos
         send(response, 200, { ok: true, ...await queueIpv6(value.enabled === true) }); return;
       }
       if (action === "claude-guard") {
-        if (value.op === "arm") send(response, 200, { ok: true, claudeGuard: { ...await claudeGuard.arm({ token: value.token, packages: value.packages, programs: value.programs, addresses: value.addresses }), armed: true } });
+        if (value.op === "arm") send(response, 200, { ok: true, claudeGuard: { ...await claudeGuard.arm({ token: value.token, packages: value.packages, programs: value.programs, addresses: value.addresses, domains: value.domains }), armed: true } });
         else if (value.op === "release") send(response, 200, { ok: true, claudeGuard: { ...await claudeGuard.release(), armed: false } });
         else if (value.op === "status") send(response, 200, { ok: true, claudeGuard: await claudeGuard.status() });
         else throw new Error("未知的 fail-closed 动作。");

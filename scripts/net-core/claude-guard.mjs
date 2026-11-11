@@ -24,12 +24,64 @@ const jsonScript = (body) => `[Console]::OutputEncoding = [System.Text.Encoding]
 
 export const CLAUDE_GUARD_GROUP_PREFIX = "EnvGuardCC-Claude-Guard";
 export const CLAUDE_GUARD_PORTS = [443];
+
+// 默认的 Anthropic/Claude 域名集合（浏览器等不按进程拦的入口靠 hosts 层覆盖）。
+// 刻意不包含 challenges.cloudflare.com：那是 Cloudflare 共享的人机验证通道，
+// 屏蔽它会连带打断其它站点的验证码登录，而 Claude 自己的登录页仍会经过它。
+// hosts 不支持通配符，所以按实际会用到的主机名逐个列出。
+export const CLAUDE_GUARD_DOMAINS = [
+  "anthropic.com",
+  "www.anthropic.com",
+  "api.anthropic.com",
+  "console.anthropic.com",
+  "statsig.anthropic.com",
+  "claude.ai",
+  "www.claude.ai",
+  "claude.com",
+  "www.claude.com",
+  "claudeusercontent.com",
+];
+
+const HOSTS_MARKER_START = "# >>> EnvGuardCC fail-closed";
+const HOSTS_MARKER_END = "# <<< EnvGuardCC fail-closed";
+const DOMAIN = /^[a-z0-9][a-z0-9.-]*\.[a-z]{2,}$/i;
 const TOKEN = /^[A-Za-z0-9_-]{8,64}$/;
 const isAddress = (value) => typeof value === "string" && /^[0-9a-fA-F:.]{3,45}$/.test(value) && (value.includes(":") || /^\d+\.\d+\.\d+\.\d+$/.test(value));
 
 export const guardGroupName = (token) => `${CLAUDE_GUARD_GROUP_PREFIX}-${token}`;
 
 const quote = (value) => `'${String(value).replaceAll("'", "''")}'`;
+
+/**
+ * 生成 hosts 阻断段。域名解析到 0.0.0.0 / ::1 后，任何走系统解析的入口（浏览器、CLI）
+ * 都拿不到真实地址；不碰 Cloudflare 共享 IP，因此不会误伤其它网站。
+ */
+export function hostsBlockText(domains = CLAUDE_GUARD_DOMAINS, token = "default", { eol = "\r\n" } = {}) {
+  const valid = (Array.isArray(domains) ? domains : []).filter(domain => DOMAIN.test(String(domain ?? "")));
+  if (!valid.length) throw new Error("fail-closed 域名集合为空。");
+  const lines = [`${HOSTS_MARKER_START} (${token}) >>>`];
+  for (const domain of valid) {
+    lines.push(`0.0.0.0 ${domain}`);
+    lines.push(`::1 ${domain}`);
+  }
+  lines.push(`# <<< EnvGuardCC fail-closed (${token}) <<<`);
+  return lines.join(eol) + eol;
+}
+
+/** 删除所有 fail-closed 段（不依赖 token，恢复工具也能用），其余行原样保留。 */
+export function stripHostsBlock(content) {
+  const text = String(content ?? "");
+  const kept = [];
+  let inside = false;
+  for (const line of text.split(/\r?\n/)) {
+    if (line.startsWith(HOSTS_MARKER_START)) { inside = true; continue; }
+    if (inside) { if (line.startsWith(HOSTS_MARKER_END)) inside = false; continue; }
+    kept.push(line);
+  }
+  return kept.join("\r\n");
+}
+
+export const hostsBlocked = (content) => String(content ?? "").includes(HOSTS_MARKER_START);
 
 /**
  * 生成防火墙规则描述（纯数据，便于单测；不执行任何命令）。
@@ -108,7 +160,7 @@ export function claudeGuardStatusScript(group) {
  * 不自动推导目标 IP：claude.ai 等域名大量落在 Cloudflare 共享网段，按 IP 阻断会误伤半个互联网。
  * 需要按 IP 阻断的用户通过 claude-guard-targets.json 显式提供（见 mergeClaudeGuardTargets）。
  */
-export async function discoverClaudeTargets({ platform = process.platform, env = process.env, home = homedir(), exec = run, exists = access } = {}) {
+export async function discoverClaudeTargets({ platform = process.platform, home = homedir(), exec = run, exists = access } = {}) {
   if (platform !== "win32") return { packages: [], programs: [] };
   const targets = { packages: [], programs: [] };
   const script = jsonScript([
@@ -153,11 +205,18 @@ const countOf = (stdout) => {
   return Number.isFinite(value) ? value : 0;
 };
 
+/** Windows hosts 路径；非 Windows 或读不到 SystemRoot 时返回 null（不碰系统文件）。 */
+export function defaultHostsPath(env = process.env, platform = process.platform) {
+  if (platform !== "win32") return null;
+  const root = env.SystemRoot || env.windir || "C:\\Windows";
+  return path.join(root, "System32", "drivers", "etc", "hosts");
+}
+
 /**
  * 宿主侧 fail-closed 守卫。desired 状态落盘，宿主重启后能自行收敛。
  * armed 永远来自回读（组内实际规则数），不来自「我调用过布防」。
  */
-export function createClaudeGuard({ platform = process.platform, stateDir, exec = run, logger = () => {} } = {}) {
+export function createClaudeGuard({ platform = process.platform, stateDir, exec = run, logger = () => {}, hostsPath = defaultHostsPath(), readText = readFile, writeText = writeFile } = {}) {
   const supported = platform === "win32";
   const file = stateDir ? path.join(stateDir, "claude-guard.json") : null;
   let state = { token: null, desired: "released", selectors: null, at: null };
@@ -184,38 +243,82 @@ export function createClaudeGuard({ platform = process.platform, stateDir, exec 
     return countOf(stdout);
   }
 
+  async function armHosts(domains, useToken) {
+    if (!hostsPath) return false;
+    const current = await readText(hostsPath, "utf8").catch(error => { if (error.code === "ENOENT") return ""; throw error; });
+    const cleaned = stripHostsBlock(current);
+    const next = (cleaned.trimEnd() ? cleaned.trimEnd() + "\r\n" : "") + hostsBlockText(domains, useToken);
+    await writeText(hostsPath, next, "utf8");
+    if (!hostsBlocked(await readText(hostsPath, "utf8"))) throw new Error("hosts 段未写入。");
+    return true;
+  }
+
+  async function releaseHosts() {
+    if (!hostsPath) return false;
+    const current = await readText(hostsPath, "utf8").catch(error => { if (error.code === "ENOENT") return ""; throw error; });
+    if (!hostsBlocked(current)) return false;
+    await writeText(hostsPath, stripHostsBlock(current), "utf8");
+    if (hostsBlocked(await readText(hostsPath, "utf8"))) throw new Error("hosts 段未清除。");
+    return true;
+  }
+
   async function status() {
-    if (!supported || !state.token) return { supported, armed: false, desired: state.desired, count: 0, error: null };
+    let hosts = false;
+    try { hosts = hostsPath ? hostsBlocked(await readText(hostsPath, "utf8")) : false; }
+    catch { hosts = null; }
+    if (!supported || !state.token) return { supported, armed: false, desired: state.desired, count: 0, hostsBlocked: hosts, error: null };
     try {
       const count = await expect(claudeGuardStatusScript(guardGroupName(state.token)));
-      return { supported, armed: count > 0, desired: state.desired, count, error: null };
+      return { supported, armed: count > 0 || hosts === true, desired: state.desired, count, hostsBlocked: hosts, error: null };
     } catch (error) {
-      return { supported, armed: null, desired: state.desired, count: null, error: error.message };
+      return { supported, armed: hosts === true ? true : null, desired: state.desired, count: null, hostsBlocked: hosts, error: error.message };
     }
   }
 
-  async function arm({ token = state.token, packages = [], programs = [], addresses = [] } = {}) {
+  /**
+   * 布防：防火墙规则（按进程/包/地址）+ hosts 段（按域名，覆盖浏览器）。
+   * 两部分各自回读；任一部分失败就报错，交给心跳与恢复工具收敛，不能当作已保护。
+   */
+  async function arm({ token = state.token, packages = [], programs = [], addresses = [], domains = CLAUDE_GUARD_DOMAINS } = {}) {
     if (!supported) throw new Error("当前平台没有实现系统级 fail-closed。");
     const useToken = TOKEN.test(String(token ?? "")) ? token : `g${Date.now().toString(36)}`;
-    const specs = claudeGuardSpecs({ token: useToken, packages, programs, addresses });
-    await save({ token: useToken, desired: "armed", selectors: { packages, programs, addresses }, at: new Date().toISOString() });
-    const count = await expect(claudeGuardArmScript(specs));
-    if (count < specs.length) throw new Error(`fail-closed 规则未全部生效：期望 ${specs.length} 条，实际 ${count} 条。`);
-    logger(`[claude-guard] 已布防：${specs.length} 条规则（令牌 ${useToken}）。`);
-    return { armed: true, count };
+    const hasRules = packages.length || programs.length || addresses.length;
+    const specs = hasRules ? claudeGuardSpecs({ token: useToken, packages, programs, addresses }) : [];
+    if (!specs.length && !(domains?.length)) throw new Error("fail-closed 缺少阻断目标：需要程序/包/地址或域名之一。");
+    await save({ token: useToken, desired: "armed", selectors: { packages, programs, addresses, domains }, at: new Date().toISOString() });
+    const errors = [];
+    let count = 0;
+    if (specs.length) {
+      try {
+        count = await expect(claudeGuardArmScript(specs));
+        if (count < specs.length) errors.push(`规则未全部生效：期望 ${specs.length} 条，实际 ${count} 条`);
+      } catch (error) { errors.push(`规则：${error.message}`); }
+    }
+    let hosts = false;
+    try { hosts = await armHosts(domains, useToken); }
+    catch (error) { errors.push(`hosts：${error.message}`); }
+    if (errors.length) throw new Error(`fail-closed 布防未全部生效：${errors.join("；")}`);
+    logger(`[claude-guard] 已布防：${specs.length} 条规则、hosts ${hosts ? "已写入" : "未启用"}（令牌 ${useToken}）。`);
+    return { armed: true, count, hostsBlocked: hosts };
   }
 
   async function release() {
     if (!supported) return { armed: false, count: 0 };
-    if (!state.token) {
-      await save({ desired: "released" });
-      return { armed: false, count: 0 };
-    }
     await save({ desired: "released", at: new Date().toISOString() });
-    const count = await expect(claudeGuardReleaseScript(guardGroupName(state.token)));
-    if (count > 0) throw new Error(`fail-closed 规则未删除：仍有 ${count} 条。`);
+    const errors = [];
+    let count = 0;
+    if (state.token) {
+      try {
+        count = await expect(claudeGuardReleaseScript(guardGroupName(state.token)));
+        if (count > 0) errors.push(`规则未删除：仍有 ${count} 条`);
+      } catch (error) { errors.push(`规则：${error.message}`); }
+    }
+    let hosts = false;
+    try { hosts = await releaseHosts(); }
+    catch (error) { errors.push(`hosts：${error.message}`); }
+    if (errors.length) throw new Error(`fail-closed 撤防未完成：${errors.join("；")}`);
     logger("[claude-guard] 已撤防。");
-    return { armed: false, count };
+    return { armed: false, count, hostsBlocked: false, hostsCleared: hosts };
   }
 
   /** 宿主重启/心跳用：按期望状态与实际规则数收敛。desired 可覆盖（心跳带新意图时）。 */
@@ -224,12 +327,13 @@ export function createClaudeGuard({ platform = process.platform, stateDir, exec 
     await load();
     if (desired === "armed" || desired === "released") await save({ desired });
     if (state.desired !== "armed") {
-      return state.token ? release() : { armed: false, count: 0 };
+      return state.token || hostsPath ? release() : { armed: false, count: 0 };
     }
     const source = selectors ?? state.selectors;
     if (!source) return { armed: false, count: 0 };
     const current = await status();
-    if (current.armed === true) return { armed: true, count: current.count };
+    const rulesReady = current.count === null ? false : (current.count > 0 || !(source.packages?.length || source.programs?.length || source.addresses?.length));
+    if (rulesReady && current.hostsBlocked === true) return { armed: true, count: current.count };
     return arm({ token: state.token, ...source });
   }
 

@@ -25,7 +25,7 @@ import { createConnectionLog } from "./connection-log.mjs";
 import { assertClaudeSupportedExit, claudeRegionSupport } from "../../src/detection/claude-regions.mjs";
 import { isHostingExit } from "../../src/detection/exit-quality.mjs";
 import { disableSystemIpv6, restoreSystemIpv6 } from "./system-ipv6.mjs";
-import { discoverClaudeTargets, mergeClaudeGuardTargets } from "./claude-guard.mjs";
+import { CLAUDE_GUARD_DOMAINS, discoverClaudeTargets, mergeClaudeGuardTargets } from "./claude-guard.mjs";
 import { checkHostHealth, hostInstallDecision, HOST_PROTOCOL } from "./host-protocol.mjs";
 
 const DEFAULT_API_PORT = 39090;
@@ -998,8 +998,9 @@ export async function createKernelRuntime({ stateDir, env = process.env, root, l
   async function failClosedTargetsResolve() {
     if (failClosedTargets) return failClosedTargets;
     const discovered = await discoverClaudeTargets({ platform });
-    const targets = await mergeClaudeGuardTargets(discovered, { stateDir });
-    if (!targets.packages.length && !targets.programs.length && !targets.addresses.length) {
+    // 默认带上 Anthropic/Claude 域名集合：浏览器这类不按进程拦的入口靠 hosts 覆盖。
+    const targets = await mergeClaudeGuardTargets({ ...discovered, domains: CLAUDE_GUARD_DOMAINS }, { stateDir });
+    if (!targets.packages.length && !targets.programs.length && !targets.addresses.length && !targets.domains.length) {
       throw new Error("未找到 Claude 客户端，无法建立 fail-closed 阻断目标。");
     }
     failClosedTargets = targets;

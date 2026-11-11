@@ -244,16 +244,20 @@ Claude 会按系统默认路由**直连**出网——实测事故就是这么发
 - 布防：`launch()` 的第一行。撤防：仅当 `!regionLock && !unprotectedLock && 隧道已接管 && 出口已验证`。
 - 判据是「隧道是否确认接管」，不是「应用是否在运行」——否则应用崩溃会让规则残留，把隧道流量一起拦掉
   （WFP 在路由之前生效，规则存在就会拦掉经 TUN 的流量）。
-- 实现：`scripts/net-core/claude-guard.mjs` 生成规则：MSIX 包族名（Store 版客户端）+ 程序路径（非打包安装 / Claude Code CLI `~/.local/bin/claude.exe`），
-  宿主按分组 `EnvGuardCC-Claude-Guard-<token>` 管理，`host.mjs` 提供 `claude-guard` 动作，需宿主协议 ≥ 4。
-- **不自动按 IP 阻断**：`claude.ai` 等域名大量落在 Cloudflare 共享网段，按 IP 拦截会误伤其他站点。
-  需要覆盖浏览器或自定义安装路径的用户，在状态目录写 `claude-guard-targets.json`：
-  `{ "programs": [...], "packages": [...], "addresses": ["203.0.113.9"] }`（地址只接受 IP）。
+- 实现：`scripts/net-core/claude-guard.mjs` 生成两类阻断：
+  - **防火墙规则**（分组 `EnvGuardCC-Claude-Guard-<token>`）：MSIX 包族名、程序路径（非打包安装 / Claude Code CLI `~/.local/bin/claude.exe`）；
+  - **hosts 段**（带标记、可幂等清理）：默认覆盖 `anthropic.com`、`api/console/statsig.anthropic.com`、`claude.ai`、`claude.com`、`claudeusercontent.com`，
+    解析到 `0.0.0.0` / `::1`。因此**浏览器这类不按进程拦的入口默认就被覆盖**，且不碰 Cloudflare 共享 IP。
+  宿主提供 `claude-guard` 动作，需宿主协议 ≥ 4。
+- **刻意不包含** `challenges.cloudflare.com`：它是 Cloudflare 共享的人机验证通道，屏蔽会连带打断其它站点登录。
+- 不自动按 IP 阻断：`claude.ai` 等大量落在 Cloudflare 共享网段，按 IP 拦截会误伤其他站点。
+  需要按 IP 阻断的用户，在状态目录写 `claude-guard-targets.json`：
+  `{ "programs": [...], "packages": [...], "addresses": ["203.0.113.9"], "domains": ["..."] }`（地址只接受 IP）。
 - 双方都是声明式：应用心跳带 `claudeGuardDesired`，宿主每次回读**实际规则数**并收敛；
   `armed` 永远是回读值，不是「我调用过布防」。单次命令失败会在下一个心跳周期自动修复并上报 `error`。
-- 应急恢复：`node scripts/recover-claude-guard.mjs`（按分组前缀删除，不依赖状态文件）。
+- 应急恢复：`node scripts/recover-claude-guard.mjs`（按分组前缀与 hosts 标记清理，不依赖状态文件）。
 - 开发开关：`CHECKCC_CLAUDE_FAILCLOSED=0` 关闭本能力。
-- 边界：只拦 Claude 自己的出站；不拦浏览器进程（会误伤其他工作），不代替出口 IP 的质量判断。
+- 边界：不拦浏览器进程（会误伤其他工作）；浏览器访问 Claude 由 hosts 段覆盖；不代替出口 IP 的质量判断。
 
 ### 宿主跟丢内核时的兜底
 
