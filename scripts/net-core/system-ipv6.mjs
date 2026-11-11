@@ -61,19 +61,33 @@ async function switchWindowsAdapters(adapters, enabled, exec) {
 
 const describe = rows => rows.map(row => `${row.name}（${row.error || '未知原因'}）`).join('；');
 
+/**
+ * 虚拟网卡即使 Status=Up 也不承载公网流量：Hyper-V/WSL 的 vEthernet、TAP、Docker 等。
+ * 它们拒绝修改 IPv6 绑定时不能判定为「正在使用的网卡关不掉」，否则装了 WSL 的机器
+ * 每次网络波动都会卡在重试数分钟，期间系统 IPv6 保持开启、Claude 会绕过 IPv4 隧道（实测事故）。
+ */
+const VIRTUAL_ADAPTER = /(?:^|[\s(])(?:vEthernet|Hyper-?V|WSL|Default Switch|Loopback|TAP|TUN|WireGuard|VMware|VirtualBox|vboxnet|Docker|Npcap|Bluetooth)/i;
+const internetCarrier = row => row.up === true && !VIRTUAL_ADAPTER.test(String(row.name ?? ''));
+
 async function disableWindowsIpv6(exec) {
   const adapters = await listWindowsAdapters(exec);
   if (!adapters.length) return { platform: 'win32', changed: false, previous: 'Off', adapters: [] };
-  // 没有任何网卡在承载流量（全部拔出/停用）：没有可泄漏的 IPv6，也不算失败。
-  if (!adapters.some(item => item.up)) return { platform: 'win32', changed: false, previous: 'Enabled', adapters: [], skipped: [], idle: true };
+  // 没有任何网卡在承载流量（全部拔出/停用，或只剩虚拟网卡）：没有可泄漏的 IPv6，也不算失败。
+  if (!adapters.some(internetCarrier)) {
+    return {
+      platform: 'win32', changed: false, previous: 'Enabled', adapters: [], idle: true,
+      skipped: adapters.map(item => ({ name: item.name, up: item.up, error: '非公网网卡，未修改' })),
+    };
+  }
   const rows = await switchWindowsAdapters(adapters.map(item => item.name), false, exec);
   const disabled = rows.filter(row => row.ok).map(row => row.name);
   const failed = rows.filter(row => !row.ok);
-  const active = failed.filter(row => row.up);
+  // 只有「正在承载公网流量」的网卡关不掉才算保护失败；虚拟网卡一律按跳过记录。
+  const active = failed.filter(internetCarrier);
   const state = {
     platform: 'win32', previous: 'Enabled', adapters: disabled, changed: disabled.length > 0,
-    // 非活动网卡（拔出/未连接/WSL 虚拟网卡）拒绝修改不影响保护：它们现在不承载流量。
-    skipped: failed.map(row => ({ name: row.name, up: row.up, error: row.error ?? null })),
+    // 非活动/虚拟网卡（拔出、未连接、WSL vEthernet）拒绝修改不影响保护：它们不承载公网流量。
+    skipped: failed.map(row => ({ name: row.name, up: row.up, error: row.error ?? null, virtual: !internetCarrier(row) })),
   };
   if (!active.length) return state;
   // 正在使用的网卡没关掉：必须回滚，不能留下「部分关、部分开」的半成品状态。
