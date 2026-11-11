@@ -155,6 +155,46 @@ test('日志管道 EPIPE 不退出后台，页面和控制服务继续可用', {
   await call('shutdown'); child.stdin.end();
 });
 
+test('后台崩溃时先恢复配置再退出，原因落盘可查', { timeout: 25000 }, async t => {
+  const fixture = await backendFixture(t);
+  const configDir = path.join(fixture.fixture, 'claude-config');
+  const settingsFile = path.join(configDir, 'settings.json');
+  const originalSettings = { env: { HTTP_PROXY: 'http://127.0.0.1:7890', CUSTOM_VALUE: 'keep' }, model: 'custom' };
+  await mkdir(configDir);
+  await writeFile(settingsFile, JSON.stringify(originalSettings));
+  const logFile = path.join(fixture.userData, 'logs', 'backend.log');
+  await mkdir(path.dirname(logFile), { recursive: true });
+  const preload = path.join(fixture.fixture, 'crash-after-ready.mjs');
+  await writeFile(preload, `
+    import { createClaudeProxySettings } from './scripts/claude-proxy-settings.mjs';
+    const proxySettings = createClaudeProxySettings({ stateDir: process.env.CHECKCC_STATE_DIR });
+    const write = process.stdout.write.bind(process.stdout);
+    process.stdout.write = (chunk, ...rest) => {
+      const result = write(chunk, ...rest);
+      if (String(chunk).includes('"type":"ready"')) setTimeout(() => {
+        void proxySettings.apply('http://127.0.0.1:39080').then(() => {
+          setImmediate(() => { throw new Error('模拟后台崩溃'); });
+        });
+      }, 50);
+      return result;
+    };
+  `);
+  const { child, ready } = launchBackend(t, fixture, { CLAUDE_CONFIG_DIR: configDir, CHECKCC_BACKEND_LOG: logFile, NODE_OPTIONS: `--import=${pathToFileURL(preload).href}` });
+  const started = await ready;
+  const exited = once(child, 'exit');
+  assert.equal((await exited)[0], 1, '崩溃后必须退出，不能留下僵尸后台');
+  const log = await readFile(logFile, 'utf8');
+  assert.match(log, /\[desktop\] 后台启动/);
+  assert.match(log, /开始恢复配置/);
+  assert.match(log, /未捕获异常/);
+  assert.match(log, /模拟后台崩溃/);
+  assert.deepEqual(JSON.parse(await readFile(settingsFile, 'utf8')), originalSettings);
+  await assert.rejects(readFile(path.join(fixture.userData, 'state', 'claude-proxy-backup.json')), { code: 'ENOENT' });
+  await assert.rejects(fetch(started.url));
+  await assert.rejects(fetch(`http://127.0.0.1:${started.ports.helper}/session`));
+  await assert.rejects(fetch(`http://127.0.0.1:${started.ports.gateway}/__checkcc/status`));
+});
+
 test('页面端口冲突明确失败，不接管或关闭原来实例', { timeout: 25000 }, async t => {
   const original = launchBackend(t, await backendFixture(t));
   const started = await original.ready;

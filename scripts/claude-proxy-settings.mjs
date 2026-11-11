@@ -5,6 +5,14 @@ import path from 'node:path';
 
 const proxyKeys = ['HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy', 'ALL_PROXY', 'all_proxy'];
 const isObject = value => value !== null && typeof value === 'object' && !Array.isArray(value);
+// 崩溃后配置里可能留着 EGCC 自己的代理；它既不能当用户原值保存，也不能在恢复时写回去。
+function isOwnProxy(value, proxy) {
+  if (typeof value !== 'string') return false;
+  try {
+    const saved = new URL(value), own = new URL(proxy);
+    return saved.origin === own.origin && saved.pathname === '/' && !saved.search && !saved.hash;
+  } catch { return false; }
+}
 
 async function readObject(file) {
   let value;
@@ -64,8 +72,12 @@ export function createClaudeProxySettings({ stateDir, configDir = process.env.CL
     for (const key of proxyKeys) {
       if (!['HTTP_PROXY', 'HTTPS_PROXY'].includes(key) && !Object.hasOwn(env, key) && !Object.hasOwn(backup.entries, key)) continue;
       const saved = backup.entries[key];
-      if (!saved || !saved.applied.includes(env[key])) {
-        backup.entries[key] = { had: Object.hasOwn(env, key), value: env[key] ?? null, applied: [proxy] };
+      const current = env[key];
+      if (!saved || !saved.applied.includes(current)) {
+        // 上次崩溃没来得及恢复时，环境里留着的是 EGCC 自己的代理，记为“本来没有”，恢复时删除。
+        backup.entries[key] = isOwnProxy(current, proxy)
+          ? { had: false, value: null, applied: [proxy] }
+          : { had: Object.hasOwn(env, key), value: current ?? null, applied: [proxy] };
       } else if (!saved.applied.includes(proxy)) saved.applied.push(proxy);
       env[key] = proxy;
     }
@@ -84,7 +96,8 @@ export function createClaudeProxySettings({ stateDir, configDir = process.env.CL
       let changed = false;
       for (const [key, entry] of Object.entries(backup.entries)) {
         if (!settings.env || !entry.applied.includes(settings.env[key])) continue;
-        if (entry.had) settings.env[key] = entry.value;
+        // 旧版备份可能把 EGCC 自己的代理记成了原值；恢复成死端口等于再次断网。
+        if (entry.had && !entry.applied.some(applied => isOwnProxy(entry.value, applied))) settings.env[key] = entry.value;
         else delete settings.env[key];
         changed = true;
       }

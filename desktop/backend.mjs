@@ -1,3 +1,4 @@
+import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createProtocol } from './protocol.mjs';
@@ -10,7 +11,26 @@ import { createClaudeProxySettings } from '../scripts/claude-proxy-settings.mjs'
 // Windows GUI launches can inherit a closed stderr pipe. Logging failure must
 // leave the control service and its network recovery loop running.
 process.stderr.on('error', () => {});
-console.log = console.info = console.debug = console.error;
+// 打包版没有控制台：宿主把 stderr 落到 <user_data>/logs/backend.log 并传回路径。
+// 这里直接追加带时间戳的日志，让“后台已退出”这类事故事后能查到原因。
+const logFile = process.env.CHECKCC_BACKEND_LOG;
+let logFd = null;
+if (logFile) { try { logFd = fs.openSync(logFile, 'a'); } catch { logFd = null; } }
+function describe(value) {
+  if (value instanceof Error) return value.stack || `${value.name}: ${value.message}`;
+  if (typeof value === 'string') return value;
+  try { return JSON.stringify(value); } catch { return String(value); }
+}
+function writeLine(line) {
+  const text = `${new Date().toISOString()} ${line}\n`;
+  if (logFd !== null) {
+    try { fs.writeSync(logFd, text); return; } catch { try { fs.closeSync(logFd); } catch {} logFd = null; }
+  }
+  // 没有可写的日志目标时必须安静失败，但绝不能打断恢复与网络循环。
+  try { process.stderr.write(text); } catch {}
+}
+for (const level of ['log', 'info', 'debug', 'warn', 'error']) console[level] = (...args) => writeLine(args.map(describe).join(' '));
+console.log(`[desktop] 后台启动 pid=${process.pid}${logFile ? `，日志 ${logFile}` : ''}`);
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const devURL = process.env.CHECKCC_DESKTOP_DEV_URL;
 let origin = 'http://127.0.0.1:3030';
@@ -19,7 +39,7 @@ if (!process.env.CHECKCC_DESKTOP_USER_DATA) throw new Error('缺少桌面用户�
 process.env.CHECKCC_STATE_DIR ||= path.join(process.env.CHECKCC_DESKTOP_USER_DATA, 'state');
 process.env.CHECKCC_NODE_EXECUTABLE = process.execPath;
 let helper, gateway, site, settings, powerTimer, stopping, kernel, servicesReady, resetPending = false;
-let queue = Promise.resolve(), shutdownRequested = false;
+let queue = Promise.resolve(), shutdownRequested = false, exiting = false;
 let finishStartup;
 const startupFinished = new Promise(resolve => { finishStartup = resolve; });
 let login = { openAtLogin: false, status: null };
@@ -63,11 +83,23 @@ async function close() {
   stopping = closeRuntime().catch(error => { stopping = null; throw error; });
   return stopping;
 }
-async function orphaned() {
-  let code = shutdownRequested ? 0 : 1;
-  try { await queue.catch(() => {}); await close(); } catch (error) { code = 1; console.error('[desktop] 原始备份已保留：', error.message); }
-  finally { process.exit(code); }
+function orphaned() { exitAfterRestore(shutdownRequested ? 0 : 1, '宿主连接已断开'); }
+// 崩溃与断管同样必须先恢复用户配置：不恢复会把 Claude 代理指向已经死掉的端口。
+function exitAfterRestore(code, reason, detail) {
+  if (exiting) return;
+  exiting = true;
+  console.error(`[desktop] ${reason}，开始恢复配置（退出码 ${code}）。`);
+  if (detail) console.error(detail);
+  // 恢复可能被内核/TUN 拖住；超时也要退出，否则会留下父进程已不在的僵尸后台。
+  const watchdog = setTimeout(() => { console.error('[desktop] 恢复超时，强制退出。'); process.exit(code); }, 60000);
+  void (async () => {
+    try { await queue.catch(() => {}); await close(); }
+    catch (error) { code = 1; console.error('[desktop] 恢复未完成，原始备份已保留：', error.message); }
+    finally { clearTimeout(watchdog); process.exit(code); }
+  })();
 }
+process.on('uncaughtException', error => exitAfterRestore(1, '未捕获异常', describe(error)));
+process.on('unhandledRejection', reason => exitAfterRestore(1, '未处理的 Promise 拒绝', describe(reason)));
 async function dispatch(method, params) {
   if (method === 'shutdown') { await close(); shutdownRequested = true; return { restored: true }; }
   if (stopping) throw new Error('应用正在退出。');

@@ -1,6 +1,6 @@
 [package]
 name = "envguardcc"
-version = "0.2.2"
+version = "0.2.3"
 description = "EnvGuardCC desktop host"
 edition = "2021"
 license = "MIT"
