@@ -6,14 +6,15 @@ mod power;
 use serde_json::{json, Value};
 use std::{
     collections::HashMap,
+    fs::{File, OpenOptions},
     io::{BufRead, BufReader, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Child, ChildStdin, Command, Stdio},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex, OnceLock,
     },
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tauri::{
     menu::{Menu, MenuItem},
@@ -40,6 +41,52 @@ fn origin() -> &'static str {
 }
 type Reply = oneshot::Sender<Result<Value, String>>;
 
+const BACKEND_LOG_LIMIT: u64 = 8 * 1024 * 1024;
+
+/// 打包版是 windows_subsystem 进程，没有控制台，stderr 会被直接丢弃。
+/// 不落盘就只能看到“后台已退出”而永远查不到原因，所以统一追加到用户目录日志。
+fn open_backend_log(user_data: &Path) -> Option<File> {
+    let directory = user_data.join("logs");
+    std::fs::create_dir_all(&directory).ok()?;
+    let path = directory.join("backend.log");
+    if std::fs::metadata(&path)
+        .map(|meta| meta.len() > BACKEND_LOG_LIMIT)
+        .unwrap_or(false)
+    {
+        let _ = std::fs::rename(&path, directory.join("backend.log.1"));
+    }
+    OpenOptions::new().create(true).append(true).open(path).ok()
+}
+
+/// 只为日志行提供可读时间戳，避免为一个格式化引入额外依赖。
+fn iso_format(seconds: i64, millis: u32) -> String {
+    let days = seconds.div_euclid(86_400);
+    let clock = seconds.rem_euclid(86_400);
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if month <= 2 { year + 1 } else { year };
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{millis:03}Z",
+        clock / 3600,
+        clock % 3600 / 60,
+        clock % 60
+    )
+}
+
+fn iso_now() -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    iso_format(now.as_secs() as i64, now.subsec_millis())
+}
+
 #[derive(Default)]
 struct Backend {
     input: Mutex<Option<ChildStdin>>,
@@ -50,6 +97,8 @@ struct Backend {
     quitting: AtomicBool,
     dead: AtomicBool,
     has_tray: AtomicBool,
+    log: Mutex<Option<File>>,
+    log_path: Mutex<Option<PathBuf>>,
 }
 
 impl Backend {
@@ -79,6 +128,32 @@ impl Backend {
         result
             .map_err(|_| "后台操作超时，配置备份已保留。".to_string())?
             .map_err(|_| "后台连接已断开。".to_string())?
+    }
+
+    fn attach_log(&self, file: Option<File>, path: &Path) {
+        if file.is_some() {
+            *self.log_path.lock().unwrap() = Some(path.to_path_buf());
+        }
+        *self.log.lock().unwrap() = file;
+    }
+
+    fn log_hint(&self) -> String {
+        self.log_path
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "日志文件不可用".into())
+    }
+
+    /// 关键事件必须留证；写日志失败也要继续走恢复流程，不能反过来影响退出。
+    fn note(&self, line: &str) {
+        eprintln!("[desktop] {line}");
+        let mut log = self.log.lock().unwrap();
+        if let Some(file) = log.as_mut() {
+            let _ = writeln!(file, "{} [host] {line}", iso_now());
+            let _ = file.flush();
+        }
     }
 }
 
@@ -156,6 +231,7 @@ fn quit(app: &tauri::AppHandle, backend: Arc<Backend>) {
         app.exit(1);
         return;
     }
+    backend.note("收到退出请求，开始恢复配置。");
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.set_enabled(false);
         let _ = window.set_title("EnvGuardCC · 正在自动恢复配置…");
@@ -164,6 +240,7 @@ fn quit(app: &tauri::AppHandle, backend: Arc<Backend>) {
     tauri::async_runtime::spawn(async move {
         match backend.request("shutdown", Value::Null).await {
             Ok(_) => {
+                backend.note("配置已恢复，退出应用。");
                 backend.quitting.store(true, Ordering::SeqCst);
                 backend.input.lock().unwrap().take();
                 let child = backend.child.lock().unwrap().take();
@@ -174,6 +251,7 @@ fn quit(app: &tauri::AppHandle, backend: Arc<Backend>) {
                 app.exit(0);
             }
             Err(error) => {
+                backend.note(&format!("自动恢复未完成：{error}"));
                 backend.stopping.store(false, Ordering::SeqCst);
                 if let Some(window) = app.get_webview_window("main") {
                     let _ = window.set_enabled(true);
@@ -283,6 +361,9 @@ fn start(app: &tauri::AppHandle, backend: Arc<Backend>) -> Result<(), Box<dyn st
         );
     let user_data = dunce::simplified(&user_data).to_path_buf();
     std::fs::create_dir_all(&user_data)?;
+    // 打包版没有控制台，stderr 无处可去；落盘后崩溃与配置残留才有据可查。
+    let log_file = open_backend_log(&user_data);
+    let log_path = user_data.join("logs").join("backend.log");
     let mut command = Command::new(node);
     // Node cannot resolve all verbatim Windows resource paths as absolute entrypoints.
     command
@@ -294,8 +375,16 @@ fn start(app: &tauri::AppHandle, backend: Arc<Backend>) -> Result<(), Box<dyn st
             origin().rsplit(':').next().unwrap(),
         )
         .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit());
+        .stdout(Stdio::piped());
+    if development {
+        // 开发版保留终端实时输出；后台仍会把结构化日志写进同一个文件。
+        command.stderr(Stdio::inherit());
+    } else if let Some(file) = log_file.as_ref().and_then(|file| file.try_clone().ok()) {
+        command.stderr(Stdio::from(file));
+        command.env("CHECKCC_BACKEND_LOG", &log_path);
+    } else {
+        command.stderr(Stdio::null());
+    }
     if development {
         command.env("CHECKCC_DESKTOP_DEV_URL", origin());
     }
@@ -305,6 +394,8 @@ fn start(app: &tauri::AppHandle, backend: Arc<Backend>) -> Result<(), Box<dyn st
         command.creation_flags(0x08000000); // CREATE_NO_WINDOW: never show a Node console.
     }
     let mut child = command.spawn()?;
+    backend.attach_log(log_file, &log_path);
+    backend.note(&format!("后台已启动（pid={}）。", child.id()));
     let output = child.stdout.take().ok_or("缺少后台输出管道。")?;
     *backend.input.lock().unwrap() = child.stdin.take();
     *backend.child.lock().unwrap() = Some(child);
@@ -373,13 +464,27 @@ fn start(app: &tauri::AppHandle, backend: Arc<Backend>) -> Result<(), Box<dyn st
         }
         reader_backend.dead.store(true, Ordering::SeqCst);
         reader_backend.pending.lock().unwrap().clear();
+        // EOF 只说明进程不在了；留下退出码才能区分崩溃、被杀和正常退出。
+        // 先把子进程取出，避免 wait() 期间占着 child 锁阻塞退出流程。
+        let child = reader_backend.child.lock().unwrap().take();
+        let code = child
+            .and_then(|mut child| child.wait().ok())
+            .and_then(|status| status.code());
+        let status = code
+            .map(|code| format!("code={code}"))
+            .unwrap_or_else(|| "退出码不可读".into());
+        reader_backend.note(&format!("后台进程已退出（{status}）。"));
         if let Some(tx) = ready.take() {
             let _ = tx.send(Err("后台在启动时退出。".into()));
         }
         if !reader_backend.quitting.load(Ordering::SeqCst) {
+            let message = format!(
+                "本机后台已退出。原始备份已保留，请重新启动应用以恢复配置。\n\n退出码：{status}\n日志：{}",
+                reader_backend.log_hint()
+            );
             app_reader
                 .dialog()
-                .message("本机后台已退出。原始备份已保留，请重新启动应用以恢复配置。")
+                .message(message)
                 .title("EnvGuardCC 后台已退出")
                 .kind(MessageDialogKind::Error)
                 .show(|_| {});
@@ -467,6 +572,14 @@ fn start(app: &tauri::AppHandle, backend: Arc<Backend>) -> Result<(), Box<dyn st
 mod tests {
     use super::*;
     #[test]
+    fn backend_log_timestamps_are_utc_iso() {
+        assert_eq!(iso_format(0, 0), "1970-01-01T00:00:00.000Z");
+        // 2000-02-29 00:00:00Z：覆盖闰年分支。
+        assert_eq!(iso_format(951_782_400, 7), "2000-02-29T00:00:00.007Z");
+        assert_eq!(iso_format(1_800_000_000, 250), "2027-01-15T08:00:00.250Z");
+    }
+
+    #[test]
     fn desktop_permissions_require_exact_main_window_origin() {
         assert!(trusted_url(
             "main",
@@ -490,7 +603,7 @@ mod tests {
 }
 
 fn startup_error(app: &tauri::AppHandle, backend: Arc<Backend>, error: String) {
-    eprintln!("[desktop] {error}");
+    backend.note(&format!("后台启动失败：{error}"));
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         let _ = backend.request("shutdown", Value::Null).await;
@@ -506,7 +619,8 @@ fn startup_error(app: &tauri::AppHandle, backend: Arc<Backend>, error: String) {
         let app_exit = app.clone();
         app.dialog()
             .message(format!(
-                "{error}\n请确认应用端口 3030 未被占用。原始备份已保留。"
+                "{error}\n请确认应用端口 3030 未被占用。原始备份已保留。\n\n日志：{}",
+                backend.log_hint()
             ))
             .title("EnvGuardCC 启动失败")
             .kind(MessageDialogKind::Error)

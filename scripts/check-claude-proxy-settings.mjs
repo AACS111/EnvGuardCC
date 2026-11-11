@@ -121,3 +121,21 @@ test('拒绝非 EGCC 本机代理地址', async t => {
   await assert.rejects(f.manager.apply('http://example.com:39080'), /本机/);
   assert.deepEqual(await read(f.file), {});
 });
+
+test('崩溃遗留的自有代理不会被当成原值，恢复时直接移除', async t => {
+  const f = await fixture(t, { env: { HTTP_PROXY: proxy, HTTPS_PROXY: proxy, CUSTOM_VALUE: 'keep' } });
+  await f.manager.apply(proxy);
+  assert.equal((await read(f.backup)).entries.HTTP_PROXY.had, false);
+  assert.equal((await read(f.backup)).entries.HTTP_PROXY.value, null);
+  await f.manager.restore();
+  assert.deepEqual(await read(f.file), { env: { CUSTOM_VALUE: 'keep' } });
+});
+
+test('旧版受污染的备份恢复时删除自有代理，不写回死端口', async t => {
+  const contaminated = { version: 1, settingsFile: null, hadFile: true, hadEnv: true,
+    entries: { HTTP_PROXY: { had: true, value: proxy, applied: [proxy] }, HTTPS_PROXY: { had: true, value: proxy, applied: [proxy] } } };
+  const f = await fixture(t, { env: { HTTP_PROXY: proxy, HTTPS_PROXY: proxy } });
+  await writeFile(f.backup, JSON.stringify({ ...contaminated, settingsFile: f.file }));
+  await f.manager.restore();
+  assert.deepEqual(await read(f.file), { env: {} });
+});
