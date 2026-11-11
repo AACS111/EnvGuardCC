@@ -17,12 +17,14 @@ import { fileURLToPath } from "node:url";
 import { createNetCore } from "../net-core.mjs";
 import { findPortOwner, processCommandLine, processName } from "./ports.mjs";
 import { createFirewallGuard } from "./firewall.mjs";
+import { createClaudeGuard } from "./claude-guard.mjs";
+import { HOST_CAPABILITIES, HOST_PROTOCOL } from "./host-protocol.mjs";
 import { disableSystemIpv6, restoreSystemIpv6 } from "./system-ipv6.mjs";
 import { assertStrictKernelConfig } from "./config.mjs";
 import os from "node:os";
 
 export const HOST_TOKEN_HEADER = "x-envguardcc-host-token";
-const ACTIONS = new Set(["start", "stop", "restart", "heartbeat", "guard-status", "guard-block", "guard-activate", "guard-release", "ipv6"]);
+const ACTIONS = new Set(["start", "stop", "restart", "heartbeat", "guard-status", "guard-block", "guard-activate", "guard-release", "ipv6", "claude-guard"]);
 
 function tokenMatches(expected, received) {
   if (typeof received !== "string" || !received) return false;
@@ -61,7 +63,7 @@ export async function readHostConfig(stateDir, requested) {
 
 export function createKernelHost({ token, binary, stateDir, apiPort = 39090, host = "127.0.0.1", port = 39091, spawn, fetchImpl, lookup, logger = () => {}, requiresAdmin = true, ports = {}, leaseTimeoutMs = 30000, ownerAlive = (pid) => {
   try { process.kill(pid, 0); return true; } catch (error) { return error.code === 'ESRCH' ? false : null; }
-}, createCore = createNetCore, systemIpv6 = { disable: disableSystemIpv6, restore: restoreSystemIpv6 }, firewall = createFirewallGuard() } = {}) {
+}, createCore = createNetCore, systemIpv6 = { disable: disableSystemIpv6, restore: restoreSystemIpv6 }, firewall = createFirewallGuard(), claudeGuard = createClaudeGuard({ stateDir, logger }) } = {}) {
   if (typeof token !== "string" || token.length < 16) throw new Error("宿主令牌太短。");
   if (typeof binary !== "string" || !binary) throw new Error("缺少内核二进制路径。");
   if (typeof stateDir !== "string" || !stateDir) throw new Error("缺少状态目录。");
@@ -192,7 +194,8 @@ export function createKernelHost({ token, binary, stateDir, apiPort = 39090, hos
     }
     const url = new URL(request.url ?? "/", "http://127.0.0.1");
     if (request.method === "GET" && url.pathname === "/health") {
-      send(response, 200, { ok: true, running: Boolean(core?.state().running), apiPort, requiresAdmin, guard: firewall.status(), hostProtocol: 3, capabilities: ["ipv6", "owner-lease"] });
+      const failClosed = await claudeGuard.status().catch((error) => ({ supported: claudeGuard.supported, armed: null, error: error.message }));
+      send(response, 200, { ok: true, running: Boolean(core?.state().running), apiPort, requiresAdmin, guard: firewall.status(), claudeGuard: failClosed, hostProtocol: HOST_PROTOCOL, capabilities: HOST_CAPABILITIES });
       return;
     }
     if (request.method !== "POST" || url.pathname !== "/kernel") {
@@ -216,13 +219,31 @@ export function createKernelHost({ token, binary, stateDir, apiPort = 39090, hos
       }
       leaseAt = Date.now();
       leaseSuspect = false;
-      send(response, 200, { ok: true, guard: firewall.status() });
+      // 心跳带期望的 fail-closed 状态：期望布防而规则不在就重建，期望撤防而规则还在就删除。
+      // 收敛失败不回 500（否则心跳会被当成内核故障），用 claudeGuard.error 上报给应用。
+      let failClosed = null;
+      if (value.claudeGuardDesired === "armed" || value.claudeGuardDesired === "released") {
+        try {
+          await claudeGuard.reconcile(value.claudeGuardSelectors ?? null, { desired: value.claudeGuardDesired });
+        } catch (error) {
+          logger(`[host] fail-closed 收敛失败：${error.message}`);
+        }
+        failClosed = await claudeGuard.status().catch(() => null);
+      }
+      send(response, 200, { ok: true, guard: firewall.status(), ...(failClosed ? { claudeGuard: failClosed } : {}) });
       return;
     }
 
     try {
       if (action === "ipv6") {
         send(response, 200, { ok: true, ...await queueIpv6(value.enabled === true) }); return;
+      }
+      if (action === "claude-guard") {
+        if (value.op === "arm") send(response, 200, { ok: true, claudeGuard: { ...await claudeGuard.arm({ token: value.token, packages: value.packages, programs: value.programs, addresses: value.addresses }), armed: true } });
+        else if (value.op === "release") send(response, 200, { ok: true, claudeGuard: { ...await claudeGuard.release(), armed: false } });
+        else if (value.op === "status") send(response, 200, { ok: true, claudeGuard: await claudeGuard.status() });
+        else throw new Error("未知的 fail-closed 动作。");
+        return;
       }
       if (action === "guard-status") { send(response, 200, { ok: true, guard: await firewall.inspect() }); return; }
       if (action === "guard-block") { send(response, 200, { ok: true, guard: await firewall.block() }); return; }
@@ -253,6 +274,9 @@ export function createKernelHost({ token, binary, stateDir, apiPort = 39090, hos
     apiPort,
     async listen() {
       await firewall.restore();
+      // 宿主重启后按落盘的期望状态收敛：宁可暂时多拦，也不能让上次未完成的布防静默消失。
+      await claudeGuard.load().catch(() => {});
+      await claudeGuard.reconcile().catch((error) => logger(`[host] fail-closed 恢复失败：${error.message}`));
       await new Promise((resolve, reject) => {
         server.once("error", reject);
         server.listen(port, host, resolve);

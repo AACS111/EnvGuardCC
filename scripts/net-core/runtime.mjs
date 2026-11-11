@@ -25,6 +25,7 @@ import { createConnectionLog } from "./connection-log.mjs";
 import { assertClaudeSupportedExit, claudeRegionSupport } from "../../src/detection/claude-regions.mjs";
 import { isHostingExit } from "../../src/detection/exit-quality.mjs";
 import { disableSystemIpv6, restoreSystemIpv6 } from "./system-ipv6.mjs";
+import { discoverClaudeTargets, mergeClaudeGuardTargets } from "./claude-guard.mjs";
 import { checkHostHealth, hostInstallDecision, HOST_PROTOCOL } from "./host-protocol.mjs";
 
 const DEFAULT_API_PORT = 39090;
@@ -390,6 +391,8 @@ export async function createKernelRuntime({ stateDir, env = process.env, root, l
   let workController = new AbortController();
   const ipv6CacheFile = path.join(stateDir, 'node-ipv6-cache.json');
   let ipv6Protected = false;
+  // 系统 IPv6 未能关闭/恢复时的真实状态：此时系统 IPv6 可能绕过 IPv4 隧道直连 Claude。
+  let ipv6Unprotected = null;
   const shouldProtectIpv6 = () => tunEnabled && ipv6Probe?.supported === true && ipv6Probe.node === nodes.selected && ipv6Probe.key === ipv6ContextKey();
   let hostHeartbeat = null;
   let heartbeatPending = false;
@@ -932,12 +935,12 @@ export async function createKernelRuntime({ stateDir, env = process.env, root, l
     await writeFile(configPath, serializeKernelConfig(effective), { mode: 0o600 });
   }
 
-  async function hostAction(action, extra = {}, heartbeatVersion = null) {
+  async function hostAction(action, extra = {}, heartbeatVersion = null, timeoutMs = 30000) {
     const response = await (fetchImpl ?? globalThis.fetch)(`${hostUrl}/kernel`, {
       method: "POST",
       headers: { "Content-Type": "application/json", "X-EnvGuardCC-Host-Token": hostToken },
       body: JSON.stringify({ action, configPath, strict: strictEnabled, guardRevision: hostGuard?.releaseId ?? null, leaseOwner: hostLeaseOwner, ...extra }),
-      signal: action === 'heartbeat' && heartbeatController ? AbortSignal.any([heartbeatController.signal, AbortSignal.timeout(3000)]) : AbortSignal.timeout(30000),
+      signal: action === 'heartbeat' && heartbeatController ? AbortSignal.any([heartbeatController.signal, AbortSignal.timeout(3000)]) : AbortSignal.timeout(timeoutMs),
     });
     const value = await response.json().catch(() => null);
     if (!response.ok || value?.ok === false) throw Object.assign(new Error(value?.reason ?? `宿主返回 ${response.status}`), { code: value?.code, status: response.status });
@@ -951,7 +954,12 @@ export async function createKernelRuntime({ stateDir, env = process.env, root, l
       const version = heartbeatGeneration;
       heartbeatController = new AbortController();
       heartbeatPending = true;
-      void hostAction("heartbeat", {}, version).catch(error => {
+      void hostAction("heartbeat", { claudeGuardDesired: failClosed.desired, claudeGuardSelectors: failClosedTargets }, version).then((value) => {
+        const guard = value?.claudeGuard;
+        if (!guard || version !== heartbeatGeneration) return;
+        // 以宿主回读为准：单次布防/撤防失败会被下一轮心跳收敛并暴露。
+        failClosed = { supported: guard.supported !== false, desired: failClosed.desired, armed: guard.armed ?? null, count: guard.count ?? null, error: guard.error ?? null };
+      }).catch(error => {
         if (version !== heartbeatGeneration) return;
         lastError = `宿主心跳失败：${error.message}`; logger(`[net-core] ${lastError}`);
         if (error.code === 'KERNEL_NOT_RUNNING' || (error.status === 409 && error.message === '内核未运行。')) {
@@ -966,12 +974,80 @@ export async function createKernelRuntime({ stateDir, env = process.env, root, l
     hostHeartbeat.unref?.();
   }
 
+  /**
+   * 系统 IPv6 未能关闭或恢复：先能锁就锁 Claude，再把状态暴露给界面。
+   * 注意：守卫组只能拦经过内核的流量，IPv6 直连不走 TUN，所以这里只能缩短窗口，
+   * 不能把「已锁 Claude」当成「IPv6 泄漏已解决」。
+   */
+  async function noteIpv6Unprotected(reason, error) {
+    ipv6Unprotected = { at: new Date().toISOString(), reason, error: error?.message ?? (error ? String(error) : null) };
+    let guard = false;
+    try { guard = await applyClaudeGuard(true); } catch { /* 锁定失败不覆盖原始错误 */ }
+    logger(`[net-core] ${reason}；Claude 流量${guard ? "已" : "未能"}阻断，系统 IPv6 可能绕过隧道。`);
+    return guard;
+  }
+
+  // ---- 第 4 状态：内核缺位时的系统级 fail-closed ----
+  // 语义：Claude 只允许经固定出口出去；隧道确认接管前一律由特权宿主在系统层阻断。
+  // 布防与撤防都只表达“意图”，实际状态以宿主回读为准，由心跳持续收敛。
+  let failClosed = { supported: false, desired: "released", armed: null, count: 0, error: null };
+  let failClosedTargets = null;
+  let failClosedToken = null;
+  const failClosedEnabled = () => hostMode && hostCapabilities.includes("claude-guard") && env.CHECKCC_CLAUDE_FAILCLOSED !== "0";
+
+  async function failClosedTargetsResolve() {
+    if (failClosedTargets) return failClosedTargets;
+    const discovered = await discoverClaudeTargets({ platform });
+    const targets = await mergeClaudeGuardTargets(discovered, { stateDir });
+    if (!targets.packages.length && !targets.programs.length && !targets.addresses.length) {
+      throw new Error("未找到 Claude 客户端，无法建立 fail-closed 阻断目标。");
+    }
+    failClosedTargets = targets;
+    return targets;
+  }
+
+  /** 布防：在起内核之前调用。失败只记录并暴露给界面，不能静默当作已保护。 */
+  async function armClaudeFailClosed(reason) {
+    if (!failClosedEnabled()) return false;
+    failClosed.desired = "armed";
+    try {
+      const targets = await failClosedTargetsResolve();
+      failClosedToken ??= randomBytes(8).toString("hex");
+      const result = await hostAction("claude-guard", { op: "arm", token: failClosedToken, ...targets }, null, 15000);
+      const guard = result.claudeGuard ?? {};
+      failClosed = { supported: true, desired: "armed", armed: guard.armed ?? null, count: guard.count ?? null, error: null };
+      logger(`[net-core] fail-closed 已布防（${reason}）：隧道验证通过前 Claude 无法直连。`);
+      return true;
+    } catch (error) {
+      failClosed = { ...failClosed, supported: true, desired: "armed", armed: false, error: error.message };
+      logger(`[net-core] fail-closed 布防失败（${reason}）：${error.message}`);
+      return false;
+    }
+  }
+
+  /** 撤防：只能在隧道与出口都验证通过后调用；越早调用越容易把流量放回直连。 */
+  async function releaseClaudeFailClosed(reason) {
+    if (!failClosedEnabled()) return false;
+    failClosed.desired = "released";
+    try {
+      const result = await hostAction("claude-guard", { op: "release" }, null, 15000);
+      const guard = result.claudeGuard ?? {};
+      failClosed = { supported: true, desired: "released", armed: guard.armed ?? null, count: guard.count ?? null, error: null };
+      logger(`[net-core] fail-closed 已撤防（${reason}）。`);
+      return true;
+    } catch (error) {
+      failClosed = { ...failClosed, supported: true, desired: "released", armed: null, error: error.message };
+      logger(`[net-core] fail-closed 撤防失败（${reason}）：${error.message}`);
+      return false;
+    }
+  }
+
   // 仅在节点 IPv6 能力未验证时关闭系统 IPv6；双栈配置生效后恢复原设置。
   async function enableIpv6Guard() {
     if ((ipv6Guard && !ipv6Guard.unconfirmed) || !tunEnabled || shouldProtectIpv6()) return;
     if (hostMode) {
       try {
-        const result = await hostAction("ipv6", { enabled: false });
+        const result = await hostAction("ipv6", { enabled: false }, null, 8000);
         if (!result.changed && result.previous !== 'Off' && result.idle !== true) throw new Error('宿主未确认系统 IPv6 已关闭。');
         ipv6Guard = { mode: "host" };
         logger("[net-core] 已通过特权宿主关闭系统 IPv6，避免绕过隧道。");
@@ -981,6 +1057,7 @@ export async function createKernelRuntime({ stateDir, env = process.env, root, l
         // 保留恢复责任，退出/回滚时仍须向同一个宿主请求恢复。
         ipv6Guard = { mode: 'host', unconfirmed: true };
         logger(`[net-core] 宿主关闭 IPv6 未确认（${error.message}），保留宿主操作并等待重试。`);
+        await noteIpv6Unprotected("特权助手关闭系统 IPv6 未确认", error);
         throw new Error(`特权助手关闭系统 IPv6 未确认：${error.message}`);
       }
     }
@@ -995,10 +1072,12 @@ export async function createKernelRuntime({ stateDir, env = process.env, root, l
       // 留日志，避免用户看到一屏他自己无法处理的命令输出。
       const denied = /PermissionDenied|Access is denied|拒绝访问|System Error 5|EACCES|EPERM/i.test(String(error?.message ?? ""));
       if (denied && !elevationStatus({ platform }).elevated) {
+        await noteIpv6Unprotected("关闭系统 IPv6 需要管理员权限", error);
         throw new Error(hostStale
           ? "特权助手版本过旧，无法关闭系统 IPv6。请重新开启环境防护，并在系统授权窗口里允许更新（仅需一次）。"
           : "关闭系统 IPv6 需要管理员权限。请重新开启环境防护并允许授权安装特权助手（仅需一次）。");
       }
+      await noteIpv6Unprotected("关闭系统 IPv6 失败", error);
       throw error;
     }
   }
@@ -1012,6 +1091,8 @@ export async function createKernelRuntime({ stateDir, env = process.env, root, l
       logger("[net-core] 已恢复系统 IPv6。");
     } catch (error) {
       logger(`[net-core] 恢复系统 IPv6 失败：${error.message}`);
+      // 恢复了一半最危险：系统 IPv6 可能已开启，而双栈隧道并未确认 → 先锁 Claude。
+      await noteIpv6Unprotected("恢复系统 IPv6 失败", error);
       throw error;
     }
   }
@@ -1024,6 +1105,7 @@ export async function createKernelRuntime({ stateDir, env = process.env, root, l
     if (!tunnel.active || applied?.ipv6 !== true || applied?.tun?.enable !== true || !applied.tun['inet6-address']?.length) throw new Error('IPv6 隧道接管未确认，保留系统 IPv6 原有关闭状态。');
     await restoreIpv6Guard();
     ipv6Protected = true;
+    ipv6Unprotected = null;
   }
 
   /** 用一个临时内核 + IPv6-only 端点判断当前节点能否承载 IPv6；结果缓存 10 分钟。 */
@@ -1096,6 +1178,9 @@ export async function createKernelRuntime({ stateDir, env = process.env, root, l
   async function launch() {
     const signal = workController.signal;
     signal.throwIfAborted();
+    // 第 4 状态的第一步：先把 Claude 锁死，再建内核。
+    // 宿主不支持该能力时只记录并暴露给界面，不能假装已保护。
+    await armClaudeFailClosed("内核启动");
     // 每次启动都重新探测宿主：否则「先开应用、后装宿主」的次序会让 TUN 一直被当成未启用。
     const previousHostMode = hostMode;
     const host = await refreshHost();
@@ -1181,6 +1266,11 @@ export async function createKernelRuntime({ stateDir, env = process.env, root, l
     signal.throwIfAborted();
     scheduleExitCheck();
     lastTunnelCaptured = tunEnabled ? await core.tunnelStatus().then(value => value.active).catch(() => null) : null;
+    // 撤防的唯一条件：没有区域锁/未保护阻断，且隧道真的接管（开了 TUN 时 captured 必须为 true）。
+    // 任何一项不成立就继续阻断：撤早了只是继续连不上，撤晚了才是裸奔。
+    if (!strictEnabled && !regionLock && !unprotectedLock && (!tunEnabled || lastTunnelCaptured === true)) {
+      await releaseClaudeFailClosed("隧道与出口已验证");
+    }
     signal.throwIfAborted();
     lastHealthAt = new Date().toISOString();
     startHealthMonitor();
@@ -1197,7 +1287,7 @@ export async function createKernelRuntime({ stateDir, env = process.env, root, l
     if (disabledReason()) return false;
     try {
       if (!core || !core.state().running) {
-        if (core) await stop();
+        if (core) await stop({ keepIpv6Guard: true });
         await launch();
       }
       else {
@@ -1209,7 +1299,7 @@ export async function createKernelRuntime({ stateDir, env = process.env, root, l
       return true;
     } catch (error) {
       lastError = error.message;
-      try { await stop(); }
+      try { await stop({ keepIpv6Guard: true }); }
       catch (cleanup) { lastError += `；清理失败：${cleanup.message}`; }
       // 唤醒后网卡可能保留 IPv4，但 DNS、网关或 TUN 尚未就绪，同样需要后台重试。
       const failure = `${error.code ?? ''} ${error.message}`;
@@ -1226,8 +1316,15 @@ export async function createKernelRuntime({ stateDir, env = process.env, root, l
     }
   }
 
-  async function stop() {
+  /**
+   * 停止内核。重建（reloadKernel）时必须 keepIpv6Guard：
+   * 否则每轮重试都会“恢复 IPv6 → 再关闭”，关不掉时就会留下「系统 IPv6 开启 + 隧道未确认」的裸奔窗口，
+   * 而且两边互相拖成分钟级重试（实测事故：16:26–16:30）。
+   */
+  async function stop({ keepIpv6Guard = false } = {}) {
     await claudeProxy?.restore();
+    // 退出/关闭保护：按用户选择“停内核 → 恢复环境 → 撤防”；重建时保持阻断。
+    if (!keepIpv6Guard) await releaseClaudeFailClosed("停止内核");
     ipv6Protected = false;
     lastHealthAt = null;
     lastTunnelCaptured = null;
@@ -1239,6 +1336,8 @@ export async function createKernelRuntime({ stateDir, env = process.env, root, l
     // 停止内核即停止接管：未保护阻断随内核一起结束，下次启动由保护服务重新建立。
     unprotectedLock = null;
     claudeGuardBlocked = false;
+    // 重建时保留 IPv6 关闭状态与告警；只有真正停止（退出/关闭保护）才清掉。
+    if (!keepIpv6Guard) ipv6Unprotected = null;
     clearInterval(hostHeartbeat);
     hostHeartbeat = null;
     heartbeatGeneration++;
@@ -1258,16 +1357,16 @@ export async function createKernelRuntime({ stateDir, env = process.env, root, l
       if (still) throw new Error(`端口 ${apiPort} 仍被进程 ${still} 占用：内核未真正停止。`);
       core = null;
       await stopConnectionLog();
-      await restoreIpv6Guard();
+      if (!keepIpv6Guard) await restoreIpv6Guard();
       return;
     }
-    if (!core) { await stopConnectionLog(); await restoreIpv6Guard(); return; }
+    if (!core) { await stopConnectionLog(); if (!keepIpv6Guard) await restoreIpv6Guard(); return; }
     await core.stop();
     await stopConnectionLog();
     // 停成功后不能继续握着已停止的实例：否则 report() 会去读它的 /version，
     // 把「已停止」误报成「状态不可读」。
     core = null;
-    await restoreIpv6Guard();
+    if (!keepIpv6Guard) await restoreIpv6Guard();
   }
 
   /** 把内存状态里的某条来源设为当前：proxies / selected / source 三个派生字段一起换。 */
@@ -1299,7 +1398,7 @@ export async function createKernelRuntime({ stateDir, env = process.env, root, l
   async function reloadKernel(reason) {
     const previousUnprotectedLock = unprotectedLock;
     if (core) {
-      await stop();
+      await stop({ keepIpv6Guard: true });
       core = null;
     }
     unprotectedLock = previousUnprotectedLock;
@@ -1337,7 +1436,7 @@ export async function createKernelRuntime({ stateDir, env = process.env, root, l
           finally { await rm(temporary, { force: true }); }
         }
         if (hadCore) await reloadKernel("回滚配置");
-        else if (core) await stop();
+        else if (core) await stop({ keepIpv6Guard: true });
       } catch (rollback) {
         lastError = `${error.message}；回滚失败：${rollback.message}`;
         throw new Error(lastError, { cause: error });
@@ -1520,6 +1619,14 @@ export async function createKernelRuntime({ stateDir, env = process.env, root, l
       claudeBlocked: claudeBlocked(),
       // 守卫组真实选择：blocked=Claude 域名在内核里被切到 REJECT（不重载配置）。
       claudeGuard: claudeGuardBlocked ? "blocked" : "open",
+      // 隧道未确认接管时的 fail-closed 事实：界面靠它区分「已保护」与「无保护」。
+      // IPv6 未关闭时守卫组覆盖不到 v6 直连，只能告警，不能声称已保护。
+      failClosed: {
+        claudeGuarded: claudeGuardBlocked,
+        ipv6Unprotected: ipv6Unprotected ? { ...ipv6Unprotected } : null,
+        // 第 4 状态：由特权宿主持有的系统级阻断（内核不在也生效）。armed 为宿主回读值。
+        hostGuard: { ...failClosed },
+      },
       unprotectedGuard: unprotectedLock ? { ...unprotectedLock } : null,
       strictMode: strictEnabled, guard: hostGuard,
       takeover: networkTakeover.status(),
@@ -1763,7 +1870,7 @@ export async function createKernelRuntime({ stateDir, env = process.env, root, l
     hungHost = false;
     const changed = next !== hostMode;
     // 切到宿主模式前必须按本机模式停掉手里的内核，否则宿主绑不上 39090。
-    if (changed && next && core) await stop();
+    if (changed && next && core) await stop({ keepIpv6Guard: true });
     hostMode = next;
     tunEnabled = tunOverride ?? resolveTunEnabled();
     return { hostMode, tunEnabled, changed };
@@ -1864,7 +1971,7 @@ export async function createKernelRuntime({ stateDir, env = process.env, root, l
     tunEnabled = next;
     if (core?.state().running && nodes?.state === "ready") {
       const restartKernel = async () => {
-        await stop();
+        await stop({ keepIpv6Guard: true });
         try { await launch(); } catch (error) { lastError = `隧道回滚后重启失败：${error.message}`; }
       };
       try {

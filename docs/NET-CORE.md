@@ -234,6 +234,27 @@ Claude 组停在别的节点上，回切比直接升级地区锁更接近用户�
   退出前 `afterStop({ shutdown: true })` 解除未保护阻断并关闭 TUN，应用退出后不再保留阻断状态。
   开发服（`scripts/dev.mjs`）同样处理。
 
+## 第 4 状态：内核缺位时的 fail-closed（Windows）
+
+前三种阻断（未保护阻断、区域锁、严格模式）都以「内核在线」为前提；内核启动中、重建中或崩溃时没有任何规则可依，
+Claude 会按系统默认路由**直连**出网——实测事故就是这么发生的（16:26–16:30 系统 IPv6 已恢复但双栈隧道未确认）。
+
+第 4 状态把这段窗口交给**特权宿主持有的系统防火墙**：
+
+- 布防：`launch()` 的第一行。撤防：仅当 `!regionLock && !unprotectedLock && 隧道已接管 && 出口已验证`。
+- 判据是「隧道是否确认接管」，不是「应用是否在运行」——否则应用崩溃会让规则残留，把隧道流量一起拦掉
+  （WFP 在路由之前生效，规则存在就会拦掉经 TUN 的流量）。
+- 实现：`scripts/net-core/claude-guard.mjs` 生成规则：MSIX 包族名（Store 版客户端）+ 程序路径（非打包安装 / Claude Code CLI `~/.local/bin/claude.exe`），
+  宿主按分组 `EnvGuardCC-Claude-Guard-<token>` 管理，`host.mjs` 提供 `claude-guard` 动作，需宿主协议 ≥ 4。
+- **不自动按 IP 阻断**：`claude.ai` 等域名大量落在 Cloudflare 共享网段，按 IP 拦截会误伤其他站点。
+  需要覆盖浏览器或自定义安装路径的用户，在状态目录写 `claude-guard-targets.json`：
+  `{ "programs": [...], "packages": [...], "addresses": ["203.0.113.9"] }`（地址只接受 IP）。
+- 双方都是声明式：应用心跳带 `claudeGuardDesired`，宿主每次回读**实际规则数**并收敛；
+  `armed` 永远是回读值，不是「我调用过布防」。单次命令失败会在下一个心跳周期自动修复并上报 `error`。
+- 应急恢复：`node scripts/recover-claude-guard.mjs`（按分组前缀删除，不依赖状态文件）。
+- 开发开关：`CHECKCC_CLAUDE_FAILCLOSED=0` 关闭本能力。
+- 边界：只拦 Claude 自己的出站；不拦浏览器进程（会误伤其他工作），不代替出口 IP 的质量判断。
+
 ### 宿主跟丢内核时的兜底
 
 宿主把内核记在内存里，进程重启或异常退出后 `core` 变成 `null`，但旧内核仍占着端口并维持 TUN。
