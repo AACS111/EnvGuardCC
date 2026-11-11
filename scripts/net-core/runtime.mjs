@@ -1178,15 +1178,15 @@ export async function createKernelRuntime({ stateDir, env = process.env, root, l
   async function launch() {
     const signal = workController.signal;
     signal.throwIfAborted();
-    // 第 4 状态的第一步：先把 Claude 锁死，再建内核。
-    // 宿主不支持该能力时只记录并暴露给界面，不能假装已保护。
-    await armClaudeFailClosed("内核启动");
     // 每次启动都重新探测宿主：否则「先开应用、后装宿主」的次序会让 TUN 一直被当成未启用。
     const previousHostMode = hostMode;
     const host = await refreshHost();
     // 启动和后台重建也必须保留已确认的宿主模式；未知状态只等待重试。
     if (host.inconclusive) throw new Error('特权宿主探测超时或暂时无响应，等待自动重试。');
     if (hostMode !== previousHostMode) logger(`[net-core] 特权宿主状态变化：${hostMode ? "不可用 → 可用" : "可用 → 不可用"}。`);
+    // 第 4 状态：先把 Claude 锁死，再建内核。必须在宿主能力刷新之后布防，
+    // 否则刚升级完宿主的首次启动会因旧 capabilities 而跳过（第二次启动才生效）。
+    await armClaudeFailClosed("内核启动");
     tunEnabled = strictEnabled || (tunOverride ?? resolveTunEnabled());
     if (strictEnabled && (!hostMode || platform !== "darwin")) throw new Error("严格模式需要已更新的 macOS 特权宿主；当前平台不能降级开启。");
     if (strictEnabled && hostGuard?.supported !== true) {
