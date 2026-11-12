@@ -490,7 +490,8 @@ export function createGateway({ upstreamBase = "https://api.anthropic.com", prof
           try { kernelValue = JSON.parse(kernelBody || "{}"); }
           catch { return sendJson(response, 400, { error: "无效的 JSON。" }); }
           const action = kernelValue?.action;
-          if (!["start", "stop", "restart", "select", "tunnel", "strict", "unlock-region"].includes(action)) return sendJson(response, 400, { error: "未知的内核操作。" });
+          if (!["start", "stop", "restart", "select", "tunnel", "strict", "unlock-region", "enable-firewall"].includes(action)) return sendJson(response, 400, { error: "未知的内核操作。" });
+          if (action === 'enable-firewall' && kernelValue.confirmed !== true) return sendJson(response, 400, { error: '开启 Windows 防火墙需要用户明确确认。' });
           if (["tunnel", "strict"].includes(action) && typeof kernelValue?.enabled !== "boolean") return sendJson(response, 400, { error: "网络开关必须是布尔值。" });
           let node = null;
           if (action === "select") {
@@ -501,6 +502,7 @@ export function createGateway({ upstreamBase = "https://api.anthropic.com", prof
           let reason = null;
           try {
             if (action === "start") ok = await netCore.start();
+            else if (action === 'enable-firewall') await netCore.enableFirewall({ confirmed: true });
             else if (action === "strict") {
               if (typeof netCore.setStrictMode !== "function") throw new Error("当前后台不支持系统断流保护，请更新应用。");
               await netCore.setStrictMode(kernelValue.enabled);
@@ -516,7 +518,7 @@ export function createGateway({ upstreamBase = "https://api.anthropic.com", prof
               else await netCore.setTunnel(kernelValue.enabled, { ensureHost: true });
             }
             else if (action === "stop") await netCore.stop();
-            else if (action === "restart") { await netCore.stop(); ok = await netCore.start(); }
+            else if (action === "restart") { ok = await netCore.restart(); }
             else ok = await netCore.select(node);
           } catch (error) { ok = false; reason = error.message; }
           const payload = await kernelPayload();

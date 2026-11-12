@@ -273,13 +273,17 @@ export function netCoreView(report, { locale = "zh", exitHistory = null } = {}) 
     ].filter(Boolean).join(zh ? " " : " ");
   }
   // fail-closed 未生效（宿主过旧/未装/收敛失败）时必须显式告警，不能因为“理论上已布防”而沉默。
-  if (report.failClosed?.hostGuard?.desired === "armed" && report.failClosed.hostGuard.armed !== true) {
+  if ((report.failClosed?.hostGuard?.desired === "armed" && report.failClosed.hostGuard.armed !== true) ||
+      (report.failClosed?.hostGuard?.desired === "protected" && report.failClosed.hostGuard.scope !== 'browser' && report.failClosed.hostGuard.directProtected !== true)) {
     if (tone !== "danger") { tone = "warn"; conclusion.tone = "warn"; }
     conclusion.detail = [
       t("内核缺位阻断未生效：Claude 可能在隧道验证前直连；请更新特权宿主（需要一次系统授权）。", "Kernel-absent guard is not active: Claude may go direct before the tunnel is verified. Update the privileged host (one system authorization)."),
       report.failClosed.hostGuard.error,
       conclusion.detail,
     ].filter(Boolean).join(zh ? " " : " ");
+  }
+  if (report.failClosed?.hostGuard?.scope === 'browser') {
+    conclusion.detail += t(' 未安装桌面客户端，当前保护浏览器访问 Claude。内核恢复期间的域名阻断不保证覆盖浏览器缓存连接或独立安全 DNS。', 'No desktop client is installed; protection applies to browser access to Claude. Domain blocking during kernel recovery may not cover cached browser connections or independent secure DNS.');
   }
   if (state === "running" && !tunEnabled) {    // 宿主模式下 TUN 关闭是「关闭保护 / 暂停接管」的正常态，不是故障：
     // 内核仍在跑（节点可测速、39080 可当代理），只是系统流量直连。

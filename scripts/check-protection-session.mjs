@@ -9,6 +9,45 @@ import { BrowserCloakController } from './browser-cloak.mjs';
 
 const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
+test('配置恢复失败仍执行网络回滚，并保留原始备份', async t => {
+  let networkRestored = 0;
+  const f = await fixture(t, {
+    restore: async () => { throw new Error('timezone restore failed'); },
+    afterStop: async ({ baseline }) => { assert.ok(baseline); networkRestored++; },
+  });
+  await f.session.start();
+  const backup = await readFile(f.session.file, 'utf8');
+  const stopped = await f.session.stop();
+  assert.equal(stopped.phase, 'restore_failed');
+  assert.equal(networkRestored, 1);
+  assert.equal(await readFile(f.session.file, 'utf8'), backup);
+});
+
+test('取消启动时恢复本次新增的 TUN，即使 Claude 阻断失败也不停止代理', async t => {
+  const stateDir = await mkdtemp(path.join(os.tmpdir(), 'checkcc-cancel-network-'));
+  t.after(() => rm(stateDir, { recursive: true, force: true }));
+  let tunEnabled = false, entered;
+  const detecting = new Promise(resolve => { entered = resolve; });
+  const calls = [];
+  const kernel = {
+    connectionState: () => ({ tunEnabled, strictEnabled: false }),
+    verifyConnection: async () => ({ state: 'running', tunEnabled, tunCaptured: tunEnabled }),
+    setTunnel: async value => { tunEnabled = value; calls.push(value); },
+    setUnprotectedGuard: async value => { if (value) throw new Error('firewall unavailable'); },
+  };
+  const service = createProtectionService({ stateDir, runtime: {}, browserCloak: {}, network: () => kernel, platform: 'win32' });
+  service.detect = async () => { entered(); return new Promise(() => {}); };
+  const starting = service.start();
+  const cancelled = assert.rejects(starting, { name: 'AbortError' });
+  await detecting;
+  const stopped = await service.stop();
+  await cancelled;
+  assert.equal(stopped.phase, 'idle');
+  assert.equal(tunEnabled, false);
+  assert.deepEqual(calls, [true, false]);
+  assert.match(stopped.unprotectedBlock.error, /firewall unavailable/);
+});
+
 test('启动卡在出口检测时可重试，旧检测晚到不覆盖新启动', async t => {
   let releaseOld, entered;
   const waiting = new Promise(resolve => { entered = resolve; });
@@ -660,7 +699,7 @@ test('关闭保护时建立未保护阻断，开启保护先解除阻断', async
   const stopped = await service.stop();
   assert.equal(stopped.phase, 'idle');
   assert.equal(stopped.unprotectedBlock.active, true);
-  assert.deepEqual(calls, ['guard:true'], '关闭保护后保持接管并阻断 Claude');
+  assert.deepEqual(calls, ['guard:true', 'tunnel:false'], '关闭保护恢复原先的代理模式并独立阻断 Claude');
 
   calls.length = 0;
   await service.start('http://localhost:3000');

@@ -13,9 +13,10 @@ import { createKernelRuntime } from "./net-core/runtime.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
-async function startFakeHost(payload) {
+async function startFakeHost(payload, status = 200) {
   const server = createServer((request, response) => {
     response.setHeader("content-type", "application/json");
+    response.statusCode = status;
     if (request.url === "/health") return response.end(JSON.stringify(payload));
     response.statusCode = 400;
     response.end(JSON.stringify({ error: "未知动作。" }));
@@ -24,18 +25,53 @@ async function startFakeHost(payload) {
   return { port: server.address().port, close: () => new Promise((resolve) => server.close(resolve)) };
 }
 
-async function createRuntime(port) {
-  const stateDir = await mkdtemp(path.join(tmpdir(), "checkcc-host-upgrade-"));
+async function createRuntime(port, savedStateDir = null) {
+  const stateDir = savedStateDir ?? await mkdtemp(path.join(tmpdir(), "checkcc-host-upgrade-"));
   await writeFile(path.join(stateDir, "host-token"), "token-token-token-token\n");
   const logs = [];
   const runtime = await createKernelRuntime({
-    stateDir,
+    stateDir, platform: 'win32',
+    hostInstaller: async () => { throw new Error('test-install-attempt'); },
     root,
     env: { CHECKCC_NET_CORE: "0", CHECKCC_NET_CORE_HOST_PORT: String(port) },
     logger: (message) => logs.push(message),
   });
-  return { runtime, logs, cleanup: () => rm(stateDir, { recursive: true, force: true }) };
+  return { runtime, stateDir, logs, cleanup: () => rm(stateDir, { recursive: true, force: true }) };
 }
+
+test('已授权宿主跨应用重启复用；重复或并发安装请求不再次提权', async () => {
+  const host = await startFakeHost({ ok: true, hostProtocol: HOST_PROTOCOL, capabilities: [...HOST_CAPABILITIES] });
+  const first = await createRuntime(host.port);
+  try {
+    for (const result of await Promise.all([first.runtime.installHost(), first.runtime.installHost()])) {
+      assert.equal(result.reused, true);
+      assert.equal(result.installed, false);
+    }
+    const next = await createRuntime(host.port, first.stateDir);
+    assert.equal((await next.runtime.installHost()).reused, true);
+  } finally { await first.cleanup(); await host.close(); }
+});
+
+test('宿主明确拒绝凭据时允许进入修复，不误报暂时离线', async () => {
+  const host = await startFakeHost({ error: 'unauthorized' }, 403);
+  const first = await createRuntime(host.port);
+  try {
+    assert.equal((await first.runtime.report()).hostMode, false);
+    assert.ok(first.logs.some(line => line.includes('拒绝现有凭据')));
+    await assert.rejects(first.runtime.installHost(), /未找到内核二进制|test-install-attempt/);
+  } finally { await first.cleanup(); await host.close(); }
+});
+
+test('凭据存在但宿主暂时离线，重复安装入口不弹 UAC', async () => {
+  const host = await startFakeHost({ ok: true, hostProtocol: HOST_PROTOCOL, capabilities: [...HOST_CAPABILITIES] });
+  const first = await createRuntime(host.port);
+  await host.close();
+  try {
+    await assert.rejects(first.runtime.installHost(), /无需重复授权/);
+    const next = await createRuntime(host.port, first.stateDir);
+    await assert.rejects(next.runtime.installHost(), /无需重复授权/);
+  } finally { await first.cleanup(); }
+});
 
 test("健康检查：认不出版本字段的宿主一律算过旧", () => {
   const legacy = checkHostHealth({ ok: true, running: false, apiPort: 39090, requiresAdmin: true });

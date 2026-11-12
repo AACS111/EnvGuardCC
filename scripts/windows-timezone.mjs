@@ -3,6 +3,21 @@ import { promisify } from 'node:util';
 import path from 'node:path';
 
 const exec = promisify(execFile);
+
+// Windows ignores _dstoff for zones without DST, and /g returns the bare ID.
+// Do not strip the suffix for zones that really have seasonal clock changes.
+export async function sameWindowsTimezone(actual, expected, { run = exec, env = process.env } = {}) {
+  if (typeof actual !== 'string' || typeof expected !== 'string') return false;
+  if (actual.toLowerCase() === expected.toLowerCase()) return true;
+  const base = value => value.replace(/_dstoff$/i, '').toLowerCase();
+  if (base(actual) !== base(expected)) return false;
+  const id = expected.replace(/_dstoff$/i, '').replaceAll("'", "''");
+  const script = `$ErrorActionPreference = 'Stop'; [TimeZoneInfo]::FindSystemTimeZoneById('${id}').SupportsDaylightSavingTime`;
+  const { stdout } = await run(windowsSystemExecutable('WindowsPowerShell\\v1.0\\powershell.exe', env), ['-NoProfile', '-NonInteractive', '-Command', script], { windowsHide: true, timeout: 15000 });
+  const supported = stdout.trim().toLowerCase();
+  if (!['true', 'false'].includes(supported)) throw new Error('无法核对 Windows 夏令时规则，原始备份已保留。');
+  return supported === 'false';
+}
 export function windowsSystemExecutable(name, env = process.env) {
   return path.win32.join(env.SystemRoot || env.windir || 'C:\\Windows', 'System32', name);
 }

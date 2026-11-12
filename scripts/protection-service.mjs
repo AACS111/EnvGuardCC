@@ -45,6 +45,7 @@ export function createProtectionService({ stateDir, runtime, browserCloak, curre
   let browserIssues = [];
   // 保护关闭时的 Claude 阻断状态：开启失败要如实展示，不能静默放行。
   let unprotectedBlock = { active: false, error: null };
+  let previousTunnel = null;
   const applyUnprotectedBlock = async enabled => {
     const kernel = network();
     if (!kernel) { unprotectedBlock = { active: false, error: null }; return; }
@@ -65,6 +66,7 @@ export function createProtectionService({ stateDir, runtime, browserCloak, curre
       signal?.throwIfAborted();
       const kernel = network();
       if (!kernel) return;
+      previousTunnel ??= kernel.connectionState?.().tunEnabled === true;
       // 先解除未保护阻断，否则保护自己的模拟测试会被 REJECT 规则挡住。
       if (kernel.setUnprotectedGuard) await kernel.setUnprotectedGuard(false);
       signal?.throwIfAborted();
@@ -74,7 +76,7 @@ export function createProtectionService({ stateDir, runtime, browserCloak, curre
       await assertNetwork();
     },
     beforeTest: assertNetwork,
-    afterStop: async ({ shutdown = false, kernelWillStop = false } = {}) => {
+    afterStop: async ({ shutdown = false, kernelWillStop = false, baseline } = {}) => {
       const kernel = network();
       if (!kernel) return;
       if (shutdown) {
@@ -88,6 +90,10 @@ export function createProtectionService({ stateDir, runtime, browserCloak, curre
         return;
       }
       await applyUnprotectedBlock(true);
+      // 恢复接管前的网络，保留本机代理；阻断失败也不能强迫用户继续使用 TUN。
+      const restoreTunnel = baseline?.networkTunnel ?? previousTunnel;
+      if (restoreTunnel === false && !kernel.connectionState?.().strictEnabled) await kernel.setTunnel(false);
+      previousTunnel = null;
     },
     detect: async () => {
       const kernel = network();
@@ -102,7 +108,7 @@ export function createProtectionService({ stateDir, runtime, browserCloak, curre
     snapshot: async () => {
       await runtime.load();
       const status = await gateway('/__checkcc/status');
-      return { timezone: timezoneSupported(platform) ? await currentZone() : null, timezoneBackup: await optionalFile(timezoneBackup), profile: await optionalFile(profileFile), policyFile: await optionalFile(policyFile), gatewayEnabled: status.cloak.enabled, policy: structuredClone(runtime.policy), runtimeEnabled: runtime.enabled };
+      return { networkTunnel: previousTunnel, timezone: timezoneSupported(platform) ? await currentZone() : null, timezoneBackup: await optionalFile(timezoneBackup), profile: await optionalFile(profileFile), policyFile: await optionalFile(policyFile), gatewayEnabled: status.cloak.enabled, policy: structuredClone(runtime.policy), runtimeEnabled: runtime.enabled };
     },
     apply: async (target, origin) => {
       const issues = [];

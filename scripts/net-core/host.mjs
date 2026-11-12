@@ -83,6 +83,7 @@ export function createKernelHost({ token, binary, stateDir, apiPort = 39090, hos
   let leaseTimer;
   let monitoring = false;
   let lastGuardInspection = 0;
+  let lastClaudeInspection = 0;
   let privateHome;
   let networkKey = "";
   const physicalNetwork = () => JSON.stringify(Object.entries(os.networkInterfaces()).filter(([name]) => name !== "utun90").map(([name, rows]) => [name, rows.filter(row => !row.internal).map(row => row.address).sort()]).sort());
@@ -194,7 +195,7 @@ export function createKernelHost({ token, binary, stateDir, apiPort = 39090, hos
     }
     const url = new URL(request.url ?? "/", "http://127.0.0.1");
     if (request.method === "GET" && url.pathname === "/health") {
-      const failClosed = await claudeGuard.status().catch((error) => ({ supported: claudeGuard.supported, armed: null, error: error.message }));
+      const failClosed = claudeGuard.snapshot();
       send(response, 200, { ok: true, running: Boolean(core?.state().running), apiPort, requiresAdmin, guard: firewall.status(), claudeGuard: failClosed, hostProtocol: HOST_PROTOCOL, capabilities: HOST_CAPABILITIES });
       return;
     }
@@ -219,17 +220,8 @@ export function createKernelHost({ token, binary, stateDir, apiPort = 39090, hos
       }
       leaseAt = Date.now();
       leaseSuspect = false;
-      // 心跳带期望的 fail-closed 状态：期望布防而规则不在就重建，期望撤防而规则还在就删除。
-      // 收敛失败不回 500（否则心跳会被当成内核故障），用 claudeGuard.error 上报给应用。
-      let failClosed = null;
-      if (value.claudeGuardDesired === "armed" || value.claudeGuardDesired === "released") {
-        try {
-          await claudeGuard.reconcile(value.claudeGuardSelectors ?? null, { desired: value.claudeGuardDesired });
-        } catch (error) {
-          logger(`[host] fail-closed 收敛失败：${error.message}`);
-        }
-        failClosed = await claudeGuard.status().catch(() => null);
-      }
+      // 心跳仅续租与读缓存。旧的在途心跳不能覆盖较新的布防/撤防动作。
+      const failClosed = claudeGuard.snapshot();
       send(response, 200, { ok: true, guard: firewall.status(), ...(failClosed ? { claudeGuard: failClosed } : {}) });
       return;
     }
@@ -239,10 +231,14 @@ export function createKernelHost({ token, binary, stateDir, apiPort = 39090, hos
         send(response, 200, { ok: true, ...await queueIpv6(value.enabled === true) }); return;
       }
       if (action === "claude-guard") {
-        if (value.op === "arm") send(response, 200, { ok: true, claudeGuard: { ...await claudeGuard.arm({ token: value.token, packages: value.packages, programs: value.programs, addresses: value.addresses, domains: value.domains }), armed: true } });
-        else if (value.op === "release") send(response, 200, { ok: true, claudeGuard: { ...await claudeGuard.release(), armed: false } });
-        else if (value.op === "status") send(response, 200, { ok: true, claudeGuard: await claudeGuard.status() });
-        else throw new Error("未知的 fail-closed 动作。");
+        const result = await serialize(async () => {
+          if (value.op === 'arm') return claudeGuard.arm({ token: value.token, packages: value.packages, programs: value.programs, addresses: value.addresses, domains: value.domains });
+          if (value.op === 'release') return claudeGuard.release({ keepDirect: value.keepDirect === true });
+          if (value.op === 'status') return claudeGuard.status();
+          if (value.op === 'enable-firewall') return claudeGuard.enableFirewall(value.confirmed);
+          throw new Error('未知的 fail-closed 动作。');
+        });
+        send(response, 200, { ok: true, claudeGuard: result });
         return;
       }
       if (action === "guard-status") { send(response, 200, { ok: true, guard: await firewall.inspect() }); return; }
@@ -276,12 +272,13 @@ export function createKernelHost({ token, binary, stateDir, apiPort = 39090, hos
       await firewall.restore();
       // 宿主重启后按落盘的期望状态收敛：宁可暂时多拦，也不能让上次未完成的布防静默消失。
       await claudeGuard.load().catch(() => {});
-      await claudeGuard.reconcile().catch((error) => logger(`[host] fail-closed 恢复失败：${error.message}`));
       await new Promise((resolve, reject) => {
         server.once("error", reject);
         server.listen(port, host, resolve);
       });
       server.removeAllListeners("error");
+      // 先开放廉价的健康检查，再串行恢复规则；首次安装也不能被 PowerShell 耗时误判失联。
+      void serialize(() => claudeGuard.reconcile()).catch(error => logger(`[host] fail-closed 恢复失败：${error.message}`));
       leaseTimer = setInterval(() => {
         if (monitoring) return;
         monitoring = true;
@@ -306,6 +303,10 @@ export function createKernelHost({ token, binary, stateDir, apiPort = 39090, hos
               leaseSuspect = true;
               leaseAt = Date.now();
             }
+          }
+          if (Date.now() - lastClaudeInspection >= 10000) {
+            lastClaudeInspection = Date.now();
+            await claudeGuard.reconcile();
           }
         }).catch(error => logger(`[host] 租约回收失败：${error.message}`)).finally(() => { monitoring = false; });
       }, Math.min(1000, leaseTimeoutMs));

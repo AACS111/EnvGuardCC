@@ -313,9 +313,11 @@ export class ProtectionSession {
       return;
     }
     try {
-      const issues = await this.restore(this.pending.baseline, this.pending.origin, options);
+      const issues = await this.restore(this.pending.baseline, this.pending.origin, options).catch(error => [error.message]);
+      // 时区/浏览器恢复失败不应阻止网络恢复；保留备份供下一次重试。
+      try { await this.afterStop({ ...options, baseline: this.pending.baseline }); }
+      catch (error) { issues.push(error.message); }
       if (issues.length) throw new Error(issues.join('；'));
-      await this.afterStop(options);
       await rm(this.file, { force: true }); this.pending = null;
       this.state.phase = 'idle'; this.state.issues = []; this.state.alarm = false; this.state.score = null;
       this.event('模拟保护已关闭，本次改动已自动恢复');

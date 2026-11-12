@@ -56,8 +56,28 @@
       const flow = await until(() => { const element = document.querySelector('.workspace-flow'); return element?.querySelector('.workspace-flow__node--proxy')?.textContent.includes('29') && element.querySelectorAll('.workspace-flow__connection').length === 30 ? element : null; }, 'merged proxy fixture');
       if (flow.querySelector('.workspace-flow__node--overseas')) throw new Error('Claude still has a separate proxy exit');
       if (flow.querySelector('.workspace-flow__more')) throw new Error('Unexpected overflow control');
-      const unhovered = [...flow.querySelectorAll('.workspace-flow__connection')].find(marker => !marker.matches(':hover') && !marker.matches(':focus-visible'));
-      if (!unhovered || getComputedStyle(unhovered.querySelector('text')).opacity !== '0') throw new Error('Particle labels must stay hidden until hover or focus');
+      const unhovered = [...flow.querySelectorAll('.workspace-flow__connection')].find(marker => !marker.matches(':hover') && !marker.matches(':focus-visible') && marker.dataset.revealed !== 'true');
+      if (!unhovered) throw new Error('No unfocused particle available for label verification');
+      const label = unhovered.querySelector('text');
+      const animation = label.querySelector('animate[attributeName="opacity"]');
+      if (animation) {
+        // Labels now briefly appear during each staggered animation cycle. Test
+        // both phases instead of assuming an arbitrary sampled frame is hidden.
+        const svg = unhovered.ownerSVGElement;
+        const savedTime = svg.getCurrentTime();
+        const begin = parseFloat(animation.getAttribute('begin'));
+        const duration = parseFloat(animation.getAttribute('dur'));
+        svg.pauseAnimations();
+        try {
+          const sample = async phase => {
+            svg.setCurrentTime(((begin + phase) % duration + duration) % duration);
+            await wait(100);
+            return Number(getComputedStyle(label).opacity);
+          };
+          if (await sample(0.8) < 0.9) throw new Error('Animated particle label did not appear');
+          if (await sample(3) !== 0) throw new Error('Animated particle label did not hide after its display window');
+        } finally { svg.setCurrentTime(savedTime); svg.unpauseAnimations(); }
+      } else if (getComputedStyle(label).opacity !== '0') throw new Error('Stationary particle label must stay hidden until hover or focus');
       const collections = [];
       for (const item of [{node:'proxy',route:'proxied',state:'active',title:'代理出口连接'}, {node:'direct',route:'direct',state:'active',title:'直连连接'}, {node:'gateway',route:'blocked',state:'all',title:'已拦截连接'}]) {
         flow.querySelector(`.workspace-flow__node--${item.node}`).click();
@@ -69,7 +89,7 @@
         modal.querySelector('button[aria-label="关闭"], button[aria-label="Close"]').click();
         await until(() => !document.querySelector('dialog.transfer-log-dialog[open]'), 'closing collection');
       }
-      flowLayout = { proxyConnections:29, visibleParticles:30, labelsHiddenUntilHover:true, singleProxyExit:true, collections };
+      flowLayout = { proxyConnections:29, visibleParticles:30, labelDisplayVerified:true, singleProxyExit:true, collections };
     } finally { window.fetch = originalFetch; }
     const result = { passed: true, title: document.title, stylesheets: document.styleSheets.length, helper: true, gateway: true, bridge: true, flowLayout, controls: { loginToggleEnabled: !loginToggle.disabled, startupToggleEnabled: !toggle.disabled, resetEnabled: !resetButton.disabled, savedAndRestored: true }, unrelatedPluginDenied: pluginDenied, nodeIntegration: false };
     await window.__TAURI_INTERNALS__.invoke('smoke_result', { result });

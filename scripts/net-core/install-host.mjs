@@ -10,6 +10,7 @@ import { buildHostInstallPlan, describePlan, waitForMacHostUnload } from "./serv
 import { resolveKernelBinary } from "./runtime.mjs";
 import { stageHostBundle } from "./host-bundle.mjs";
 import { createFirewallGuard } from "./firewall.mjs";
+import { cleanupClaudeGuard, uninstallHost } from './cleanup-claude-guard.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(here, "..", "..");
@@ -41,7 +42,7 @@ async function ensureToken(file) {
 async function main() {
   const stateDir = process.env.CHECKCC_STATE_DIR || path.join(root, "node_modules", ".checkcc-local");
   const hostScript = path.join(here, "host.mjs");
-  const binary = await resolveKernelBinary({ stateDir, root });
+  const binary = flag('uninstall') ? path.join(stateDir, 'unused-kernel') : await resolveKernelBinary({ stateDir, root });
   if (!binary) throw new Error("未找到内核二进制，请先运行 pnpm kernel:fetch。");
   await access(hostScript);
 
@@ -64,11 +65,11 @@ async function main() {
       process.exitCode = 2;
       return;
     }
-    for (const step of plan.uninstallCommands) {
-      if (step === plan.uninstallCommands[0] && process.platform === "darwin") await createFirewallGuard().release();
-      try { execFileSync(step.cmd, step.args, { stdio: "inherit", windowsHide: true }); }
-      catch (error) { if (!step.optional) throw error; }
-    }
+    await uninstallHost(plan, {
+      run: (cmd, args) => execFileSync(cmd, args, { stdio: 'inherit', windowsHide: true }),
+      cleanup: () => cleanupClaudeGuard({ stateDir }),
+      releaseMac: () => createFirewallGuard().release(),
+    });
     process.stdout.write("[install] 已卸载宿主。\n");
     return;
   }

@@ -1,4 +1,4 @@
-// 系统接管前退出当前用户已识别的代理 GUI；不按内核名字强杀或停用未知 VPN。
+// 系统接管前只检查冲突，不退出用户正在使用的代理，避免破坏现有网络。
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import net from "node:net";
@@ -84,7 +84,7 @@ const freePort = port => new Promise(resolve => {
   server.listen({ host: "127.0.0.1", port, exclusive: true }, () => server.close(() => resolve(true)));
 });
 
-export function createNetworkTakeover({ platform = process.platform, uid = process.getuid?.(), ownBinary, exec = run, listProcesses = () => processes(platform, exec), canBind = freePort, pause = ms => new Promise(r => setTimeout(r, ms)), attempts = 20, scanAttempts = 2 } = {}) {
+export function createNetworkTakeover({ platform = process.platform, uid = process.getuid?.(), ownBinary, exec = run, listProcesses = () => processes(platform, exec), canBind = freePort, scanAttempts = 2 } = {}) {
   let status = { phase: "idle", closed: [], reason: null, checkedAt: null };
   const update = (phase, extra = {}) => { status = { ...status, phase, ...extra, checkedAt: new Date().toISOString() }; };
   // 进程枚举是本环节最慢、最易抖动的一步（Windows 走 WMI）。单次失败先重试，
@@ -109,35 +109,8 @@ export function createNetworkTakeover({ platform = process.platform, uid = proce
     const command = (file, args) => bounded(() => exec(file, args));
     try {
       const initial = await bounded(scan);
-      if (initial.clients.length) update("quitting");
-      for (const client of initial.clients) {
-        if (platform === "darwin") {
-          await command("/usr/bin/osascript", ["-e", "on run argv\n if application (item 1 of argv) is running then\n tell application (item 1 of argv) to quit\n end if\nend run", client.target]);
-        } else {
-          const row = (await bounded(listProcesses)).find(p => p.pid === client.pid);
-          if (!row || !classifyTakeoverProcesses([row], { platform, uid, ownBinary }).clients.length) continue;
-          // 托盘运行的客户端没有主窗口，CloseMainWindow 不会生效；直接告诉用户去哪里退出。
-          if (row.hasWindow === false) throw Object.assign(new Error(`${client.label} 正在托盘运行（没有主窗口），请在其托盘菜单选择退出后重试。`), { handoffHint: true });
-          const expected = String(row.executable).replace(/'/g, "''");
-          await command("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", `$ErrorActionPreference='Stop'; $p=Get-Process -Id ${client.pid} -ErrorAction SilentlyContinue; if($p){if($p.Path -ne '${expected}'){throw '进程已变化，请重试。'}; $null=$p.CloseMainWindow()}`]);
-        }
-      }
-      update("waiting");
-      // 没有要退出的客户端时无需再扫一遍：这一次枚举就要数秒，而它只能得到同一个结论。
-      let remaining = initial;
-      for (let i = 0; initial.clients.length && i < attempts; i++) {
-        try { remaining = await bounded(scan); }
-        catch (error) {
-          // 已知有客户端待退出时，枚举失败也要说清是谁没退，而不是只报一条枚举错误。
-          throw new Error(`其他代理未能退出（${initial.clients.map(c => c.label).join("、")}）：${error.message}`);
-        }
-        if (!remaining.clients.length && !remaining.kernels.some(k => k.client)) break;
-        if (i + 1 < attempts) await pause(250);
-      }
-      if (remaining.clients.length || remaining.kernels.some(k => k.client)) {
-        const names = [...new Set([...remaining.clients.map(c => c.label), ...remaining.kernels.filter(k => k.client).map(k => `${k.name}（PID ${k.pid}）`)])];
-        throw new Error(`其他代理仍未退出：${names.join("、")}。请关闭其后台服务或自动重启，再重试接管。`);
-      }
+      if (initial.clients.length) throw Object.assign(new Error(`其他代理正在运行：${initial.clients.map(client => client.label).join("、")}。已保留现有网络与本机代理；如需系统接管，请手动处理冲突后重试。`), { handoffHint: true });
+      if (initial.kernels.some(k => k.client)) throw new Error('其他代理的隧道内核仍在运行，请手动处理冲突后重试。');
       if (platform === "darwin") {
         const vpn = await command("/usr/sbin/scutil", ["--nc", "list"]);
         if (/\(Connected\)|\(Connecting\)/i.test(vpn)) throw new Error("系统仍有已连接或正在连接的 VPN，请先断开后重试接管。");

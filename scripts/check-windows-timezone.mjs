@@ -1,6 +1,22 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readWindowsTimezone, windowsSystemExecutable } from './windows-timezone.mjs';
+import { readWindowsTimezone, sameWindowsTimezone, windowsSystemExecutable } from './windows-timezone.mjs';
+import { setSystemTimezone } from './system-timezone.mjs';
+
+test('旧备份的无夏令时时区 _dstoff 可以恢复，仍严格验证真实时区和夏令时', async () => {
+  const calls = [];
+  const run = async (file, args) => { calls.push({ file, args }); return { stdout: file.endsWith('powershell.exe') ? 'False\r\n' : '' }; };
+  assert.equal(await setSystemTimezone('China Standard Time_dstoff', { platform: 'win32', run, read: async () => 'China Standard Time' }), 'China Standard Time');
+  assert.deepEqual(calls[0].args, ['/s', 'China Standard Time_dstoff']);
+  assert.equal(await sameWindowsTimezone('UTC', 'China Standard Time_dstoff', { run }), false);
+  assert.equal(await sameWindowsTimezone('Pacific Standard Time', 'Pacific Standard Time_dstoff', { run: async () => ({ stdout: 'True' }) }), false);
+  await assert.rejects(sameWindowsTimezone('China Standard Time', 'China Standard Time_dstoff', { run: async () => ({ stdout: '' }) }), /无法核对/);
+  await assert.rejects(setSystemTimezone('Pacific Standard Time_dstoff', { platform: 'win32', run: async () => ({ stdout: 'True' }), read: async () => 'Pacific Standard Time' }), /复核未通过/);
+});
+
+test('本机只读验证 China Standard Time 不使用夏令时，不改时区', { skip: process.platform !== 'win32' }, async () => {
+  assert.equal(await sameWindowsTimezone('China Standard Time', 'China Standard Time_dstoff'), true);
+});
 
 const windows = { platform: 'win32', env: { SystemRoot: 'D:\\Windows' } };
 test('使用系统目录绝对路径读取 Windows 时区，不依赖 PATH', async () => {

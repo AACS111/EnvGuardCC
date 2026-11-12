@@ -22,7 +22,7 @@ test("自动退出只识别确切客户端与当前用户，不按模糊名称�
   assert.deepEqual(windows.clients.map(c => c.pid), [1]);
 });
 
-test("先正常退出 GUI，等待后台内核消失，再检查路由、代理与端口", async () => {
+test("发现其他代理时保留所有进程和网络，拒绝强制接管", async () => {
   let scans = 0; const events = [];
   const takeover = createNetworkTakeover({ platform: "darwin", uid: 501,
     listProcesses: async () => ++scans === 1 ? [gui, kernel, own] : scans === 2 ? [kernel, own] : [own],
@@ -30,9 +30,8 @@ test("先正常退出 GUI，等待后台内核消失，再检查路由、代理�
     pause: async () => { events.push("wait"); },
     canBind: async port => { events.push(port); return true; },
   });
-  const result = await takeover.prepare({ ports: [39080, 39090], proxyPort: 39080 });
-  assert.equal(result.phase, "ready"); assert.deepEqual(result.closed, ["FlClash"]);
-  assert.deepEqual(events, ["/usr/bin/osascript", "wait", "/usr/sbin/scutil", "/sbin/route", "/usr/sbin/scutil", 39080, 39090]);
+  await assert.rejects(takeover.prepare({ ports: [39080, 39090], proxyPort: 39080 }), /FlClash.*已保留现有网络/);
+  assert.deepEqual(events, []);
 });
 
 test("退出失败、内核重启或扫描权限不足均阻止接管，不发送强杀命令", async () => {
@@ -41,9 +40,9 @@ test("退出失败、内核重启或扫描权限不足均阻止接管，不发�
     listProcesses: async () => [gui, kernel], pause: async () => {},
     exec: async (file, args) => { calls.push([file, args]); return ""; },
   });
-  await assert.rejects(takeover.prepare(), /仍未退出.*FlClash.*mihomo/);
+  await assert.rejects(takeover.prepare(), /其他代理正在运行.*FlClash/);
   assert.equal(takeover.status().phase, "blocked");
-  assert.equal(calls.length, 1); assert.equal(calls[0][0], "/usr/bin/osascript");
+  assert.equal(calls.length, 0);
   const unavailable = createNetworkTakeover({ listProcesses: async () => { throw new Error("permission denied"); } });
   await assert.rejects(unavailable.prepare(), /permission denied/);
 });
@@ -64,14 +63,14 @@ test("未知 VPN、默认隧道路由、残留系统代理与占用端口分别�
   }
 });
 
-test("Windows 使用窗口退出，进程路径改变时不关闭复用的 PID", async () => {
+test("Windows 不关闭其他代理的窗口或进程", async () => {
   let scans = 0, closes = 0;
   const takeover = createNetworkTakeover({ platform: "win32", listProcesses: async () => {
     scans++;
     if (scans === 1) return [{ pid: 10, executable: "C:\\Apps\\FlClash.exe" }];
     return [{ pid: 10, executable: "C:\\Apps\\Browser.exe" }];
   }, exec: async () => { closes++; return ""; } });
-  assert.equal((await takeover.prepare()).phase, "ready");
+  await assert.rejects(takeover.prepare(), /FlClash.*已保留现有网络/);
   assert.equal(closes, 0);
 });
 
@@ -114,8 +113,8 @@ test("解析 Windows 进程扫描结果，托盘运行的客户端直接提示�
   let scans = 0;
   const rows = () => { scans++; return JSON.stringify([{ Id: 10, Path: String.raw`C:\Apps\FlClash.exe`, Window: false }]); };
   const takeover = createNetworkTakeover({ platform: "win32", exec: async () => rows() });
-  await assert.rejects(takeover.prepare(), /FlClash 正在托盘运行（没有主窗口），请在其托盘菜单选择退出后重试。/);
-  assert.equal(scans, 2, "托盘客户端无法被关闭：只重新读取一次就报错，不进等待循环");
+  await assert.rejects(takeover.prepare(), /FlClash.*已保留现有网络/);
+  assert.equal(scans, 1, "只扫描，不关闭进程或等待退出");
   assert.equal(takeover.status().phase, "blocked");
 });
 
@@ -128,5 +127,5 @@ test("已识别客户端未退出时，枚举失败仍点名是谁", async () =>
       if (calls === 2) return "";
       throw new Error("powershell.exe 超过 12 秒未返回。");
     } });
-  await assert.rejects(takeover.prepare(), /其他代理未能退出（FlClash）：.*超过 12 秒未返回/);
+  await assert.rejects(takeover.prepare(), /其他代理正在运行.*FlClash/);
 });

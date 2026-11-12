@@ -22,7 +22,30 @@ for (const extension of ['.ts', '.tsx']) {
 }
 const { ProtectionWorkspace } = require(path.join(root, 'src/components/detector/ProtectionWorkspace.tsx'));
 const { AppUpdateDialog } = require(path.join(root, 'src/components/detector/AppUpdateNotice.tsx'));
+const { HostAuthorizationDialog } = require(path.join(root, 'src/components/detector/HostAuthorizationDialog.tsx'));
 const { ReleaseNotes } = require(path.join(root, 'src/components/detector/ReleaseNotes.tsx'));
+test('防火墙确认界面说明系统范围、持久影响，并提供取消与明确开启按钮', () => {
+  const props = { locale: 'zh', platform: 'win32', mode: 'firewall', error: '', busy: false, onAuthorize() {}, onClose() {} };
+  const html = renderToStaticMarkup(React.createElement(HostAuthorizationDialog, props));
+  assert.match(html, /开启 Windows 防火墙/);
+  assert.match(html, /域网络、专用网络和公用网络/);
+  assert.match(html, /退出 EnvGuardCC 后防火墙仍保持开启/);
+  assert.match(html, /暂不/);
+  assert.match(html, /确认开启并继续/);
+  const busy = renderToStaticMarkup(React.createElement(HostAuthorizationDialog, { ...props, busy: true }));
+  assert.match(busy, /disabled=""/);
+});
+test('前端只在显式确认后发送 confirmed:true，缺省值不能代表同意', async () => {
+  const { controlNetCore } = require(path.join(root, 'src/detection/gateway-check.ts'));
+  const original = globalThis.fetch;
+  const requests = [];
+  globalThis.fetch = async (_url, options) => { requests.push(JSON.parse(options.body)); return { ok: true, json: async () => ({ ok: true }) }; };
+  try {
+    await controlNetCore('enable-firewall');
+    await controlNetCore('enable-firewall', undefined, { confirmed: true });
+    assert.deepEqual(requests, [{ action: 'enable-firewall', confirmed: false }, { action: 'enable-firewall', confirmed: true }]);
+  } finally { globalThis.fetch = original; }
+});
 const { verificationScores } = require(path.join(root, 'src/detection/verification-score.ts'));
 const workspace = (phase, props = {}) => {
   const html = renderToStaticMarkup(React.createElement(ProtectionWorkspace, {

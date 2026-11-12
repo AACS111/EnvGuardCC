@@ -8,6 +8,22 @@ import path from 'node:path';
 import { buildInstallCommand, buildWindowsInstallCommand, cleanInstallerOutput, installKernelHost, shellQuote } from './net-core/host-install.mjs';
 import { waitForMacHostUnload, buildHostInstallPlan } from './net-core/service.mjs';
 
+test('Windows 首次安装注册开机 SYSTEM 宿主，长期运行且异常恢复不需再次授权', () => {
+  const plan = buildHostInstallPlan({ platform: 'win32', nodePath: 'C:\\host\\node.exe', hostScript: 'C:\\host\\host.mjs', stateDir: 'C:\\state', binary: 'C:\\host\\kernel.exe' });
+  const create = plan.commands.find(step => step.args.includes('/Create'));
+  assert.ok(create.args.includes('ONSTART'));
+  assert.ok(create.args.includes('SYSTEM'));
+  const settings = plan.commands.find(step => step.args.some(arg => arg.includes('New-ScheduledTaskSettingsSet')));
+  const script = settings.args.at(-1);
+  assert.match(script, /ExecutionTimeLimit \(\[TimeSpan\]::Zero\)/);
+  assert.match(script, /AllowStartIfOnBatteries/);
+  assert.match(script, /DontStopIfGoingOnBatteries/);
+  assert.match(script, /RestartCount 999/);
+  assert.match(script, /MultipleInstances IgnoreNew/);
+  assert.ok(plan.commands.indexOf(settings) > plan.commands.indexOf(create));
+  assert.ok(plan.commands.indexOf(settings) < plan.commands.findIndex(step => step.args.includes('/Run')));
+});
+
 test('macOS 重装等待旧作业退出，未退出或权限失败不能继续 bootstrap', async () => {
   let prints = 0, pauses = 0;
   await waitForMacHostUnload({ run: async (_, args) => {
@@ -46,7 +62,7 @@ test('单引号会被转义，路径无法注入额外命令', async t => {
 test('macOS 通过 osascript 请求系统管理员授权', async () => {
   const calls = [];
   const result = await installKernelHost({
-    stateDir: '/tmp/state',
+    stateDir: await mkdtemp(path.join(tmpdir(), 'checkcc-auth-')),
     binary: '/tmp/kernel',
     platform: 'darwin',
     nodePath: '/usr/local/bin/node',
@@ -64,7 +80,20 @@ test('macOS 通过 osascript 请求系统管理员授权', async () => {
 
 test('用户取消授权给出可读原因，而不是安装失败', async () => {
   const error = Object.assign(new Error('Command failed'), { stderr: 'execution error: User canceled. (-128)' });
-  await assert.rejects(installKernelHost({ stateDir: '/tmp/state', binary: '/tmp/kernel', platform: 'darwin', run: async () => { throw error; } }), /授权已取消/);
+  await assert.rejects(installKernelHost({ stateDir: await mkdtemp(path.join(tmpdir(), 'checkcc-auth-')), binary: '/tmp/kernel', platform: 'darwin', run: async () => { throw error; } }), /授权已取消/);
+});
+
+test('首次取消清理新凭据，重试可安装；已有授权凭据在取消升级时保留', async t => {
+  const stateDir = await mkdtemp(path.join(tmpdir(), 'checkcc-cancel-auth-'));
+  t.after(() => rm(stateDir, { recursive: true, force: true }));
+  const tokenFile = path.join(stateDir, 'host-token');
+  const denied = async () => { throw new Error('User canceled 1223'); };
+  await assert.rejects(installKernelHost({ stateDir, platform: 'win32', run: denied }), /授权已取消/);
+  await assert.rejects(readFile(tokenFile), { code: 'ENOENT' });
+  await installKernelHost({ stateDir, platform: 'win32', run: async () => ({ stdout: 'installed' }) });
+  const token = await readFile(tokenFile, 'utf8');
+  await assert.rejects(installKernelHost({ stateDir, platform: 'win32', run: denied }), /授权已取消/);
+  assert.equal(await readFile(tokenFile, 'utf8'), token);
 });
 
 test('不支持的平台明确要求手动安装', async () => {
@@ -93,7 +122,6 @@ test('Windows 以 UAC 执行编码命令，安装器输出落到日志并回读'
 test('提权进程失败时从日志读出真实原因，不把 CLIXML 进度噪声丢给用户', async t => {
   const stateDir = await mkdtemp(path.join(tmpdir(), 'checkcc-windows-log-'));
   t.after(() => rm(stateDir, { recursive: true, force: true }));
-  const logFile = path.join(stateDir, 'host-install.log');
   const noisy = '<Objs Version="1.1.0.1" xmlns="http://schemas.microsoft.com/powershell/2004/04"><Obj S="progress"><MS><AV>正在准备首次使用模块。</AV></MS></Obj></Objs>\n#< CLIXML\n';
   assert.equal(cleanInstallerOutput(noisy), '', 'CLIXML 进度记录必须被剔除');
   assert.equal(cleanInstallerOutput('a\r\n\r\nb\r\n'), 'a\nb');
