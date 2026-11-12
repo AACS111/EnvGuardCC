@@ -281,6 +281,28 @@ test("配置来源接口：列出、切换、重命名、删除、刷新，非�
   } finally { await close(gateway); }
 });
 
+test('开启防火墙接口必须有明确确认，普通启动和重启不走自动开启', async () => {
+  let enabled = 0, restarted = 0;
+  const gateway = createGateway({ netCore: {
+    report: async () => ({ state: 'running' }),
+    enableFirewall: async options => { assert.deepEqual(options, { confirmed: true }); enabled++; },
+    restart: async () => { restarted++; return true; },
+    stop: async () => assert.fail('重启必须使用保留阻断的专用入口'),
+  }, collect: async () => ({}) });
+  const url = await listen(gateway);
+  const post = body => fetch(url + '/__checkcc/net-core', { method: 'POST', headers: { ...ui, 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  try {
+    assert.equal((await post({ action: 'enable-firewall' })).status, 400);
+    assert.equal((await post({ action: 'enable-firewall', confirmed: false })).status, 400);
+    assert.equal(enabled, 0);
+    assert.equal((await (await post({ action: 'enable-firewall', confirmed: true })).json()).ok, true);
+    assert.equal(enabled, 1);
+    assert.equal((await (await post({ action: 'restart' })).json()).ok, true);
+    assert.equal(restarted, 1);
+    assert.equal(enabled, 1);
+  } finally { await close(gateway); }
+});
+
 test("内核动作失败时把报告里的真实原因带回接口", async () => {
   const netCore = {
     report: async () => ({ state: "error", reason: "TUN 需要更高权限：安装特权助手后重试。" }),
@@ -443,7 +465,7 @@ test("网络声明接口：GET 返回真实产物，POST 按后端校验拒绝�
     path: "/state/net-core-network.json",
     config: { directDomains: ["corp.example"] },
     effective: { target: "DIRECT", domainRules: ["DOMAIN-SUFFIX,corp.example,DIRECT"], ipRules: [], nameserverPolicy: {}, fakeIpFilter: [], dnsServers: ["system"], defaultExclusions: ["192.168.0.0/16"], redundantAddresses: [] },
-    problem: null, interfaces: [{ name: "以太网 2", address: "10.10.85.112" }], pendingRestart: false, canRestart: true,
+    problem: null, interfaces: [{ name: "test-ethernet", address: "192.0.2.10" }], pendingRestart: false, canRestart: true,
   };
   const netCore = {
     report: async () => ({ state: "idle" }),
@@ -460,7 +482,7 @@ test("网络声明接口：GET 返回真实产物，POST 按后端校验拒绝�
   try {
     const read = await (await fetch(url + "/__checkcc/net-core/network", { headers: ui })).json();
     assert.equal(read.ok, true);
-    assert.deepEqual(read.interfaces[0], { name: "以太网 2", address: "10.10.85.112" });
+    assert.deepEqual(read.interfaces[0], { name: "test-ethernet", address: "192.0.2.10" });
     assert.equal(read.effective.target, "DIRECT");
 
     const saved = await (await post({ config: { directDomains: ["corp.example"] }, restart: true })).json();
@@ -488,20 +510,20 @@ test("解析测试接口：返回内核真实解析结果，错误原样透出�
     verifyDomain: async (config, name) => {
       calls.push({ config, name });
       if (name === "bad") throw new Error("请填写有效的域名（不含 http:// 或端口）。");
-      return { name, status: 0, addresses: ["192.168.6.114"], fakeIp: false, restarted: true, elapsedMs: 12 };
+      return { name, status: 0, addresses: ["192.0.2.20"], fakeIp: false, restarted: true, elapsedMs: 12 };
     },
   };
   const gateway = createGateway({ netCore, collect: async () => ({}) });
   const url = await listen(gateway);
   const post = (body) => fetch(url + "/__checkcc/net-core/verify-domain", { method: "POST", headers: { ...ui, "Content-Type": "application/json" }, body: JSON.stringify(body) });
   try {
-    const ok = await (await post({ config: { directDomains: ["onmicro.ic"] }, name: "api.ai.onmicro.ic" })).json();
+    const ok = await (await post({ config: { directDomains: ["corp.example"] }, name: "api.corp.example" })).json();
     assert.equal(ok.ok, true);
-    assert.deepEqual(ok.addresses, ["192.168.6.114"]);
+    assert.deepEqual(ok.addresses, ["192.0.2.20"]);
     assert.equal(ok.restarted, true);
-    assert.deepEqual(calls.at(-1), { config: { directDomains: ["onmicro.ic"] }, name: "api.ai.onmicro.ic" });
+    assert.deepEqual(calls.at(-1), { config: { directDomains: ["corp.example"] }, name: "api.corp.example" });
 
-    const bad = await post({ config: { directDomains: ["onmicro.ic"] }, name: "bad" });
+    const bad = await post({ config: { directDomains: ["corp.example"] }, name: "bad" });
     assert.equal(bad.status, 400);
     assert.match((await bad.json()).reason, /有效的域名/);
 

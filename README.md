@@ -24,14 +24,14 @@
 
 ## 下载安装
 
-当前版本：**0.2.3**。下载其他版本或查看发布说明，请前往 [GitHub Releases](https://github.com/AACS111/EnvGuardCC/releases)。
+当前版本：**0.2.4**。下载其他版本或查看发布说明，请前往 [GitHub Releases](https://github.com/AACS111/EnvGuardCC/releases)。
 
 | 平台                  | 安装包                                                                                                    | 其他形式                                                                                              |
 | --------------------- | --------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
-| Windows x64           | [EXE 安装器](https://github.com/AACS111/EnvGuardCC/releases/download/v0.2.3/EnvGuardCC-Setup-0.2.3.exe)   | [便携 ZIP](https://github.com/AACS111/EnvGuardCC/releases/download/v0.2.3/EnvGuardCC-Windows-x64.zip) |
-| macOS · Apple Silicon | [DMG 安装镜像](https://github.com/AACS111/EnvGuardCC/releases/download/v0.2.3/EnvGuardCC-0.2.3-arm64.dmg) | [应用 ZIP](https://github.com/AACS111/EnvGuardCC/releases/download/v0.2.3/EnvGuardCC-macOS-arm64.zip) |
+| Windows x64           | [EXE 安装器](https://github.com/AACS111/EnvGuardCC/releases/download/v0.2.4/EnvGuardCC-Setup-0.2.4.exe)   | [便携 ZIP](https://github.com/AACS111/EnvGuardCC/releases/download/v0.2.4/EnvGuardCC-Windows-x64.zip) |
+| macOS · Apple Silicon | [DMG 安装镜像](https://github.com/AACS111/EnvGuardCC/releases/download/v0.2.4/EnvGuardCC-0.2.4-arm64.dmg) | [应用 ZIP](https://github.com/AACS111/EnvGuardCC/releases/download/v0.2.4/EnvGuardCC-macOS-arm64.zip) |
 
-[SHA-256 校验值](https://github.com/AACS111/EnvGuardCC/releases/download/v0.2.3/SHA256SUMS.txt)
+[SHA-256 校验值](https://github.com/AACS111/EnvGuardCC/releases/download/v0.2.4/SHA256SUMS.txt)
 
 - **Windows**：运行安装器，或完整解压便携包后运行 `EnvGuardCC.exe`，保留同目录文件。需要系统 WebView2；安装器会在缺失时联网安装，便携版需自行准备。安装包尚未进行代码签名。
 - **macOS**：打开 DMG，将应用拖入 Applications，再从“应用程序”启动。当前采用 ad-hoc 签名，尚未进行 Developer ID 签名和公证；首次打开可能需要在“系统设置 → 隐私与安全性”中允许。
@@ -137,6 +137,7 @@ Claude 专用出口由用户明确选择，不因测速自动切换。普通流�
 | 内置 mihomo、本机 HTTP/SOCKS 代理 | 支持用户自己的配置         | 支持用户自己的配置               |
 | 系统流量接管（TUN）               | 需要系统授权，需按平台实测 | 需要系统授权，需按平台实测       |
 | 严格连接保护                      | 尚未实现 WFP 系统断流      | 可选，限兼容的系统 PF 布局       |
+| 内核缺位时的 Claude 阻断          | 需要新版特权宿主（协议 4）   | 尚未实现                      |
 | 系统时区适配与恢复                | 依赖系统权限               | macOS 13+ 使用授权时区辅助服务   |
 | Claude 桌面端启动                 | 能力以本机检测为准         | 普通打开，不等同于受管浏览器保护 |
 
@@ -246,7 +247,7 @@ pnpm desktop:installer
 | [网络兼容性](docs/NETWORK-COMPATIBILITY.md)               | 网络场景与兼容性说明。               |
 | [时区服务](docs/timezone-service.md)                      | macOS 时区辅助服务、授权及恢复。     |
 | [环境操作](docs/environment-actions.md)                   | 环境检测与操作说明。                 |
-| [0.2.3 发布说明](docs/releases/v0.2.3.md)                 | 当前发布版本的变更记录。             |
+| [0.2.4 发布说明](docs/releases/v0.2.4.md)                 | 当前发布版本的变更记录。             |
 
 ## 技术栈与许可证
 

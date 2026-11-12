@@ -485,15 +485,15 @@ export async function readNetCore(): Promise<{ netCore: NetCoreReport | null; ex
   return { netCore: (value?.netCore ?? null) as NetCoreReport | null, exitHistory: (value?.exitHistory ?? null) as ExitHistory | null };
 }
 
-export type NetCoreAction = "start" | "stop" | "restart" | "select" | "tunnel" | "strict" | "unlock-region";
+export type NetCoreAction = "start" | "stop" | "restart" | "select" | "tunnel" | "strict" | "unlock-region" | "enable-firewall";
 
 // 内核动作：白名单由网关二次校验；失败原因原样返回，不做兜底美化。
-export async function controlNetCore(action: NetCoreAction, node?: string, options: { enabled?: boolean } = {}): Promise<{ ok: boolean; reason: string | null; netCore: NetCoreReport | null }> {
+export async function controlNetCore(action: NetCoreAction, node?: string, options: { enabled?: boolean; confirmed?: boolean } = {}): Promise<{ ok: boolean; reason: string | null; netCore: NetCoreReport | null }> {
   const response = await fetch(`${gatewayUrl}/__checkcc/net-core`, {
     method: "POST",
     headers: { "X-CheckCC-Client": "gateway-ui", "Content-Type": "application/json" },
-    body: JSON.stringify({ action, ...(node ? { node } : {}), ...(["tunnel", "strict"].includes(action) ? { enabled: options.enabled !== false } : {}) }),
-    cache: "no-store", signal: AbortSignal.timeout(["strict", "tunnel", "start", "restart", "select"].includes(action) ? 180000 : 30000),
+    body: JSON.stringify({ action, ...(node ? { node } : {}), ...(action === 'enable-firewall' ? { confirmed: options.confirmed === true } : {}), ...(["tunnel", "strict"].includes(action) ? { enabled: options.enabled !== false } : {}) }),
+    cache: "no-store", signal: AbortSignal.timeout(["strict", "tunnel", "start", "restart", "select", "enable-firewall"].includes(action) ? 180000 : 30000),
   });
   const value = await response.json().catch(() => null);
   if (!response.ok) throw new Error(value?.error ?? `HTTP ${response.status}`);

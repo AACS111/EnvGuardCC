@@ -8,6 +8,115 @@ import { createProtectionService, targetFromExit } from './protection-service.mj
 import { BrowserCloakController } from './browser-cloak.mjs';
 
 const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+test('配置恢复失败仍执行网络回滚，并保留原始备份', async t => {
+  let networkRestored = 0;
+  const f = await fixture(t, {
+    restore: async () => { throw new Error('timezone restore failed'); },
+    afterStop: async ({ baseline }) => { assert.ok(baseline); networkRestored++; },
+  });
+  await f.session.start();
+  const backup = await readFile(f.session.file, 'utf8');
+  const stopped = await f.session.stop();
+  assert.equal(stopped.phase, 'restore_failed');
+  assert.equal(networkRestored, 1);
+  assert.equal(await readFile(f.session.file, 'utf8'), backup);
+});
+
+test('取消启动时恢复本次新增的 TUN，即使 Claude 阻断失败也不停止代理', async t => {
+  const stateDir = await mkdtemp(path.join(os.tmpdir(), 'checkcc-cancel-network-'));
+  t.after(() => rm(stateDir, { recursive: true, force: true }));
+  let tunEnabled = false, entered;
+  const detecting = new Promise(resolve => { entered = resolve; });
+  const calls = [];
+  const kernel = {
+    connectionState: () => ({ tunEnabled, strictEnabled: false }),
+    verifyConnection: async () => ({ state: 'running', tunEnabled, tunCaptured: tunEnabled }),
+    setTunnel: async value => { tunEnabled = value; calls.push(value); },
+    setUnprotectedGuard: async value => { if (value) throw new Error('firewall unavailable'); },
+  };
+  const service = createProtectionService({ stateDir, runtime: {}, browserCloak: {}, network: () => kernel, platform: 'win32' });
+  service.detect = async () => { entered(); return new Promise(() => {}); };
+  const starting = service.start();
+  const cancelled = assert.rejects(starting, { name: 'AbortError' });
+  await detecting;
+  const stopped = await service.stop();
+  await cancelled;
+  assert.equal(stopped.phase, 'idle');
+  assert.equal(tunEnabled, false);
+  assert.deepEqual(calls, [true, false]);
+  assert.match(stopped.unprotectedBlock.error, /firewall unavailable/);
+});
+
+test('启动卡在出口检测时可重试，旧检测晚到不覆盖新启动', async t => {
+  let releaseOld, entered;
+  const waiting = new Promise(resolve => { entered = resolve; });
+  let detects = 0;
+  const target = { ip: '203.0.113.45', language: 'ko-KR', locale: 'ko-KR' };
+  const f = await fixture(t, { detect: async () => {
+    if (++detects === 1) { entered(); return new Promise(resolve => { releaseOld = resolve; }); }
+    return target;
+  } });
+  const old = f.session.start('http://localhost:3000');
+  const cancelled = assert.rejects(old, { name: 'AbortError' });
+  await waiting;
+  const fresh = await Promise.race([f.session.restart('http://localhost:3000'), delay(1000).then(() => { throw new Error('重试仍被旧检测阻塞'); })]);
+  assert.equal(fresh.enabled, true);
+  assert.equal(fresh.target.ip, target.ip);
+  releaseOld({ ...target, ip: '203.0.113.99' });
+  await cancelled;
+  await delay(0);
+  assert.deepEqual(f.calls, [target.ip]);
+  assert.equal(f.session.report().target.ip, target.ip);
+});
+
+test('重试等待已开始的配置写入安全回滚，保留原始基线', async t => {
+  let release, entered;
+  const writing = new Promise(resolve => { entered = resolve; });
+  const f = await fixture(t);
+  const apply = f.session.apply;
+  let applies = 0;
+  f.session.apply = async (...args) => {
+    if (++applies === 1) { entered(); await new Promise(resolve => { release = resolve; }); }
+    return apply(...args);
+  };
+  const old = f.session.start();
+  const cancelled = assert.rejects(old, { name: 'AbortError' });
+  await writing;
+  let done = false;
+  const retry = f.session.restart().then(report => { done = true; return report; });
+  await delay(10);
+  assert.equal(done, false, '旧写入完成前不能并行启动');
+  release();
+  await cancelled;
+  assert.equal((await retry).enabled, true);
+  await f.session.stop();
+  assert.deepEqual(f.settings(), f.original);
+});
+
+test('连续重试只执行最后一次，随后关闭优先于排队重试', async t => {
+  let entered, release;
+  const waiting = new Promise(resolve => { entered = resolve; });
+  let detects = 0;
+  const f = await fixture(t, { detect: async () => {
+    if (++detects === 1) { entered(); await new Promise(resolve => { release = resolve; }); }
+    return { ip: '203.0.113.45', language: 'ko-KR', locale: 'ko-KR' };
+  } });
+  const old = f.session.start();
+  const cancelled = assert.rejects(old, { name: 'AbortError' });
+  await waiting;
+  const first = f.session.restart();
+  const second = f.session.restart();
+  await Promise.all([first, second, cancelled]);
+  release();
+  assert.equal(f.calls.length, 1);
+  const retry = f.session.restart();
+  const stop = f.session.stop();
+  await Promise.all([retry, stop]);
+  assert.equal(f.session.report().enabled, false);
+  assert.equal(f.session.report().desiredEnabled, false);
+  assert.deepEqual(f.settings(), f.original);
+});
 async function fixture(t, overrides = {}) {
   const stateDir = await mkdtemp(path.join(os.tmpdir(), 'checkcc-protection-'));
   let settings = { timezone: 'Original', language: 'original' };
@@ -267,7 +376,7 @@ test('启动期间排队的唤醒不能越过后续关闭，重新打开网络�
   const wake = f.session.resume('http://localhost:3000');
   const stopping = f.session.stop(); release();
   await Promise.all([starting, wake, stopping]);
-  assert.equal(applies, 1); assert.equal(f.session.report().desiredEnabled, false);
+  assert.equal(applies, 0, '尚未开始的启动被关闭意愿取消'); assert.equal(f.session.report().desiredEnabled, false);
   await f.session.start('http://localhost:3000'); await f.session.stop({ shutdown: true });
   const reopened = new ProtectionSession(f.options);
   t.after(() => clearInterval(reopened.timer));
@@ -590,7 +699,7 @@ test('关闭保护时建立未保护阻断，开启保护先解除阻断', async
   const stopped = await service.stop();
   assert.equal(stopped.phase, 'idle');
   assert.equal(stopped.unprotectedBlock.active, true);
-  assert.deepEqual(calls, ['guard:true'], '关闭保护后保持接管并阻断 Claude');
+  assert.deepEqual(calls, ['guard:true', 'tunnel:false'], '关闭保护恢复原先的代理模式并独立阻断 Claude');
 
   calls.length = 0;
   await service.start('http://localhost:3000');

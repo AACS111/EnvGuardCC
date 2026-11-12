@@ -4,10 +4,12 @@ export function watchProtectionConnection(onWake, {
   later = setTimeout, cancel = clearTimeout, every = setInterval, stop = clearInterval,
 } = {}) {
   let timer = null;
+  let resume = false;
   let lastTick = now();
-  const wake = () => {
+  const wake = event => {
+    if (event === true || event?.type === 'online' || event?.type === 'checkcc:resume') resume = true;
     if (timer !== null) return;
-    timer = later(() => { timer = null; onWake(); }, 1000);
+    timer = later(() => { timer = null; const requested = resume; resume = false; onWake({ resume: requested }); }, 1000);
   };
   const visible = () => { if (page.visibilityState === 'visible') wake(); };
   const events = ['online', 'focus', 'pageshow', 'checkcc:resume'];
@@ -15,7 +17,7 @@ export function watchProtectionConnection(onWake, {
   page.addEventListener('visibilitychange', visible);
   const heartbeat = every(() => {
     const current = now();
-    if (current - lastTick > 15000) wake();
+    if (current - lastTick > 15000 || current < lastTick) wake(true);
     lastTick = current;
   }, 5000);
   return () => {

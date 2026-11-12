@@ -107,7 +107,9 @@ test('父应用被强杀后守护进程自动回收真实内核', { timeout: 200
   } finally {
     if (parent.exitCode===null && parent.signalCode===null) parent.kill('SIGKILL');
     for (const pid of [state?.pid,state?.supervisorPid]) if(pid && alive(pid)) process.kill(pid,'SIGKILL');
-    await fs.rm(directory,{recursive:true,force:true});
+    // Windows may retain the cache handle briefly after process/port teardown.
+    // Bounded cleanup retries preserve the lifecycle assertion above.
+    await fs.rm(directory,{recursive:true,force:true,maxRetries:10,retryDelay:100});
   }
 });
 

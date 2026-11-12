@@ -8,7 +8,7 @@ import { promisify } from "node:util";
 
 const execute = promisify(execFile);
 // 宿主运行包必须自包含：staged 目录里缺任何一个被 import 的文件，装好的宿主会直接起不来。
-export const HOST_BUNDLE_FILES = ["scripts/net-core/host.mjs", "scripts/net-core.mjs", "scripts/net-core/config.mjs", "scripts/net-core/public-dns.mjs", "scripts/net-core/ports.mjs", "scripts/net-core/guardian.cjs", "scripts/net-core/firewall.mjs", "scripts/net-core/system-ipv6.mjs", "scripts/windows-timezone.mjs"];
+export const HOST_BUNDLE_FILES = ["scripts/net-core/host.mjs", "scripts/net-core.mjs", "scripts/net-core/config.mjs", "scripts/net-core/public-dns.mjs", "scripts/net-core/ports.mjs", "scripts/net-core/guardian.cjs", "scripts/net-core/firewall.mjs", "scripts/net-core/claude-guard.mjs", "scripts/net-core/host-protocol.mjs", "scripts/net-core/system-ipv6.mjs", "scripts/windows-timezone.mjs", "scripts/windows-claude-targets.mjs", "scripts/net-core/firewall-rule-check.mjs"];
 const FILES = HOST_BUNDLE_FILES;
 
 export function protectedHostRoot(platform = process.platform) {

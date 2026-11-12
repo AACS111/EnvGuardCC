@@ -49,6 +49,7 @@ const STATE_LABELS = {
   unavailable: ["状态不可读", "Status unavailable"],
   off: ["未接入", "Not connected"],
   starting: ["启动中", "Starting"],
+  offline: ["等待网络", "Waiting for network"],
 };
 
 function normalizeViolation(item) {
@@ -163,11 +164,12 @@ export function netCoreView(report, { locale = "zh", exitHistory = null } = {}) 
     };
   } else if (state === "starting") {
     // 启动阶段（建隧道、验证出口）比页面加载慢：告诉用户正在做什么，而不是报未启动。
-    tone = "muted";
+    // 同时必须说清此刻没有保护：启动窗口里的 Claude 请求会绕过隧道直连。
+    tone = "warn";
     conclusion = {
-      tone: "muted",
-      title: t("网络内核正在启动", "Network kernel is starting"),
-      detail: report.reason || t("正在建立隧道并验证出口，完成后自动刷新。", "Establishing the tunnel and verifying the exit; this view refreshes automatically."),
+      tone: "warn",
+      title: t("内核正在启动 · Claude 当前无保护", "Kernel starting · Claude is unprotected"),
+      detail: report.reason || t("正在建立隧道并验证出口；此期间请勿使用 Claude 客户端，完成后本视图自动刷新。", "Establishing the tunnel and verifying the exit; do not use the Claude client until this completes. This view refreshes automatically."),
     };
   } else if (state === "idle") {
     // 内核停止 = 没有 TUN 接管：这是「关闭保护后恢复直连」的正常态，不是故障。
@@ -183,6 +185,14 @@ export function netCoreView(report, { locale = "zh", exitHistory = null } = {}) 
       tone: "warn",
       title: t("内核状态不可读", "Kernel status unavailable"),
       detail: report.reason || t("请确认内核进程仍在运行。", "Confirm the kernel process is still running."),
+    };
+  } else if (state === "offline") {
+    // 断网不是内核故障：等 network 回来就自动复检/重建，不能报成「启动失败」吓人。
+    tone = "warn";
+    conclusion = {
+      tone: "warn",
+      title: t("网络已断开 · 等待恢复", "Network down · waiting to recover"),
+      detail: report.reason || t("网络恢复后会自动复检，不需要手动重启。", "Verification resumes automatically when the network returns; no manual restart is needed."),
     };
   } else if (routing?.state === "violation" || Number(routing?.direct ?? 0) > 0) {
     tone = "danger";
@@ -249,18 +259,63 @@ export function netCoreView(report, { locale = "zh", exitHistory = null } = {}) 
       detail: report.unprotectedGuard.reason || t("环境防护未开启，Claude 域名已被拒绝；开启环境防护后恢复。", "Environment protection is off; Claude domains are rejected until protection is enabled."),
     };
   }
-  if (state === "running" && !tunEnabled) {
-    // 宿主模式下 TUN 关闭是「关闭保护 / 暂停接管」的正常态，不是故障：
+  // 系统 IPv6 未关闭：守卫组只能拦经过内核的流量，v6 直连不走 TUN。
+  // 任何“已保护”结论在这种状态下都不成立，必须降级成“可能泄漏”。
+  if (report.failClosed?.ipv6Unprotected) {
+    tone = "danger";
+    label = t("可能泄漏", "Possible leak");
+    conclusion.tone = "danger";
+    conclusion.title = `${t("系统 IPv6 未关闭", "System IPv6 not disabled")} · ${conclusion.title}`;
+    conclusion.detail = [
+      report.failClosed.ipv6Unprotected.reason,
+      t("系统 IPv6 可能绕过 IPv4 隧道直连，目前不能确认 Claude 请求走专用出口。", "System IPv6 may bypass the IPv4 tunnel; it is not confirmed that Claude requests use the dedicated exit."),
+      conclusion.detail,
+    ].filter(Boolean).join(zh ? " " : " ");
+  }
+  // fail-closed 未生效（宿主过旧/未装/收敛失败）时必须显式告警，不能因为“理论上已布防”而沉默。
+  if ((report.failClosed?.hostGuard?.desired === "armed" && report.failClosed.hostGuard.armed !== true) ||
+      (report.failClosed?.hostGuard?.desired === "protected" && report.failClosed.hostGuard.scope !== 'browser' && report.failClosed.hostGuard.directProtected !== true)) {
+    if (tone !== "danger") { tone = "warn"; conclusion.tone = "warn"; }
+    conclusion.detail = [
+      t("内核缺位阻断未生效：Claude 可能在隧道验证前直连；请更新特权宿主（需要一次系统授权）。", "Kernel-absent guard is not active: Claude may go direct before the tunnel is verified. Update the privileged host (one system authorization)."),
+      report.failClosed.hostGuard.error,
+      conclusion.detail,
+    ].filter(Boolean).join(zh ? " " : " ");
+  }
+  if (report.failClosed?.hostGuard?.scope === 'browser') {
+    conclusion.detail += t(' 未安装桌面客户端，当前保护浏览器访问 Claude。内核恢复期间的域名阻断不保证覆盖浏览器缓存连接或独立安全 DNS。', 'No desktop client is installed; protection applies to browser access to Claude. Domain blocking during kernel recovery may not cover cached browser connections or independent secure DNS.');
+  }
+  if (state === "running" && !tunEnabled) {    // 宿主模式下 TUN 关闭是「关闭保护 / 暂停接管」的正常态，不是故障：
     // 内核仍在跑（节点可测速、39080 可当代理），只是系统流量直连。
     if (hostMode) tone = "muted";
     conclusion.tone = tone;
     conclusion.detail = [conclusion.detail, t("TUN 未启用，流量未走隧道（内核仍在运行）。", "TUN is disabled; traffic goes direct while the kernel keeps running.")]
       .filter(Boolean).join(zh ? " " : " ");
   } else if (state === "running" && tunCaptured === false) {
-    conclusion.detail = [conclusion.detail, t("TUN 已配置但未接管流量（网卡未生效），请重启内核或检查宿主权限。", "TUN is configured but not capturing traffic; restart the kernel or check the host privilege.")]
-      .filter(Boolean).join(zh ? " " : " ");
+    // 配了 TUN 却没接管：Claude 此刻走的是系统默认路由（直接出网）。
+    tone = "danger";
+    label = t("无保护", "Unprotected");
+    conclusion = {
+      tone,
+      title: t("隧道未接管 · Claude 当前无保护", "Tunnel not capturing · Claude is unprotected"),
+      detail: t("TUN 已配置但未接管流量，Claude 请求会直接出网；请重启内核或检查宿主权限。", "TUN is configured but not capturing traffic, so Claude requests go direct. Restart the kernel or check the host privilege."),
+    };
   } else if (state === "running" && tunEnabled && tunCaptured === null) {
+    tone = "warn";
+    label = t("未验证", "Unverified");
+    conclusion.tone = "warn";
     conclusion.detail += t(" 隧道接管状态未知，不能确认系统流量已受保护。", " Tunnel capture is unknown; system traffic protection is unverified.");
+  }
+  // 有线 + 无线同时在线时默认接口会跳，TUN 跟着重建，表现为“一波动就断”。
+  if (state === "running" && Number(report.network?.links) > 1) {
+    conclusion.detail = [conclusion.detail, t("检测到多个网络同时在线（例如同时连有线和无线），出口可能抖动；建议只保留一条网络。", "Multiple networks are online (e.g. Ethernet and Wi-Fi); the exit may flap. Keeping a single link is recommended.")]
+      .filter(Boolean).join(zh ? " " : " ");
+  }
+  // 宿主暂时探测不到：保持宿主模式，不降级自起内核（否则会抢 39090/TUN）。
+  if (report.hostProbeFailed === true) {
+    conclusion.detail = [conclusion.detail, t("特权宿主暂时无响应，已在保持现有模式；稍后重试即可，不会另起一个内核。", "The privileged helper is temporarily unresponsive; the current mode is kept. Retry shortly — no second kernel is started.")]
+      .filter(Boolean).join(zh ? " " : " ");
+    if (tone === "ok") { tone = "warn"; conclusion.tone = "warn"; }
   }
 
   const violations = dedupeViolations(routing?.violations).map((item) => ({

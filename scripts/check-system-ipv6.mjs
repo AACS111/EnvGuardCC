@@ -93,8 +93,7 @@ test('Windows 仅关闭原本启用 IPv6 的网卡，恢复时使用原记录', 
   assert.ok(calls.at(-1).includes('Enable-NetAdapterBinding'));
 });
 
-test('Windows 未连接 / 虚拟网卡拒绝修改 IPv6 时不影响保护，只记录跳过项', async () => {
-  const exec = async (_file, args) => {
+test('Windows 未连接 / 虚拟网卡拒绝修改 IPv6 时不影响保护，只记录跳过项', async () => {  const exec = async (_file, args) => {
     const script = args.at(-1);
     if (script.includes('Where-Object Enabled')) return { stdout: '[{"Name":"以太网","Up":true},{"Name":"cfw-tap","Up":false},{"Name":"vEthernet (WSL)","Up":false}]' };
     return { stdout: JSON.stringify([
@@ -108,6 +107,35 @@ test('Windows 未连接 / 虚拟网卡拒绝修改 IPv6 时不影响保护，只
   assert.deepEqual(state.adapters, ['以太网']);
   assert.equal(state.changed, true);
   assert.deepEqual(state.skipped.map(item => item.name), ['cfw-tap', 'vEthernet (WSL)']);
+});
+
+test('Windows 虚拟网卡即使 Status=Up 也不算「正在使用」，不阻断保护也不无限重试', async () => {
+  const exec = async (_file, args) => {
+    const script = args.at(-1);
+    if (script.includes('Where-Object Enabled')) {
+      return { stdout: '[{"Name":"以太网","Up":true},{"Name":"vEthernet (WSL (Hyper-V firewall))","Up":true}]' };
+    }
+    return { stdout: JSON.stringify([
+      { name: '以太网', up: true, ok: true },
+      { name: 'vEthernet (WSL (Hyper-V firewall))', up: true, ok: false, error: 'Access is denied.' },
+    ]) };
+  };
+  const state = await disableSystemIpv6({ platform: 'win32', exec });
+  assert.equal(state.changed, true);
+  assert.deepEqual(state.adapters, ['以太网']);
+  // 关键：vEthernet 虽然 Up 但被标成 virtual，不能再被当成「活动网卡关不掉」。
+  assert.equal(state.skipped[0].virtual, true);
+});
+
+test('Windows 只剩虚拟网卡时不报错，按空闲处理', async () => {
+  const exec = async (_file, args) => {
+    const script = args.at(-1);
+    if (script.includes('Where-Object Enabled')) return { stdout: '[{"Name":"vEthernet (WSL)","Up":true}]' };
+    throw new Error('不该去改虚拟网卡的绑定');
+  };
+  const state = await disableSystemIpv6({ platform: 'win32', exec });
+  assert.equal(state.idle, true);
+  assert.equal(state.changed, false);
 });
 
 test('Windows 正在使用的网卡关不掉时回滚，回滚也失败则携带原记录供重试', async () => {

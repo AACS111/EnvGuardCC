@@ -32,6 +32,7 @@ import type { SignalResult } from "@/detection/types";
 import type { RepairChoice } from "@/detection/repair-options";
 
 const baselineKey = "checkcc.protection-baseline.v1";
+const firewallDisabled = (reason?: string | null) => /Windows 防火墙未开启/.test(reason ?? '');
 const storageKeys = [...orderedIds().map((id) => `checkcc.repair-target.v1.${id}`), "checkcc.applied-environment.v1", "checkcc.browser-gateway-linked.v1", "checkcc.repair-targets.v1"];
 function orderedIds() { return Object.entries(detectionConfig.signals).filter(([, config]) => config.enabled).sort(([, a], [, b]) => a.order - b.order).map(([id]) => id); }
 
@@ -74,6 +75,8 @@ export function Detector({ locale = "zh" }: { locale?: LocaleCode }) {
   const [browserPickerOpen, setBrowserPickerOpen] = useState(false);
   // 系统级隧道授权：保护启动时若 TUN 因缺少特权助手失败，就在这里请求一次系统授权。
   const [hostAuth, setHostAuth] = useState<{ error: string; purpose?: "proxy" | "protection" | "strict" } | null>(null);
+  const [firewallAuth, setFirewallAuth] = useState<{ error: string; action: NetCoreAction | 'protection'; protectionAction?: 'start' | 'restart' | 'stop'; node?: string; options?: { enabled?: boolean } } | null>(null);
+  const [firewallBusy, setFirewallBusy] = useState(false);
   const [hostBusy, setHostBusy] = useState(false);
   const [detailSignalId, setDetailSignalId] = useState<string | null>(null);
   const [baseline, setBaseline] = useState<Baseline | null>(null);
@@ -86,6 +89,8 @@ export function Detector({ locale = "zh" }: { locale?: LocaleCode }) {
   const [transitioning, setTransitioning] = useState(false);
   const [powerAction, setPowerAction] = useState<"start" | "stop" | null>(null);
   const powerLock = useRef(false);
+  const powerVersion = useRef(0);
+  const activationBaseline = useRef<Baseline | null>(null);
   const scanLock = useRef(false);
   const scanTask = useRef<Promise<void> | null>(null);
   const scanVersion = useRef(0);
@@ -165,15 +170,17 @@ export function Detector({ locale = "zh" }: { locale?: LocaleCode }) {
       const result = await controlNetCore(action, node, options);
       if (result.netCore) setNetCore(result.netCore);
       setNetCoreError(result.ok ? "" : (result.reason ?? (zh ? "内核操作未生效。" : "Kernel action had no effect.")));
+      if (!result.ok && firewallDisabled(result.reason)) setFirewallAuth({ error: '', action, node, options });
       return result;
     } catch (error) {
       setNetCoreError(error instanceof Error ? error.message : String(error));
+      if (firewallDisabled(error instanceof Error ? error.message : String(error))) setFirewallAuth({ error: '', action, node, options });
       return { ok: false, reason: error instanceof Error ? error.message : String(error), netCore: null };
     }
     finally { setNetCoreBusy(false); }
   }, [zh]);
   // 需要系统授权的原因：一次性安装/更新特权助手都能解决，取消授权后要能直接重试。
-  const hostPermissionError = (reason: string | null | undefined) => /TUN 需要更高权限|隧道未接管|严格模式需要|需要管理员权限|特权助手|授权已取消/.test(reason ?? "");
+  const hostPermissionError = (reason: string | null | undefined) => !firewallDisabled(reason) && /TUN 需要更高权限|隧道未接管|严格模式需要|需要管理员权限|特权助手|授权已取消/.test(reason ?? "");
   const authorizeHost = useCallback(async () => {
     if (hostBusy) return;
     const purpose = hostAuth?.purpose ?? "proxy";
@@ -190,7 +197,11 @@ export function Detector({ locale = "zh" }: { locale?: LocaleCode }) {
       await refreshNetCore();
       setHostAuth(null);
     } catch (error) {
-      setHostAuth({ error: error instanceof Error ? error.message : String(error), purpose });
+      const reason = error instanceof Error ? error.message : String(error);
+      if (firewallDisabled(reason)) {
+        setHostAuth(null);
+        setFirewallAuth({ error: '', action: purpose === 'protection' ? 'protection' : purpose === 'strict' ? 'strict' : 'tunnel', options: { enabled: true } });
+      } else setHostAuth({ error: reason, purpose });
     } finally { setHostBusy(false); }
   }, [hostBusy, hostAuth, netCoreAction, protection, refreshNetCore, zh]);
   useEffect(() => {
@@ -273,6 +284,7 @@ export function Detector({ locale = "zh" }: { locale?: LocaleCode }) {
       if (Object.keys(baseline.policy).length) installRuntimePolicy(baseline.policy); else restoreRuntimePolicy();
       for (const [key, value] of Object.entries(baseline.storage)) { if (value === null) localStorage.removeItem(key); else localStorage.setItem(key, value); }
       localStorage.removeItem("checkcc.protection-local-pending.v1");
+      activationBaseline.current = null;
     }, 0);
     return () => clearTimeout(timer);
   }, [baseline, protection.report?.phase, protection.connected, transitioning, protection.busy]);
@@ -413,44 +425,87 @@ export function Detector({ locale = "zh" }: { locale?: LocaleCode }) {
     await Promise.all([refreshExit(), enabled ? protectionRequest("test").then(() => protection.refresh()) : runAll({ background: true })]);
   };
   const toggleProtection = async (stop = false) => {
-    if (powerLock.current || transitioning || protection.busy || !protection.connected || !protection.report || protection.report.phase === "starting" || protection.report.phase === "stopping") return;
+    const retrying = powerLock.current || protection.busy || protection.report?.phase === 'starting' || protection.report?.phase === 'stopping';
+    const attempt = ++powerVersion.current;
     powerLock.current = true;
     scanVersion.current++; scanTask.current = null; scanLock.current = false; setRunning(false);
-    const restarting = protection.report.phase === "restart_required" && !stop;
-    const stopping = !restarting && (protection.report.enabled || protection.report.phase === "restore_failed");
+    const restarting = !stop && (retrying || protection.report?.phase === "restart_required");
+    const stopping = stop || (!restarting && (protection.report?.enabled || protection.report?.phase === "restore_failed"));
     setPowerAction(stopping ? "stop" : "start");
     setTransitioning(true); setCheckError("");
     try {
+      // Capture reversible page settings before any asynchronous scan. Retries
+      // share this baseline even when the first scan has not returned yet.
+      if (!stopping && !activationBaseline.current) {
+        if (localStorage.getItem('checkcc.protection-local-pending.v1')) {
+          const saved = JSON.parse(localStorage.getItem(baselineKey) ?? 'null') as Baseline | null;
+          if (!saved?.policy || !saved.storage) throw new Error(zh ? '原始配置备份不可用，请先关闭保护并重试恢复。' : 'The original settings backup is unavailable. Stop protection and retry restoration first.');
+          activationBaseline.current = saved;
+        }
+        if (!activationBaseline.current) {
+          const saved: Baseline = { at: new Date().toISOString(), browser: browserSignals, claude: claudeSignals, score: environmentScores(browserSignals, claudeSignals).combined, policy: activeRuntimePolicy(), storage: Object.fromEntries(storageKeys.map(key => [key, localStorage.getItem(key)])) };
+          localStorage.setItem(baselineKey, JSON.stringify(saved));
+          localStorage.setItem('checkcc.protection-local-pending.v1', 'true');
+          activationBaseline.current = saved; setBaseline(saved);
+        }
+      }
       if (stopping) {
         // 后台先恢复环境，再解除 TUN；页面不再拆分网络与会话事务。
         const report = await protection.act("stop");
+        if (attempt !== powerVersion.current) return;
         if (report.phase === "restore_failed") throw new Error(report.issues.join("；"));
-        if (baseline) {
-          if (Object.keys(baseline.policy).length) installRuntimePolicy(baseline.policy); else restoreRuntimePolicy();
-          for (const [key, value] of Object.entries(baseline.storage)) { if (value === null) localStorage.removeItem(key); else localStorage.setItem(key, value); }
+        const original = activationBaseline.current ?? baseline;
+        if (original) {
+          if (Object.keys(original.policy).length) installRuntimePolicy(original.policy); else restoreRuntimePolicy();
+          for (const [key, value] of Object.entries(original.storage)) { if (value === null) localStorage.removeItem(key); else localStorage.setItem(key, value); }
         }
         localStorage.removeItem("checkcc.protection-local-pending.v1");
+        activationBaseline.current = null;
       } else if (restarting) {
-        await protection.act("start");
+        await protection.act("restart");
       } else {
         const [browser, gateway] = await Promise.all([runBrowserScan(normalizeRegion(region), locale, detectorText), checkGateway(locale)]);
+        if (attempt !== powerVersion.current) return;
         if (!gateway.report) throw new Error(gateway.error ?? "网关未连接。");
-        const saved: Baseline = { at: new Date().toISOString(), browser: browser.signals, claude: gateway.signals, score: environmentScores(browser.signals, gateway.signals).combined, policy: activeRuntimePolicy(), storage: Object.fromEntries(storageKeys.map((key) => [key, localStorage.getItem(key)])) };
+        const saved: Baseline = { ...activationBaseline.current!, browser: browser.signals, claude: gateway.signals, score: environmentScores(browser.signals, gateway.signals).combined };
+        activationBaseline.current = saved;
         localStorage.setItem(baselineKey, JSON.stringify(saved)); setBaseline(saved);
         localStorage.setItem("checkcc.protection-local-pending.v1", "true");
         await protection.act("start");
       }
+      if (attempt !== powerVersion.current) return;
       setPowerAction(null);
       if (stopping) {
         await selfTest.refresh();
       }
       void refreshChecks(!stopping).catch(() => {});
     } catch (error) {
+      if (attempt !== powerVersion.current) return;
       const reason = error instanceof Error ? error.message : String(error);
       setCheckError(reason);
-      if (hostPermissionError(reason) && ["darwin", "win32"].includes(netCore?.elevation?.platform ?? "")) setHostAuth({ error: "", purpose: "protection" });
+      if (firewallDisabled(reason)) setFirewallAuth({ error: '', action: 'protection', protectionAction: stopping ? 'stop' : restarting ? 'restart' : 'start' });
+      else if (hostPermissionError(reason) && ["darwin", "win32"].includes(netCore?.elevation?.platform ?? "")) setHostAuth({ error: "", purpose: "protection" });
     }
-    finally { powerLock.current = false; setPowerAction(null); setTransitioning(false); }
+    finally { if (attempt === powerVersion.current) { powerLock.current = false; setPowerAction(null); setTransitioning(false); } }
+  };
+  const authorizeFirewall = async () => {
+    if (firewallBusy || !firewallAuth) return;
+    const pending = firewallAuth;
+    setFirewallBusy(true);
+    setFirewallAuth({ ...pending, error: '' });
+    try {
+      const enabled = await controlNetCore('enable-firewall', undefined, { confirmed: true });
+      if (!enabled.ok) throw new Error(enabled.reason ?? 'Windows 防火墙开启失败。');
+      if (pending.action === 'protection') await protection.act(pending.protectionAction ?? 'start');
+      else {
+        const result = await controlNetCore(pending.action, pending.node, pending.options);
+        if (!result.ok) throw new Error(result.reason ?? '保护未能恢复。');
+      }
+      await refreshNetCore();
+      setNetCoreError(''); setCheckError(''); setFirewallAuth(null);
+    } catch (error) {
+      setFirewallAuth({ ...pending, error: error instanceof Error ? error.message : String(error) });
+    } finally { setFirewallBusy(false); }
   };
   const recheck = async () => {
     if (powerLock.current || manualChecking || transitioning || protection.busy) return;
@@ -490,6 +545,7 @@ export function Detector({ locale = "zh" }: { locale?: LocaleCode }) {
     {manageSourcesOpen && <SourcesDialog locale={locale} initialView={manageSourcesView} busy={netCoreBusy} sources={netCore?.sources ?? []} activeId={netCore?.activeId ?? null} onClose={() => setManageSourcesOpen(false)} onImport={async (payload: NetCoreImportPayload) => { const result = await importNetCore(payload); if (result.netCore) { latestSourceScope.current = nodeMeasurementScope(result.netCore); setNetCore(result.netCore); } else await refreshNetCore(); return result; }} onAction={async (action: NetCoreSourceAction, id: string, name?: string) => { const result = await netCoreSourceAction(action, id, name); if (result.netCore) { latestSourceScope.current = nodeMeasurementScope(result.netCore); setNetCore(result.netCore); } else await refreshNetCore(); return result; }} onChanged={() => void refreshNetCore()} />}
     {browserPickerOpen && <BrowserPickerDialog locale={locale} busy={netCoreBusy} onClose={() => setBrowserPickerOpen(false)} onSaved={() => {}} onLink={async () => { await linkBrowser(); }} />}
     {hostAuth && <HostAuthorizationDialog platform={netCore?.elevation?.platform} locale={locale} busy={hostBusy} error={hostAuth.error} onAuthorize={() => void authorizeHost()} onClose={() => { if (!hostBusy) setHostAuth(null); }} />}
+    {firewallAuth && <HostAuthorizationDialog mode="firewall" platform="win32" locale={locale} busy={firewallBusy} error={firewallAuth.error} onAuthorize={() => void authorizeFirewall()} onClose={() => { if (!firewallBusy) setFirewallAuth(null); }} />}
     {networkExemptOpen && <NetworkExemptDialog locale={locale} busy={netCoreBusy} onClose={() => setNetworkExemptOpen(false)} onSaved={async (state) => { setNetCoreNetwork(state); if (state.netCore) setNetCore(state.netCore); else await refreshNetCore(); setNetCoreError(state.problem ?? ""); }} />}
     {detailSignal && <RepairDialog key={detailSignal.id} signal={detailSignal} browser={browserSignals.find((item) => item.id === detailSignal.id)} claude={claudeSignals.find((item) => item.id === detailSignal.id)} signals={allSignals} locale={locale} target={target} protectionEnabled={protection.report?.enabled} loading={loading || transitioning || cloakBusy || protection.report?.phase === "restart_required"} onClose={() => setDetailSignalId(null)} onRecheck={() => runSignal(detailSignal.id)} onRuntimeRecheck={runAll} onApplyGateway={(choice) => runSignal(detailSignal.id, choice)} />}
   </>;

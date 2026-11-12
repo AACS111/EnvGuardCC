@@ -27,14 +27,14 @@ async function ensureUserToken(stateDir) {
   const file = path.join(stateDir, "host-token");
   try {
     const existing = (await readFile(file, "utf8")).trim();
-    if (existing) return existing;
+    if (existing) return { token: existing, created: false };
   } catch (error) {
     if (error.code !== "ENOENT") throw error;
   }
   const token = randomBytes(32).toString("hex");
   await mkdir(stateDir, { recursive: true });
   await writeFile(file, `${token}\n`, { mode: 0o600 });
-  return token;
+  return { token, created: true };
 }
 
 /** POSIX 单引号转义：任意内容放进 sh 的单个参数都不会被解释。 */
@@ -77,7 +77,7 @@ export function buildWindowsInstallCommand({ nodePath = process.execPath, script
     "exit $LASTEXITCODE",
   ].filter(Boolean).join("\n");
   const encoded = Buffer.from(script, "utf16le").toString("base64");
-  const outer = `$ErrorActionPreference = 'Stop'\n$ProgressPreference = 'SilentlyContinue'\n$p = Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -Verb RunAs -ArgumentList @('-NoProfile', '-NonInteractive', '-EncodedCommand', '${encoded}') -Wait -PassThru\nexit $p.ExitCode`;
+  const outer = `$ErrorActionPreference = 'Stop'\n$ProgressPreference = 'SilentlyContinue'\n$p = Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -WindowStyle Hidden -Verb RunAs -ArgumentList @('-NoProfile', '-NonInteractive', '-EncodedCommand', '${encoded}') -Wait -PassThru\nexit $p.ExitCode`;
   return { file: "powershell.exe", args: ["-NoProfile", "-NonInteractive", "-EncodedCommand", Buffer.from(outer, "utf16le").toString("base64")], logFile: log };
 }
 
@@ -109,7 +109,7 @@ export async function installKernelHost({
   if (!stateDir) throw new Error("缺少状态目录，无法安装特权宿主。");
   if (!["darwin", "win32"].includes(platform)) throw new Error("当前平台需要手动安装特权宿主。");
   // 先以当前用户身份准备令牌：安装器是 root，令牌由 root 创建会让应用读不到。
-  await ensureUserToken(stateDir);
+  const credential = await ensureUserToken(stateDir);
   const logFile = path.join(stateDir, "host-install.log");
   if (platform === "win32") await rm(logFile, { force: true }).catch(() => {});
   const readLog = async () => {
@@ -132,7 +132,13 @@ export async function installKernelHost({
     const logged = await readLog();
     const captured = cleanInstallerOutput(`${error?.stderr ?? ""}${error?.stdout ?? ""}`);
     const output = logged || captured || String(error?.message ?? "");
-    if (/User canceled|cancelled|canceled|1223|操作已取消|用户取消|-128/i.test(output)) throw new Error("授权已取消，未安装特权宿主。");
+    if (/User canceled|cancelled|canceled|1223|操作已取消|用户取消|-128/i.test(output)) {
+      // UAC was declined before installation. Do not leave a new token that the
+      // next launch would mistake for an installed but temporarily offline host.
+      const file = path.join(stateDir, 'host-token');
+      if (credential.created && (await readFile(file, 'utf8')).trim() === credential.token) await rm(file);
+      throw new Error("授权已取消，未安装特权宿主。");
+    }
     const detail = output.split("\n").filter(Boolean).slice(-4).join(" ");
     const hint = logged ? `（安装日志：${logFile}）` : "";
     throw new Error(`安装特权宿主失败：${detail || "系统未返回原因"}${hint}`);

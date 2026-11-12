@@ -37,7 +37,7 @@ test('并发启停串行完成，已停止内核不会被健康检查重新启�
   let count = 0;
   let active = 0;
   let maximum = 0;
-  const core = createNetCore({ binary: '/test/kernel', homeDir: '/private/tmp', configPath: '/private/tmp/test.yaml', apiPort: 49123,
+  const core = createNetCore({ binary: '/test/kernel', homeDir: await mkdtemp(path.join(tmpdir(), 'checkcc-core-')), configPath: path.join(tmpdir(), 'test.yaml'), apiPort: 49123,
     portOwner: async () => null,
     spawn: () => {
       const child = new EventEmitter(); child.pid = ++count;
@@ -60,7 +60,7 @@ test('停止无法确认退出时保留 PID 并报告失败', async () => {
   const { EventEmitter } = require('node:events');
   const child = new EventEmitter(); child.pid = 12345;
   child.kill = () => false;
-  const core = createNetCore({ binary: '/test/kernel', homeDir: '/private/tmp', configPath: '/private/tmp/test.yaml', apiPort: 49124,
+  const core = createNetCore({ binary: '/test/kernel', homeDir: await mkdtemp(path.join(tmpdir(), 'checkcc-core-')), configPath: path.join(tmpdir(), 'test.yaml'), apiPort: 49124,
     portOwner: async () => null, spawn: () => child,
     fetchImpl: async () => ({ ok: true, status: 200, text: async () => JSON.stringify({ version: 'test' }) }),
   });

@@ -12,6 +12,7 @@ import { createKernelRuntime, loadNodes } from "./net-core/runtime.mjs";
 import { migrateStore } from "./net-core/sources.mjs";
 import { recordExit, readExitHistory } from "./net-core/exit-history.mjs";
 import { readHostConfig } from "./net-core/host.mjs";
+import { HOST_PROTOCOL, HOST_CAPABILITIES } from './net-core/host-protocol.mjs';
 import { buildHostInstallPlan } from "./net-core/service.mjs";
 import { stageHostBundle } from "./net-core/host-bundle.mjs";
 import { createNetCore } from "./net-core.mjs";
@@ -124,16 +125,20 @@ test("来源 DNS 独立持久化，旧顶层 DNS 只迁移到原 active", async 
   assert.deepEqual(migrated.sources[1].proxyServerDns, ["192.0.2.53"]);
 });
 
-async function fakeRuntime(t, takeover = { prepare: async () => {}, status: () => ({ phase: "idle", closed: [] }) }, { host = false, ipv6Supported = false, nodeExits = {}, nodeDelays = {}, claudeProxy = null, ipv6Fetch = async () => '2001:db8::1', stateDir } = {}) {
+async function fakeRuntime(t, takeover = { prepare: async () => {}, status: () => ({ phase: "idle", closed: [] }) }, { host = false, ipv6Supported = false, nodeExits = {}, nodeDelays = {}, claudeProxy = null, ipv6Fetch = async () => '2001:db8::1', stateDir, guard = null, platform = 'linux', failClosedAction = null, hostProbe = null, observeExitProbe = null, discoverTargets = async () => ({ programs: ['C:/Claude.exe'], packages: [] }) } = {}) {
   const dir = stateDir ?? await directory(t);
+  if (hostProbe) await writeFile(path.join(dir, 'host-token'), 'test-token');
   const apiPort = await pickPortBlock(2, { start: 40181 });
   let failNext = false;
   let failedReloads = 0;
   let tunnelActive = true;
   const hostActions = [];
+  const coreModes = [];
+  const guardSwitches = [];
   let capturedSecret;
   let starts = 0, maxStarts = 0;
   let healthBroken = false, scheduled = null, interfaceAddress = "192.0.2.10", launches = 0, reloads = 0, exitProbes = 0;
+  let statusFailures = 0;
   let ipv6Disabled = false;
   let failRestore = false;
   let failDisable = false;
@@ -144,10 +149,13 @@ async function fakeRuntime(t, takeover = { prepare: async () => {}, status: () =
   let ipv6ProbeStarts = 0;
   const runtime = await createKernelRuntime({
     stateDir: dir,
+    ...(platform ? { platform } : {}),
     takeover,
     claudeProxy,
-    exitFetch: async () => {
+    discoverTargets,
+    exitFetch: async (_url, options) => {
       exitProbes++;
+      await observeExitProbe?.(options);
       const country = Object.hasOwn(nodeExits, selectedNode) ? nodeExits[selectedNode] : 'SG';
       if (country === null) throw new Error('test exit timeout');
       if (country instanceof Error) throw country;
@@ -165,17 +173,27 @@ async function fakeRuntime(t, takeover = { prepare: async () => {}, status: () =
     ipv6Fetch,
     env: { CHECKCC_NET_CORE_BINARY: process.execPath, CHECKCC_NET_CORE_TUN: "0", CHECKCC_NET_CORE_DNS: "https://192.0.2.53/dns-query",
       CHECKCC_NET_CORE_API_PORT: String(apiPort), CHECKCC_NET_CORE_MIXED_PORT: String(apiPort + 1),
-      ...(host ? { CHECKCC_NET_CORE_HOST: "http://127.0.0.1:39091", CHECKCC_NET_CORE_HOST_TOKEN: "test-host-token" } : {}),
+      ...(host && !hostProbe ? { CHECKCC_NET_CORE_HOST: "http://127.0.0.1:39091", CHECKCC_NET_CORE_HOST_TOKEN: "test-host-token" } : {}),
     },
     fetchImpl: async (_url, options) => {
-      hostActions.push(JSON.parse(options.body));
-      return { ok: true, json: async () => ({ ok: true }) };
+      if (hostProbe && String(_url).endsWith('/health')) return hostProbe();
+      if (String(_url).endsWith('/health')) return { ok: true, json: async () => ({ ok: true, running: !healthBroken, hostProtocol: HOST_PROTOCOL, capabilities: HOST_CAPABILITIES, ...(guard ? { guard: { ...guard } } : {}) }) };
+      if (options.body) {
+        const action = JSON.parse(options.body);
+        hostActions.push(action);
+        if (action.action === 'claude-guard') {
+          await failClosedAction?.(action);
+          return { ok: true, json: async () => ({ ok: true, claudeGuard: { armed: action.op === 'arm', directProtected: action.op === 'arm' || action.keepDirect === true, count: action.op === 'arm' ? 2 : 0 } }) };
+        }
+      }
+      return { ok: true, json: async () => ({ ok: true, ...(options.body && JSON.parse(options.body).action === 'ipv6' ? { changed: true, previous: 'Off' } : {}), ...(guard ? { guard: { ...guard } } : {}) }) };
     },
-    interfaces: () => ({ test: [{ address: interfaceAddress, internal: false }] }),
+    interfaces: () => (interfaceAddress ? { test: [{ address: interfaceAddress, internal: false }] } : {}),
     healthScheduler: { every: callback => { scheduled = callback; return { unref() {} }; }, clear: () => { scheduled = null; } },
     createCore: options => {
       // 能力探测不访问真实节点，也不操作系统 IPv6。
       if (options.configPath.endsWith("probe.yaml")) return { start: async () => { ipv6ProbeStarts++; if (!ipv6Supported) throw new Error("test probe disabled"); }, stop: async () => {} };
+      coreModes.push(options.manageProcess);
       capturedSecret = options.secret;
       let running = false, config;
       // 守卫组选择与固定出口节点分开记：切 REJECT 不应该影响出口选择。
@@ -185,7 +203,7 @@ async function fakeRuntime(t, takeover = { prepare: async () => {}, status: () =
           starts++; maxStarts = Math.max(maxStarts, starts);
           try {
             await new Promise(resolve => setTimeout(resolve, 5));
-            if (failNext) { failNext = false; throw new Error("injected launch failure"); }
+            if (failNext) { const error = failNext; failNext = false; throw error instanceof Error ? error : new Error("injected launch failure"); }
             config = yaml(await readFile(options.configPath, "utf8"));
             selectedNode = config['proxy-groups'][0].proxies[0];
             guardSelection = 'CLAUDE-PIN';
@@ -195,9 +213,10 @@ async function fakeRuntime(t, takeover = { prepare: async () => {}, status: () =
           } finally { starts--; }
         },
         stop: async () => { running = false; },
-        state: () => ({ running }),
+        state: () => ({ running: running && !healthBroken }),
         status: async () => {
           if (!running || healthBroken) throw new Error("not running");
+          if (statusFailures > 0) { statusFailures--; throw new Error('controller timeout'); }
           return { version: "test", connections: [], proxies: { proxies: proxiesState() } };
         },
         request: async url => {
@@ -208,10 +227,10 @@ async function fakeRuntime(t, takeover = { prepare: async () => {}, status: () =
         },
         selectProxy: async (group, name) => {
           if (group === 'CLAUDE-GUARD' && failedGuardSelections > 0) { failedGuardSelections--; throw new Error('test guard unavailable'); }
-          if (group === 'CLAUDE-GUARD') { guardSelection = name; return true; }
+          if (group === 'CLAUDE-GUARD') { guardSwitches.push(name); guardSelection = name; return true; }
           config['proxy-groups'][0].proxies = [name]; selectedNode = name;
         },
-        tunnelStatus: async () => ({ active: tunnelActive }),
+        tunnelStatus: async () => { if (tunnelActive instanceof Error) throw tunnelActive; return { active: tunnelActive }; },
         reloadFromFile: async () => {
           reloads++;
           config = yaml(await readFile(options.configPath, "utf8"));
@@ -221,18 +240,103 @@ async function fakeRuntime(t, takeover = { prepare: async () => {}, status: () =
     },
   });
   t.after(() => runtime.stop());
-  return { runtime, dir, fail: () => { failNext = true; }, secret: () => capturedSecret, maximum: () => maxStarts,
-    failReload: (count = 1) => { failedReloads = count; }, hostActions,
+  return { runtime, dir, fail: (error = true) => { failNext = error; }, secret: () => capturedSecret, maximum: () => maxStarts,
+    failReload: (count = 1) => { failedReloads = count; }, hostActions, coreModes, guardSwitches,
     failGuard: () => { failedGuardSelections++; },
     setTunnelActive: value => { tunnelActive = value; },
     tick: async () => { await scheduled?.(); }, disconnect: () => { healthBroken = true; },
+    failStatus: (count = 1) => { statusFailures = count; },
     switchNetwork: () => { interfaceAddress = "192.0.2.11"; }, launches: () => launches,
+    offline: () => { interfaceAddress = null; }, online: () => { interfaceAddress = "192.0.2.12"; },
     ipv6Disabled: () => ipv6Disabled, setIpv6Supported: value => { ipv6Supported = value; },
     guard: () => guardSelection, exitProbes: () => exitProbes, reloads: () => reloads, ipv6ProbeStarts: () => ipv6ProbeStarts,
     failIpv6Restore: value => { failRestore = value; },
     failIpv6Disable: value => { failDisable = value; },
   };
 }
+
+test('Windows 目标识别失败不拆旧隧道；重试刷新客户端路径', async t => {
+  let mode = 'ok';
+  const f = await fakeRuntime(t, undefined, { host: true, platform: 'win32', discoverTargets: async () => {
+    if (mode === 'error') throw new Error('discovery timeout');
+    return { packages: [], programs: mode === 'empty' ? [] : [`C:/${mode}/Claude.exe`] };
+  } });
+  await f.runtime.importNodes([node('a')]);
+  await f.runtime.setTunnel(true);
+  for (mode of ['error']) {
+    f.hostActions.length = 0;
+    await assert.rejects(f.runtime.restart(), /discovery timeout|未找到 Claude/);
+    assert.equal(f.hostActions.some(action => action.action === 'stop'), false);
+  }
+  mode = 'updated';
+  f.hostActions.length = 0;
+  assert.equal(await f.runtime.restart(), true);
+  assert.ok(f.hostActions.some(action => action.op === 'arm' && action.programs.includes('C:/updated/Claude.exe')));
+});
+
+test('明确未安装桌面客户端可启动和重启浏览器保护，不误报桌面规则失败', async t => {
+  const f = await fakeRuntime(t, undefined, { host: true, platform: 'win32', discoverTargets: async () => ({ packages: [], programs: [] }) });
+  await f.runtime.importNodes([node('a')]);
+  await f.runtime.setTunnel(true);
+  assert.equal(await f.runtime.restart(), true);
+  assert.equal(f.hostActions.some(action => action.action === 'ipv6' && action.enabled === false), false, 'Windows 不应为 Claude 禁用整机 IPv6');
+  assert.ok(f.hostActions.some(action => action.op === 'arm' && action.domains.includes('claude.ai') && action.programs.length === 0));
+  const report = await f.runtime.report();
+  assert.equal(report.failClosed.hostGuard.scope, 'browser');
+  report.failClosed.hostGuard.directProtected = false;
+  report.failClosed.hostGuard.desired = 'protected';
+  const view = netCoreView(report);
+  assert.doesNotMatch(view.conclusion.detail, /内核缺位阻断未生效/);
+  assert.match(view.conclusion.detail, /当前保护浏览器/);
+  await f.runtime.stop();
+});
+
+test('Windows 重启先布防后停内核，失败期间保持阻断，成功只允许隧道', async t => {
+  let deny = false;
+  const f = await fakeRuntime(t, undefined, { host: true, platform: 'win32', failClosedAction: async action => {
+    if (deny && action.op === 'arm') throw new Error('firewall unavailable');
+  } });
+  await f.runtime.importNodes([node('a')]);
+  await f.runtime.setTunnel(true);
+  f.hostActions.length = 0;
+  deny = true;
+  await assert.rejects(f.runtime.restart(), /firewall unavailable/);
+  assert.equal(f.hostActions.some(action => action.action === 'stop'), false, '布防失败不能拆掉旧隧道');
+  deny = false;
+  f.hostActions.length = 0;
+  assert.equal(await f.runtime.restart(), true);
+  const armed = f.hostActions.findIndex(action => action.action === 'claude-guard' && action.op === 'arm');
+  const stopped = f.hostActions.findIndex(action => action.action === 'stop');
+  assert.ok(armed >= 0 && stopped > armed);
+  assert.ok(f.hostActions.filter(action => action.op === 'release').every(action => action.keepDirect === true));
+  f.hostActions.length = 0;
+  f.fail();
+  await assert.rejects(f.runtime.restart(), /launch failure/);
+  assert.equal(f.hostActions.some(action => action.op === 'release'), false);
+  assert.equal((await f.runtime.report()).failClosed.hostGuard.desired, 'armed');
+  await f.tick();
+  assert.equal((await f.runtime.report()).failClosed.hostGuard.directProtected, true, '重建失败后自动恢复，无需手动开始');
+  f.hostActions.length = 0;
+  await f.runtime.stop();
+  const finalStop = f.hostActions.findIndex(action => action.action === 'stop');
+  const release = f.hostActions.findIndex(action => action.op === 'release' && action.keepDirect === false);
+  assert.ok(finalStop >= 0 && release > finalStop, '明确停止在内核停止后才解除常驻规则');
+});
+
+test('Windows 内核意外退出且断网时保持系统阻断，网络恢复后才允许隧道', async t => {
+  const f = await fakeRuntime(t, undefined, { host: true, platform: 'win32' });
+  await f.runtime.importNodes([node('a')]);
+  await f.runtime.setTunnel(true);
+  assert.equal((await f.runtime.report()).failClosed.hostGuard.directProtected, true);
+  f.disconnect(); f.offline();
+  f.hostActions.length = 0;
+  await f.tick();
+  assert.ok(f.hostActions.some(action => action.op === 'arm'));
+  assert.equal(f.hostActions.some(action => action.op === 'release'), false);
+  f.online();
+  await f.tick();
+  assert.equal((await f.runtime.report()).failClosed.hostGuard.directProtected, true);
+});
 
 test('内核就绪后同步 Claude 代理，停止和启动失败时恢复配置', async t => {
   const calls = [];
@@ -667,41 +771,32 @@ test("网络异常默认只阻断 Claude；严格断流需显式开启并落盘"
   assert.equal((await f.runtime.report()).networkFailurePolicy, "claude");
 });
 
-test("未保护阻断保持系统接管并拒绝 Claude 域名", async t => {
-  const f = await fakeRuntime(t, undefined, { host: true });
+test("Windows 未保护阻断不启动 TUN、不重载普通代理", async t => {
+  const f = await fakeRuntime(t, undefined, { host: true, platform: 'win32' });
   await f.runtime.importNodes([node("a")]);
-  const before = await f.runtime.report();
-  assert.equal(before.tunEnabled, false);
-
+  const launches = f.launches();
   await f.runtime.setUnprotectedGuard(true);
   const blocked = await f.runtime.report();
   assert.equal(blocked.unprotectedGuard?.active, true);
-  assert.equal(blocked.claudeBlocked, true);
-  assert.equal(blocked.tunEnabled, true, "阻断必须建立在真实的系统接管上");
-  const config = yaml(await readFile(path.join(f.dir, "net-core/config.yaml"), "utf8"));
-  // Claude 阻断走运行时守卫组：零重载切换，其他流量完全不受影响。
+  assert.equal(blocked.tunEnabled, false);
   assert.equal(f.guard(), 'REJECT');
-  for (const domain of ["anthropic.com", "claude.ai", "claude.com", "claudeusercontent.com"]) {
-    assert.equal(config.rules.includes(`DOMAIN-SUFFIX,${domain},REJECT`), false, `${domain} 不得把阻断写进配置`);
-  }
-  await assert.rejects(f.runtime.setTunnel(false), /保护未开启/);
-
+  assert.equal(f.launches(), launches);
+  await f.runtime.setTunnel(false);
+  assert.equal((await f.runtime.report()).state, 'running');
   await f.runtime.setUnprotectedGuard(false);
-  const cleared = await f.runtime.report();
-  assert.equal(cleared.unprotectedGuard, null);
-  // 出口探测在测试环境不可达时可能已有区域锁；未保护阻断不得在解除后残留。
-  assert.equal(cleared.claudeBlocked, Boolean(before.regionLock?.locked));
-  assert.equal(cleared.tunEnabled, true, "解除阻断不主动关闭保护即将使用的 TUN");
+  assert.equal((await f.runtime.report()).unprotectedGuard, null);
 });
 
-test("未保护阻断失败时回滚接管且不声明 Claude 已被阻断", async t => {
-  const f = await fakeRuntime(t, undefined, { host: true });
+test("独立阻断失败不影响普通代理运行或切换节点", async t => {
+  const f = await fakeRuntime(t, undefined, { host: true, platform: 'win32', failClosedAction: async action => { if (action.op === 'arm') throw new Error('test firewall unavailable'); } });
   await f.runtime.importNodes([node("a")]);
-  f.setTunnelActive(false);
-  await assert.rejects(f.runtime.setUnprotectedGuard(true), /接管/);
+  await assert.rejects(f.runtime.setUnprotectedGuard(true), /firewall unavailable/);
+  await f.runtime.setTunnel(false);
+  await f.runtime.importNodes([node("b")]);
   const report = await f.runtime.report();
   assert.equal(report.unprotectedGuard, null);
-  assert.equal(report.tunEnabled, false, "建立失败不能留下半开的接管");
+  assert.equal(report.tunEnabled, false);
+  assert.equal(report.state, 'running');
 });
 
 test("节点配置启动失败恢复旧文件，不能返回导入成功", async t => {
@@ -734,7 +829,7 @@ test("网络抖动只阻断 Claude，不重建内核（重建会断掉全部流�
   assert.equal(f.launches(), launches, "放行同样不重建内核");
 });
 
-test("一秒网络波动恢复后后台下一轮自动放行，不等待旧的三十秒周期", async t => {
+test("网络波动恢复后两秒内自动复检放行，不等待旧的三十秒周期", async t => {
   const f = await fakeRuntime(t, undefined, { host: true });
   await f.runtime.importNodes([node("a")]);
   await f.runtime.setTunnel(true);
@@ -744,13 +839,13 @@ test("一秒网络波动恢复后后台下一轮自动放行，不等待旧的�
   await f.tick();
   assert.equal(f.guard(), 'REJECT');
   f.setTunnelActive(true);
-  t.mock.timers.tick(1000);
+  t.mock.timers.tick(2000);
   await f.tick();
   assert.equal(f.guard(), 'CLAUDE-PIN', '恢复后自动复检放行，无需手动解锁或重启');
   assert.equal(f.launches(), launches);
 });
 
-test("出口连续探测失败后仍每秒复检，恢复即自动放行", async t => {
+test("出口连续探测失败后前五分钟每两秒复检，恢复即自动放行", async t => {
   const exits = { a: 'SG' };
   const f = await fakeRuntime(t, undefined, { nodeExits: exits });
   await f.runtime.importNodes([node('a')]);
@@ -761,7 +856,7 @@ test("出口连续探测失败后仍每秒复检，恢复即自动放行", async
   for (let attempt = 0; attempt < 3; attempt++) {
     await f.tick();
     assert.equal(f.guard(), 'REJECT');
-    t.mock.timers.tick(1000);
+    t.mock.timers.tick(2000);
   }
   exits.a = 'SG';
   await f.tick();
@@ -800,7 +895,7 @@ test("守卫切换失败写入兜底 REJECT 后，恢复必须清除规则", asy
   assert.equal(f.guard(), 'CLAUDE-PIN');
 });
 
-test("断网超过五分钟后仍每秒检测，首轮成功即放行", async t => {
+test("断网超过五分钟后降低复检频率，首轮成功即放行", async t => {
   const exits = { a: 'SG' };
   const f = await fakeRuntime(t, undefined, { nodeExits: exits });
   await f.runtime.importNodes([node('a')]);
@@ -808,11 +903,14 @@ test("断网超过五分钟后仍每秒检测，首轮成功即放行", async t 
   exits.a = null;
   f.switchNetwork();
   await f.tick();
-  t.mock.timers.tick(6 * 60 * 1000);
-  await f.tick();
+  // 持续巡检，不能把时间跳跃误当成休眠唤醒并重置恢复窗口。
+  for (let second = 0; second < 300; second++) { t.mock.timers.tick(1000); await f.tick(); }
+  const probes = f.exitProbes();
   exits.a = 'SG';
   t.mock.timers.tick(1000);
   await f.tick();
+  assert.equal(f.exitProbes(), probes, '五分钟后不再维持高频探测');
+  for (let second = 0; second < 30; second++) { t.mock.timers.tick(1000); await f.tick(); }
   assert.equal(f.guard(), 'CLAUDE-PIN');
 });
 
@@ -939,4 +1037,382 @@ test("宿主安装使用独立运行包，来源文件替换不影响已安装�
   assert.ok(installed.hostScript.startsWith(destination + path.sep));
   assert.ok((await readFile(path.join(installed.root, "node_modules/yaml/package.json"), "utf8")).includes('"yaml"'));
   assert.ok(calls.some(([command]) => command.endsWith("chown")));
+});
+
+test("断网期间不重建内核，网络恢复后立即重建（不再反复启动失败）", async t => {
+  const f = await fakeRuntime(t);
+  await f.runtime.importNodes([node("a")]);
+  assert.equal(await f.runtime.start(), true);
+  const launches = f.launches();
+  // 网卡消失 + 内核进程挂掉：此刻重建必然失败，只应进入等待。
+  f.offline();
+  f.disconnect();
+  await f.tick();
+  assert.equal(f.launches(), launches, "断网期间不得重建内核");
+  const waiting = await f.runtime.report();
+  assert.equal(waiting.state, "offline", "断网要显示等待网络，而不是启动失败");
+  assert.match(waiting.reason, /网络已断开/);
+  assert.equal(waiting.network.offline, true);
+  assert.equal(waiting.network.links, 0);
+  // 网络恢复（接口变化）：立刻重建，不等退避窗口。
+  f.online();
+  await f.tick();
+  assert.equal(f.launches(), launches + 1, "网络恢复后应立即重建内核");
+  assert.notEqual((await f.runtime.report()).state, "offline");
+});
+
+test('断网启动失败后建立后台重试，联网后自动拉起', async t => {
+  const f = await fakeRuntime(t);
+  await f.runtime.importNodes([node('a')]);
+  await f.runtime.stop();
+  const launches = f.launches();
+  f.offline(); f.fail();
+  assert.equal(await f.runtime.start(), false);
+  await f.tick();
+  assert.equal(f.launches(), launches, '无网时只等待');
+  f.online(); await f.tick();
+  assert.equal(f.launches(), launches + 1, '恢复网络后无需手动启动');
+  assert.equal((await f.runtime.report()).state, 'running');
+});
+
+test('等待网络恢复时显式停止，联网和唤醒都不能重新拉起', async t => {
+  const f = await fakeRuntime(t);
+  await f.runtime.importNodes([node('a')]);
+  await f.runtime.stop();
+  f.offline(); f.fail();
+  assert.equal(await f.runtime.start(), false);
+  await f.runtime.stop();
+  const launches = f.launches();
+  f.online(); await f.tick();
+  assert.equal(f.launches(), launches);
+  assert.equal((await f.runtime.report()).state, 'idle');
+});
+
+test('单次控制接口超时保持内核运行，下一轮正常即清除错误', async t => {
+  const f = await fakeRuntime(t);
+  await f.runtime.importNodes([node('a')]);
+  const launches = f.launches();
+  f.failStatus(); await f.tick();
+  assert.equal(f.launches(), launches, '进程存活时不因单次超时重建');
+  await f.tick();
+  assert.equal((await f.runtime.report()).state, 'running');
+  assert.equal(f.launches(), launches);
+});
+
+test('隧道持续失败超过五分钟只阻断 Claude，不重建存活内核', async t => {
+  const f = await fakeRuntime(t);
+  await f.runtime.importNodes([node('a')]);
+  await f.runtime.setTunnel(true);
+  t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+  const launches = f.launches();
+  f.setTunnelActive(new Error('隧道解析探测超时。'));
+  for (let second = 0; second < 620; second++) { t.mock.timers.tick(1000); await f.tick(); }
+  assert.equal(f.launches(), launches);
+  assert.equal(f.guard(), 'REJECT');
+});
+
+test('进程存活时控制接口持续失败超过五分钟仍不重建', async t => {
+  const f = await fakeRuntime(t);
+  await f.runtime.importNodes([node('a')]);
+  t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+  const launches = f.launches();
+  f.failStatus(2);
+  for (let i = 0; i < 2; i++) { await f.tick(); t.mock.timers.tick(1000); }
+  assert.equal(f.launches(), launches);
+  await f.tick();
+  f.failStatus(Infinity);
+  for (let i = 0; i < 2; i++) { t.mock.timers.tick(1000); await f.tick(); }
+  assert.equal(f.launches(), launches, '成功探测应清除此前累计');
+  t.mock.timers.tick(1000); await f.tick();
+  assert.equal(f.launches(), launches, '三次控制接口失败也不能立即重建存活的内核');
+  for (let second = 0; second < 298; second++) { t.mock.timers.tick(1000); await f.tick(); }
+  assert.equal(f.launches(), launches, '控制接口无响应不能证明进程已退出');
+});
+
+test('宿主确认进程已退出后立即恢复，不等待控制接口五分钟窗口', async t => {
+  let running = true;
+  const f = await fakeRuntime(t, undefined, { host: true, hostProbe: async () => ({ ok: true, json: async () => ({ ok: true, running, hostProtocol: HOST_PROTOCOL, capabilities: HOST_CAPABILITIES }) }) });
+  await f.runtime.importNodes([node('a')]);
+  const launches = f.launches();
+  running = false;
+  f.failStatus(Infinity);
+  await f.tick();
+  assert.equal(f.launches(), launches + 1, '本地 ready 缓存不能掩盖宿主确认的退出');
+});
+
+test('宿主确认进程仍在时控制接口失联不能触发重建', async t => {
+  const f = await fakeRuntime(t, undefined, { host: true, hostProbe: async () => ({ ok: true, json: async () => ({ ok: true, running: true, hostProtocol: HOST_PROTOCOL, capabilities: HOST_CAPABILITIES }) }) });
+  await f.runtime.importNodes([node('a')]);
+  const launches = f.launches();
+  f.failStatus(Infinity);
+  await f.tick();
+  assert.equal(f.launches(), launches);
+});
+
+test('后台休眠恢复立即复检相同网卡的出口，健康内核不重启', async t => {
+  const f = await fakeRuntime(t);
+  await f.runtime.importNodes([node('a')]);
+  t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+  await f.tick();
+  const probes = f.exitProbes(), launches = f.launches();
+  t.mock.timers.tick(16000); await f.tick();
+  assert.ok(f.exitProbes() > probes, '唤醒立即作废旧证据，不等待三十秒周期');
+  assert.equal(f.launches(), launches);
+  assert.equal((await f.runtime.report()).state, 'running');
+});
+
+test('休眠超过抢修窗口后隧道未就绪，只阻断 Claude 并继续恢复', async t => {
+  const nodeExits = {};
+  const f = await fakeRuntime(t, undefined, { host: true, nodeExits });
+  await f.runtime.importNodes([node('a')]);
+  await f.runtime.setTunnel(true);
+  t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+  const launches = f.launches();
+  nodeExits.a = null;
+  f.setTunnelActive(false); await f.tick();
+  t.mock.timers.tick(10 * 60 * 1000); await f.tick();
+  assert.equal(f.launches(), launches, '休眠时间不能耗尽抢修窗口并触发全网重建');
+  assert.equal(f.guard(), 'REJECT');
+  nodeExits.a = 'SG';
+  f.setTunnelActive(true); t.mock.timers.tick(2000); await f.tick();
+  assert.equal(f.guard(), 'CLAUDE-PIN');
+  assert.equal((await f.runtime.report()).state, 'running');
+});
+
+test('休眠唤醒取消重建退避，即使网卡地址未变也马上重试', async t => {
+  const f = await fakeRuntime(t);
+  await f.runtime.importNodes([node('a')]);
+  t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+  const launches = f.launches();
+  f.disconnect(); f.fail(); await f.tick();
+  // 每秒巡检，重建在第 4、12 秒失败，下次原定第 28 秒。
+  for (let i = 0; i < 12; i++) { f.fail(); t.mock.timers.tick(1000); await f.tick(); }
+  assert.equal(f.launches(), launches);
+  t.mock.timers.tick(15001); await f.tick();
+  assert.equal(f.launches(), launches + 1, '后台唤醒不能继续等休眠前的退避');
+  assert.equal((await f.runtime.report()).state, 'running');
+});
+
+test('唤醒时网络晚于进程恢复，等到网卡上线再重建内核', async t => {
+  const f = await fakeRuntime(t);
+  await f.runtime.importNodes([node('a')]);
+  t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+  const launches = f.launches();
+  f.offline(); f.disconnect();
+  t.mock.timers.tick(60 * 60 * 1000); await f.tick();
+  assert.equal(f.launches(), launches, '唤醒不代表网络已经可用');
+  t.mock.timers.tick(1000); await f.tick();
+  assert.equal(f.launches(), launches);
+  f.online(); t.mock.timers.tick(1000); await f.tick();
+  assert.equal(f.launches(), launches + 1);
+  assert.equal((await f.runtime.report()).state, 'running');
+});
+
+test('网卡仍有 IPv4 的启动网络超时，也会自动重试', async t => {
+  const f = await fakeRuntime(t);
+  await f.runtime.importNodes([node('a')]);
+  await f.runtime.stop();
+  const launches = f.launches();
+  f.fail(new Error('内核就绪超时，请检查内核配置或端口占用。'));
+  assert.equal(await f.runtime.start(), false);
+  await f.tick();
+  assert.equal(f.launches(), launches + 1);
+  assert.equal((await f.runtime.report()).state, 'running');
+});
+
+test('权限失败不进入自动启动循环', async t => {
+  const f = await fakeRuntime(t);
+  await f.runtime.importNodes([node('a')]);
+  await f.runtime.stop();
+  const launches = f.launches();
+  f.fail(new Error('TUN 需要更高权限'));
+  assert.equal(await f.runtime.start(), false);
+  await f.tick();
+  assert.equal(f.launches(), launches);
+  assert.equal((await f.runtime.report()).state, 'error');
+});
+
+test('唤醒且内核丢失时，独立恢复工具解除严格模式的意愿优先于自动重建', async t => {
+  const saved = await fakeRuntime(t);
+  await saved.runtime.importNodes([node('a')]);
+  await saved.runtime.stop();
+  await writeFile(path.join(saved.dir, 'net-core-strict.json'), JSON.stringify({ enabled: true, baselineIp: '203.0.113.20' }));
+  const guard = { supported: true, armed: true, phase: 'active', checkedAt: new Date().toISOString() };
+  const f = await fakeRuntime(t, undefined, { stateDir: saved.dir, host: true, platform: 'darwin', guard });
+  const started = await f.runtime.start();
+  assert.equal(started, true, (await f.runtime.report()).reason);
+  await f.runtime.setNetworkFailurePolicy('all');
+  t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+  Object.assign(guard, { armed: false, phase: 'off' });
+  f.disconnect();
+  const before = f.hostActions.length;
+  t.mock.timers.tick(60000); await f.tick();
+  const actions = f.hostActions.slice(before);
+  assert.equal(actions[0]?.action, 'guard-status', '任何自动阻断或重建之前先读取显式解除');
+  assert.ok(!actions.some(action => action.action === 'start' && action.strict));
+  assert.equal((await f.runtime.report()).strictMode, false);
+});
+
+test("宿主探测超时不降级成本机模式（否则会自起第二个内核抢 39090/TUN）", async t => {
+  const dir = await mkdtemp(path.join(tmpdir(), "checkcc-host-probe-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  await writeFile(path.join(dir, "host-token"), "test-token\n");
+  let healthOk = true;
+  const runtime = await createKernelRuntime({
+    stateDir: dir,
+    env: { CHECKCC_NET_CORE: "0" },
+    fetchImpl: async url => {
+      if (!String(url).endsWith("/health")) throw new Error("unexpected request " + url);
+      if (!healthOk) throw Object.assign(new Error("The operation was aborted due to timeout"), { name: "TimeoutError" });
+      return { ok: true, json: async () => ({ ok: true, hostProtocol: HOST_PROTOCOL, capabilities: HOST_CAPABILITIES, guard: null }) };
+    },
+  });
+  t.after(() => runtime.stop().catch(() => {}));
+  assert.equal((await runtime.report()).hostMode, true, "宿主可用时应进入宿主模式");
+  healthOk = false;
+  await runtime.refreshHost();
+  const after = await runtime.report();
+  assert.equal(after.hostMode, true, "探测超时不得降级成本机模式");
+  assert.equal(after.hostProbeFailed, true, "界面应能看出是在等宿主");
+  healthOk = true;
+  await runtime.refreshHost();
+  assert.equal((await runtime.report()).hostProbeFailed, false, "宿主恢复后应清除提示");
+});
+
+test('真正启动时宿主探测超时，保持宿主模式且恢复后自动重试', async t => {
+  let healthy = true;
+  const f = await fakeRuntime(t, undefined, { hostProbe: () => {
+    if (!healthy) throw new Error('The operation was aborted due to timeout');
+    return { ok: true, json: async () => ({ hostProtocol: HOST_PROTOCOL, capabilities: HOST_CAPABILITIES }) };
+  } });
+  await f.runtime.importNodes([node('a')]);
+  await f.runtime.stop();
+  const launches = f.launches(), cores = f.coreModes.length;
+  healthy = false;
+  assert.equal(await f.runtime.start(), false, '宿主探测失败时等待，不尝试本机启动');
+  const waiting = await f.runtime.report();
+  assert.equal(waiting.hostMode, true);
+  assert.equal(waiting.hostProbeFailed, true);
+  assert.equal(f.coreModes.length, cores);
+  await f.tick();
+  assert.equal(f.launches(), launches);
+  healthy = true;
+  t.mock.timers.enable({ apis: ['Date'], now: Date.now() + 60000 });
+  await f.tick();
+  const recovered = await f.runtime.report();
+  assert.equal(recovered.hostMode, true);
+  assert.equal(recovered.hostProbeFailed, false);
+  assert.equal(recovered.state, 'running');
+  assert.equal(f.launches(), launches + 1);
+  assert.ok(f.coreModes.every(manageProcess => manageProcess === false));
+});
+
+test('后台重建遇到宿主 HTTP 失败也不降级，下一次探测成功清除提示', async t => {
+  let healthy = true;
+  const f = await fakeRuntime(t, undefined, { hostProbe: () => healthy
+    ? { ok: true, json: async () => ({ ok: true, running: false, hostProtocol: HOST_PROTOCOL, capabilities: HOST_CAPABILITIES }) }
+    : { ok: false, status: 503 },
+  });
+  await f.runtime.importNodes([node('a')]);
+  t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+  const launches = f.launches(), cores = f.coreModes.length;
+  healthy = false; f.disconnect(); await f.tick();
+  const waiting = await f.runtime.report();
+  assert.equal(waiting.hostMode, true);
+  assert.equal(waiting.hostProbeFailed, true);
+  assert.equal(f.coreModes.length, cores, '后台恢复不能新建本机内核');
+  healthy = true; t.mock.timers.tick(4000); await f.tick();
+  const recovered = await f.runtime.report();
+  assert.equal(recovered.state, 'running');
+  assert.equal(recovered.hostMode, true);
+  assert.equal(recovered.hostProbeFailed, false);
+  assert.equal(f.launches(), launches + 1);
+  assert.ok(f.coreModes.every(manageProcess => manageProcess === false));
+});
+
+test('应用冷启动时已安装的宿主超时，也只能等待，不能自起本机内核', async t => {
+  let healthy = true;
+  const hostProbe = () => {
+    if (!healthy) throw new Error('The operation was aborted due to timeout');
+    return { ok: true, json: async () => ({ hostProtocol: HOST_PROTOCOL, capabilities: HOST_CAPABILITIES }) };
+  };
+  const seed = await fakeRuntime(t, undefined, { hostProbe });
+  await seed.runtime.importNodes([node('a')]);
+  await seed.runtime.stop();
+  healthy = false;
+  const f = await fakeRuntime(t, undefined, { stateDir: seed.dir, hostProbe });
+  await assert.rejects(f.runtime.setTunnel(true, { ensureHost: true }), /宿主探测超时/);
+  assert.equal(await f.runtime.start(), false);
+  assert.equal((await f.runtime.report()).hostProbeFailed, true);
+  assert.equal(f.coreModes.length, 0);
+  healthy = true; await f.tick();
+  assert.equal((await f.runtime.report()).state, 'running');
+  assert.equal((await f.runtime.report()).hostProbeFailed, false);
+  assert.deepEqual(f.coreModes, [false]);
+});
+
+test('节点超时后的五分钟内按两秒起点复检，不把请求耗时叠加进间隔', async t => {
+  let sampling = false;
+  const starts = [];
+  const budgets = [];
+  const exits = { a: 'SG' };
+  const f = await fakeRuntime(t, undefined, { nodeExits: exits, observeExitProbe: options => {
+    if (!sampling) return;
+    starts.push(Date.now()); budgets.push(options.timeoutMs);
+    t.mock.timers.tick(700);
+  } });
+  await f.runtime.importNodes([node('a')]);
+  const launches = f.launches();
+  t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+  sampling = true; exits.a = null; f.switchNetwork(); await f.tick();
+  t.mock.timers.tick(1999); await f.tick();
+  assert.equal(starts.length, 1, '首次进入网络锁后等待两秒');
+  t.mock.timers.tick(1); await f.tick();
+  assert.equal(starts.length, 2);
+  assert.ok(budgets[1] < 2000, '恢复探测超时预算短于两秒，避免长请求堵住下一轮');
+  t.mock.timers.tick(1299); await f.tick();
+  assert.equal(starts.length, 2);
+  exits.a = 'SG'; t.mock.timers.tick(1); await f.tick();
+  assert.equal(starts[2] - starts[1], 2000, '两次请求起点间隔两秒，不额外累加700毫秒耗时');
+  assert.equal(f.guard(), 'CLAUDE-PIN');
+  assert.equal(f.launches(), launches);
+});
+
+test('隧道探测直接抛出超时也先进入恢复窗口，不立即重建健康内核', async t => {
+  const f = await fakeRuntime(t, undefined, { host: true });
+  await f.runtime.importNodes([node('a')]);
+  await f.runtime.setTunnel(true);
+  t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+  const launches = f.launches();
+  f.setTunnelActive(new Error('隧道解析探测超时。')); await f.tick();
+  assert.equal(f.launches(), launches, '超时抛异常不能绕过五分钟恢复窗口');
+  assert.equal(f.guard(), 'REJECT');
+  assert.equal((await f.runtime.report()).regionLock.type, 'network');
+  const switches = f.guardSwitches.length;
+  f.switchNetwork();
+  t.mock.timers.tick(2000); await f.tick();
+  assert.ok(!f.guardSwitches.slice(switches).includes('CLAUDE-PIN'), '切网后隧道仍超时，即使出口探测成功也不能短暂放行');
+  const beforeWake = f.guardSwitches.length;
+  t.mock.timers.tick(16000); await f.tick();
+  assert.ok(!f.guardSwitches.slice(beforeWake).includes('CLAUDE-PIN'), '唤醒后也必须重新确认隧道，不能先放行');
+  f.setTunnelActive(true); t.mock.timers.tick(2000); await f.tick();
+  assert.equal(f.guard(), 'CLAUDE-PIN');
+  assert.equal(f.launches(), launches);
+});
+
+test('健康巡检不读取连接明细，采样接口超时不能导致内核重建', async t => {
+  const dir = await directory(t);
+  const requests = [];
+  const core = createNetCore({ binary: process.execPath, homeDir: dir, configPath: path.join(dir, 'test.yaml'), manageProcess: false,
+    fetchImpl: async url => {
+      const route = new URL(url).pathname; requests.push(route);
+      if (route === '/connections') throw new Error('signal timed out');
+      return { ok: true, text: async () => JSON.stringify(route === '/version' ? { version: 'test' } : { proxies: {} }) };
+    },
+  });
+  await core.start(); t.after(() => core.stop());
+  requests.length = 0;
+  assert.equal((await core.status({ includeConnections: false })).running, true);
+  assert.deepEqual(requests.sort(), ['/proxies', '/version']);
+  await assert.rejects(core.status(), /signal timed out/, '完整状态仍如实报告连接证据缺失');
 });

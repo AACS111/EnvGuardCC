@@ -3,7 +3,7 @@ import { promisify } from 'node:util';
 import { realpath, access } from 'node:fs/promises';
 import { setTimeout as delay } from 'node:timers/promises';
 import { applyTimezoneWithService } from './timezone-service.mjs';
-import { readWindowsTimezone, windowsSystemExecutable } from './windows-timezone.mjs';
+import { readWindowsTimezone, sameWindowsTimezone, windowsSystemExecutable } from './windows-timezone.mjs';
 
 const exec = promisify(execFile);
 export const timezoneSupported = platform => ['win32', 'darwin'].includes(platform);
@@ -67,7 +67,8 @@ export async function setSystemTimezone(zone, { automaticTimezone = false, readA
     if (platform === 'darwin' ? sameTimezone(actual, zone) : actual === zone) break;
     if (platform === 'darwin') await delay(100);
   }
-  if (platform === 'darwin' ? !sameTimezone(actual, zone) : actual !== zone) throw new Error('系统时区复核未通过，可能被自动时区覆盖；原始备份已保留。');
+  const matches = platform === 'darwin' ? sameTimezone(actual, zone) : await sameWindowsTimezone(actual, zone, { run });
+  if (!matches) throw new Error(`系统时区复核未通过（期望 ${zone}，实际 ${actual}）；原始备份已保留。`);
   if (platform === 'darwin' && await readAutomatic({ run }) !== automaticTimezone) throw new Error('自动时区开关复核未通过，原始备份已保留。');
   return actual;
 }

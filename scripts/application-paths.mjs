@@ -3,6 +3,7 @@ import { promisify } from 'node:util';
 import { access } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import path from 'node:path';
+import { windowsClaudeTargets } from './windows-claude-targets.mjs';
 
 const exec = promisify(execFile);
 
@@ -53,8 +54,7 @@ export async function findDesktop({ platform = process.platform, env = process.e
     }
     throw new Error('未找到 Claude 桌面应用包。可通过 CHECKCC_DESKTOP_PATH 指定应用或可执行文件。');
   }
-  const result = await exec('pwsh.exe', ['-NoProfile', '-NonInteractive', '-Command', "$p = Get-AppxPackage -Name Claude | Select-Object -First 1; if ($p) { Join-Path $p.InstallLocation 'app/Claude.exe' }"], { windowsHide: true, timeout: 5000, maxBuffer: 4096 });
-  const candidate = result.stdout.trim();
+  const candidate = (await windowsClaudeTargets({ env, home })).programs[0];
   if (!candidate) throw new Error('未找到 Claude 桌面应用包。');
   await access(candidate);
   return candidate;

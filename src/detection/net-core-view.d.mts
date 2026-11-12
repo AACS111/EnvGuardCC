@@ -1,6 +1,6 @@
 // 网络内核视图模型的类型契约（实现见 net-core-view.mjs）。
 export type NetCoreTone = "ok" | "warn" | "danger" | "muted";
-export type NetCoreViewState = "unconfigured" | "error" | "idle" | "running" | "unavailable" | "off";
+export type NetCoreViewState = "unconfigured" | "error" | "idle" | "running" | "unavailable" | "off" | "offline";
 
 export type NetCoreViolation = { host: string; chains: string[]; count: number; note: string };
 

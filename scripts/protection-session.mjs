@@ -20,6 +20,7 @@ export class ProtectionSession {
     this.timer = null;
     this.testing = false;
     this.testController = null;
+    this.activationController = null;
     this.operationCount = 0;
     this.observedSamples = new Set();
     // 出口变化后的自动重适配：记住启动时的页面来源，并跟踪在途的 apply，避免与关闭/恢复交叉。
@@ -79,23 +80,53 @@ export class ProtectionSession {
     });
   }
   start(origin) {
-    return this.serialize(() => this.activate(origin));
+    const version = this.intentVersion;
+    return this.serialize(() => version === this.intentVersion ? this.activate(origin) : this.report());
+  }
+  restart(origin) {
+    const version = ++this.intentVersion;
+    this.activationController?.abort();
+    this.cancelTest();
+    clearInterval(this.timer); this.timer = null;
+    this.state.nextTestAt = null;
+    return this.serialize(async () => {
+      if (version !== this.intentVersion) return this.report();
+      if (this.pending || this.state.enabled || this.state.phase === 'restore_failed') await this.restorePending({ retry: true });
+      if (this.state.phase === 'restore_failed') throw new Error(this.state.issues.join('；'));
+      if (version !== this.intentVersion) return this.report();
+      return this.activate(origin);
+    });
   }
   async activate(origin) {
     if (this.state.enabled && this.state.phase !== 'restart_required') return this.report();
     if (this.pending && this.state.phase !== 'restart_required') throw new Error('尚有配置未恢复，请先关闭模拟保护以重试恢复。');
     if (origin) this.origin = origin;
+    const controller = new AbortController();
+    this.activationController = controller;
+    const { signal } = controller;
+    // Only read-only detection may be detached. System writes must finish before rollback/retry.
+    const detect = () => new Promise((resolve, reject) => {
+      const abort = () => reject(signal.reason);
+      signal.addEventListener('abort', abort, { once: true });
+      Promise.resolve().then(() => { signal.throwIfAborted(); return this.detect({ signal }); })
+        .then(resolve, reject).finally(() => signal.removeEventListener('abort', abort));
+    });
     this.state.phase = 'starting'; this.state.issues = [];
     try {
-      await this.beforeActivate();
-      const target = await this.detect();
+      await this.beforeActivate({ signal });
+      signal.throwIfAborted();
+      const target = await detect();
+      signal.throwIfAborted();
       if (!target?.ip || !target.language || !target.locale) throw new Error('无法识别当前出口 IP，未应用任何配置。');
       if (!this.pending) {
-        this.pending = { origin, baseline: await this.snapshot(), savedAt: new Date().toISOString() };
+        const baseline = await this.snapshot({ signal });
+        signal.throwIfAborted();
+        this.pending = { origin, baseline, savedAt: new Date().toISOString() };
         await this.persist();
       }
       this.state.target = target;
-      this.state.issues = await this.apply(target, origin);
+      this.state.issues = await this.apply(target, origin, { signal });
+      signal.throwIfAborted();
       await this.savePreference(true);
       this.state.enabled = true;
       this.state.runId = null; this.state.score = null; this.state.alarm = false; this.state.testError = null; this.state.testState = 'pending';
@@ -111,6 +142,8 @@ export class ProtectionSession {
         catch (cleanup) { this.state.phase = 'restore_failed'; this.state.issues.push(cleanup.message); }
       }
       throw error;
+    } finally {
+      if (this.activationController === controller) this.activationController = null;
     }
   }
   resume(origin, { background = false } = {}) {
@@ -280,9 +313,11 @@ export class ProtectionSession {
       return;
     }
     try {
-      const issues = await this.restore(this.pending.baseline, this.pending.origin, options);
+      const issues = await this.restore(this.pending.baseline, this.pending.origin, options).catch(error => [error.message]);
+      // 时区/浏览器恢复失败不应阻止网络恢复；保留备份供下一次重试。
+      try { await this.afterStop({ ...options, baseline: this.pending.baseline }); }
+      catch (error) { issues.push(error.message); }
       if (issues.length) throw new Error(issues.join('；'));
-      await this.afterStop(options);
       await rm(this.file, { force: true }); this.pending = null;
       this.state.phase = 'idle'; this.state.issues = []; this.state.alarm = false; this.state.score = null;
       this.event('模拟保护已关闭，本次改动已自动恢复');
@@ -293,6 +328,7 @@ export class ProtectionSession {
   }
   stop(options = {}) {
     this.intentVersion++;
+    this.activationController?.abort();
     this.cancelTest();
     if (!options.shutdown) this.desiredEnabled = false;
     clearInterval(this.timer); this.timer = null; this.state.nextTestAt = null;

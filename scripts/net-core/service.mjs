@@ -5,6 +5,7 @@
 // macOS  ：/Library/PrivilegedHelperTools + /Library/LaunchDaemons，复用现有特权助手模式。
 
 import path from "node:path";
+import { windowsSystemExecutable } from '../windows-timezone.mjs';
 
 export const HOST_LABEL = "com.envguardcc.kernelhost";
 export const HOST_TASK = "EnvGuardCC-KernelHost";
@@ -67,6 +68,11 @@ export function buildHostInstallPlan({ platform = process.platform, nodePath, ho
           note: "以 SYSTEM 身份、开机自动运行内核宿主。安装时需要管理员权限。",
           cmd: "schtasks.exe",
           args: ["/Create", "/TN", HOST_TASK, "/SC", "ONSTART", "/RU", "SYSTEM", "/RL", "HIGHEST", "/TR", quote(launch), "/F"],
+        },
+        {
+          note: '宿主长期运行，电池供电不停机，异常退出由系统重启。',
+          cmd: windowsSystemExecutable('WindowsPowerShell\\v1.0\\powershell.exe'),
+          args: ['-NoProfile', '-NonInteractive', '-Command', `$ErrorActionPreference = 'Stop'; $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -MultipleInstances IgnoreNew; Set-ScheduledTask -TaskName '${HOST_TASK}' -Settings $settings -ErrorAction Stop | Out-Null`],
         },
         { note: "安装后立即启动一次，无需重启系统。", cmd: "schtasks.exe", args: ["/Run", "/TN", HOST_TASK] },
       ],

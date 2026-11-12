@@ -1,11 +1,26 @@
-// 系统接管前退出当前用户已识别的代理 GUI；不按内核名字强杀或停用未知 VPN。
+// 系统接管前只检查冲突，不退出用户正在使用的代理，避免破坏现有网络。
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import net from "node:net";
 import path from "node:path";
 
 const execute = promisify(execFile);
-const run = async (file, args) => (await execute(file, args, { timeout: 5000, maxBuffer: 4 * 1024 * 1024, windowsHide: true })).stdout;
+// 本机进程数上千时，枚举一次就要数秒；5 秒上限会被瞬时尖峰打穿，
+// 进而把一次抖动判定成「内核启动失败」。放宽单条命令上限，靠整体截止时间兜底。
+const COMMAND_TIMEOUT_MS = 12000;
+const DEADLINE_MS = 30000;
+export function describeCommandFailure(file, error, timeoutMs = COMMAND_TIMEOUT_MS) {
+  // execFile 超时会 kill 子进程，只留下只有命令行的 "Command failed"，对用户没有任何信息量。
+  if (error?.killed || error?.signal) return new Error(`${path.basename(file)} 超过 ${timeoutMs / 1000} 秒未返回。`);
+  return error;
+}
+const run = async (file, args) => {
+  try {
+    return (await execute(file, args, { timeout: COMMAND_TIMEOUT_MS, maxBuffer: 4 * 1024 * 1024, windowsHide: true })).stdout;
+  } catch (error) {
+    throw describeCommandFailure(file, error);
+  }
+};
 const CLIENTS = [
   { label: "FlClash", mac: ["FlClash"], win: ["flclash.exe"] },
   { label: "Clash Verge", mac: ["Clash Verge", "Clash Verge Rev"], win: ["clash-verge.exe"] },
@@ -41,7 +56,8 @@ export function classifyTakeoverProcesses(rows, { platform, uid = process.getuid
       if (client) clients.set(match[1], { label: client.label, target: match[1], pid: row.pid });
     } else if (platform === "win32") {
       const client = CLIENTS.find(c => c.win.includes(base.toLowerCase()));
-      if (client) clients.set(row.pid, { label: client.label, target: row.pid, pid: row.pid });
+      // hasWindow 缺省为 true，兼容只提供 pid/executable 的调用方。
+      if (client) clients.set(row.pid, { label: client.label, target: row.pid, pid: row.pid, hasWindow: row.hasWindow !== false });
     }
   }
   return { clients: [...clients.values()], kernels };
@@ -50,9 +66,11 @@ export function classifyTakeoverProcesses(rows, { platform, uid = process.getuid
 async function processes(platform, exec) {
   if (platform === "win32") {
     // 只关闭当前交互会话的 GUI，不能借 SYSTEM 权限停其他用户的工具。
-    const output = await exec("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", "$ErrorActionPreference='Stop'; $s=(Get-Process -Id $PID).SessionId; @(Get-CimInstance Win32_Process | Where-Object {$_.SessionId -eq $s} | Select-Object ProcessId,ExecutablePath) | ConvertTo-Json -Compress"]);
+    // 用 Get-Process 而不是 WMI：不依赖 Winmgmt，还能顺带拿到「是否有主窗口」，
+    // 托盘运行（无窗口）的客户端无法被 CloseMainWindow 关掉，必须直接提示用户。
+    const output = await exec("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", "$ErrorActionPreference='Stop'; $s=(Get-Process -Id $PID).SessionId; @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.SessionId -eq $s } | ForEach-Object { $path = try { $_.Path } catch { $null }; if ($path) { [pscustomobject]@{ Id = $_.Id; Path = $path; Window = [bool]$_.MainWindowHandle } } }) | ConvertTo-Json -Compress"]);
     const data = JSON.parse(output || "[]");
-    return (Array.isArray(data) ? data : [data]).filter(Boolean).map(p => ({ pid: Number(p.ProcessId), executable: p.ExecutablePath }));
+    return (Array.isArray(data) ? data : [data]).filter(Boolean).map(p => ({ pid: Number(p.Id), executable: p.Path, hasWindow: p.Window !== false }));
   }
   return (await exec("/bin/ps", ["-axo", "pid=,uid=,comm="])).split(/\r?\n/).flatMap(line => {
     const match = line.trim().match(/^(\d+)\s+(\d+)\s+(.+)$/);
@@ -66,44 +84,33 @@ const freePort = port => new Promise(resolve => {
   server.listen({ host: "127.0.0.1", port, exclusive: true }, () => server.close(() => resolve(true)));
 });
 
-export function createNetworkTakeover({ platform = process.platform, uid = process.getuid?.(), ownBinary, exec = run, listProcesses = () => processes(platform, exec), canBind = freePort, pause = ms => new Promise(r => setTimeout(r, ms)), attempts = 20 } = {}) {
+export function createNetworkTakeover({ platform = process.platform, uid = process.getuid?.(), ownBinary, exec = run, listProcesses = () => processes(platform, exec), canBind = freePort, scanAttempts = 2 } = {}) {
   let status = { phase: "idle", closed: [], reason: null, checkedAt: null };
   const update = (phase, extra = {}) => { status = { ...status, phase, ...extra, checkedAt: new Date().toISOString() }; };
-  const scan = async () => classifyTakeoverProcesses(await listProcesses(), { platform, uid, ownBinary });
+  // 进程枚举是本环节最慢、最易抖动的一步（Windows 走 WMI）。单次失败先重试，
+  // 避免一次枚举卡顿就把整个接管硬判为失败。
+  async function scan() {
+    let error;
+    for (let attempt = 0; attempt < scanAttempts; attempt++) {
+      try { return classifyTakeoverProcesses(await listProcesses(), { platform, uid, ownBinary }); }
+      catch (failure) { error = failure; }
+    }
+    throw new Error(`无法枚举本机会话进程：${error?.message ?? "未知错误"}`);
+  }
   async function prepare({ ports = [], proxyPort } = {}) {
     update("checking", { closed: [], reason: null });
-    const deadline = Date.now() + 20000;
+    const deadline = Date.now() + DEADLINE_MS;
     const bounded = async action => {
-      if (Date.now() >= deadline) throw new Error("网络交接等待超过 20 秒，请手动退出其他 VPN 后重试。");
+      if (Date.now() >= deadline) throw new Error(`网络交接等待超过 ${DEADLINE_MS / 1000} 秒，请手动退出其他 VPN 后重试。`);
       const result = await action();
-      if (Date.now() >= deadline) throw new Error("网络交接等待超过 20 秒，请手动退出其他 VPN 后重试。");
+      if (Date.now() >= deadline) throw new Error(`网络交接等待超过 ${DEADLINE_MS / 1000} 秒，请手动退出其他 VPN 后重试。`);
       return result;
     };
     const command = (file, args) => bounded(() => exec(file, args));
     try {
       const initial = await bounded(scan);
-      if (initial.clients.length) update("quitting");
-      for (const client of initial.clients) {
-        if (platform === "darwin") {
-          await command("/usr/bin/osascript", ["-e", "on run argv\n if application (item 1 of argv) is running then\n tell application (item 1 of argv) to quit\n end if\nend run", client.target]);
-        } else {
-          const row = (await bounded(listProcesses)).find(p => p.pid === client.pid);
-          if (!row || !classifyTakeoverProcesses([row], { platform, uid, ownBinary }).clients.length) continue;
-          const expected = String(row.executable).replace(/'/g, "''");
-          await command("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", `$ErrorActionPreference='Stop'; $p=Get-Process -Id ${client.pid} -ErrorAction SilentlyContinue; if($p){if($p.Path -ne '${expected}'){throw '进程已变化，请重试。'}; $null=$p.CloseMainWindow()}`]);
-        }
-      }
-      update("waiting");
-      let remaining;
-      for (let i = 0; i < attempts; i++) {
-        remaining = await bounded(scan);
-        if (!remaining.clients.length && !remaining.kernels.some(k => k.client)) break;
-        if (i + 1 < attempts) await pause(250);
-      }
-      if (remaining.clients.length || remaining.kernels.some(k => k.client)) {
-        const names = [...new Set([...remaining.clients.map(c => c.label), ...remaining.kernels.filter(k => k.client).map(k => `${k.name}（PID ${k.pid}）`)])];
-        throw new Error(`其他代理仍未退出：${names.join("、")}。请关闭其后台服务或自动重启，再重试接管。`);
-      }
+      if (initial.clients.length) throw Object.assign(new Error(`其他代理正在运行：${initial.clients.map(client => client.label).join("、")}。已保留现有网络与本机代理；如需系统接管，请手动处理冲突后重试。`), { handoffHint: true });
+      if (initial.kernels.some(k => k.client)) throw new Error('其他代理的隧道内核仍在运行，请手动处理冲突后重试。');
       if (platform === "darwin") {
         const vpn = await command("/usr/sbin/scutil", ["--nc", "list"]);
         if (/\(Connected\)|\(Connecting\)/i.test(vpn)) throw new Error("系统仍有已连接或正在连接的 VPN，请先断开后重试接管。");
@@ -126,8 +133,10 @@ export function createNetworkTakeover({ platform = process.platform, uid = proce
       update("ready", { closed: [...new Set(initial.clients.map(c => c.label))] });
       return { ...status };
     } catch (error) {
-      update("blocked", { reason: `启动前网络交接失败：${error.message}` });
-      throw new Error(status.reason);
+      // 已经能给出具体操作提示的错误不再套「交接失败」前缀。
+      const reason = error?.handoffHint ? error.message : `启动前网络交接失败：${error.message}`;
+      update("blocked", { reason });
+      throw new Error(reason);
     }
   }
   return { prepare, status: () => ({ ...status, closed: [...status.closed] }) };
