@@ -4,6 +4,7 @@ import { fileURLToPath } from 'node:url';
 import { createProtocol } from './protocol.mjs';
 import { closeServer, startSite } from './site.mjs';
 import { createShutdown } from './lifecycle.mjs';
+import { startDesktopServices } from './start-services.mjs';
 import { createDesktopSettings } from '../scripts/desktop-settings.mjs';
 import { createClaudeReset } from '../scripts/claude-reset.mjs';
 import { createClaudeProxySettings } from '../scripts/claude-proxy-settings.mjs';
@@ -132,6 +133,9 @@ try {
   // 内核先于网关：页面通过网关诊断接口读取内核状态。未配置节点时保持“未启用”。
   kernel = await createKernelRuntime({
     stateDir: process.env.CHECKCC_STATE_DIR,
+    // Windows can block Claude independently of TUN. Start protection through
+    // its own verified transition, instead of opening and then closing old TUN.
+    ...(process.platform === 'win32' ? { initialTunnel: false } : {}),
     claudeProxy: createClaudeProxySettings({ stateDir: process.env.CHECKCC_STATE_DIR }),
     root,
     logger: (line) => console.error('[net-core]', line),
@@ -163,26 +167,22 @@ try {
 
 // 内核启动与「应用启动保护」放在窗口之后执行；出错只记录真实原因，页面会按时轮询到。
 async function startServices() {
+  await startDesktopServices({ kernel, autoStartProtection: settings.autoStartProtection,
+    stopping: () => stopping, logger: line => console.error(line), configureProtection: applyStartupProtection });
   if (stopping) return;
-  if (kernel.enabled) {
-    if (!await kernel.start()) console.error('[net-core] 内核未能启动，页面会显示未启用原因。');
-    else kernel.connectionLog?.start();
-    if (stopping) return;
-    kernel.startAutoRefresh?.();
-    kernel.startPublicDnsSync?.();
-  } else {
-    console.error('[net-core] 未启用：', kernel.reason);
-  }
+  powerTimer = setInterval(() => { void report().then(value => protocol.send({ type: 'power', enabled: Boolean(value.enabled || value.desiredEnabled) })).catch(() => {}); }, 2500);
+  powerTimer.unref();
+}
+
+async function applyStartupProtection(enabled) {
   // 每次启动都执行启动策略：已有会话要 resume 重新应用（退出时已恢复系统时区），不能只看状态。
   await report();
   if (stopping) return;
   const response = await fetch(helper.url + '/session?tokenOnly=1', { headers });
   const session = await response.json();
-  const configured = await fetch(helper.url + '/protection', { method: 'POST', headers: { ...headers, 'Content-Type': 'application/json', 'X-CheckCC-Token': session.token }, body: JSON.stringify({ action: 'startup', enabled: settings.autoStartProtection }), signal: AbortSignal.timeout(120000) });
+  const configured = await fetch(helper.url + '/protection', { method: 'POST', headers: { ...headers, 'Content-Type': 'application/json', 'X-CheckCC-Token': session.token }, body: JSON.stringify({ action: 'startup', enabled }), signal: AbortSignal.timeout(120000) });
   if (!configured.ok) throw new Error('无法应用启动保护设置：' + (await configured.json()).error);
   if (stopping) return;
-  powerTimer = setInterval(() => { void report().then(value => protocol.send({ type: 'power', enabled: Boolean(value.enabled || value.desiredEnabled) })).catch(() => {}); }, 2500);
-  powerTimer.unref();
 }
 process.once('SIGTERM', () => { void orphaned(); });
 process.once('SIGINT', () => { void orphaned(); });

@@ -10,14 +10,15 @@ const proxies = [
 ];
 const build = (overrides = {}) => buildKernelConfig({ proxies, selected: 'node-a', apiPort: 39090, mixedPort: 39080, egressMode: 'rule', ...overrides });
 
-test('地区 DNS 无响应时可并行使用 DoH，显式协议保持且解析遵循路由', () => {
+test('地区 DNS 不混入 anycast，全部固定到 Claude 出口', () => {
   const config = build({ publicDns: ['168.95.1.1', '168.95.192.1'] });
   const doh = ['https://1.1.1.1/dns-query', 'https://8.8.8.8/dns-query'];
-  assert.deepEqual(config.dns.nameserver, ['168.95.1.1', '168.95.192.1', ...doh]);
+  assert.deepEqual(config.dns.nameserver, ['168.95.1.1#CLAUDE-PIN', '168.95.192.1#CLAUDE-PIN']);
   assert.equal(config.dns['respect-rules'], true);
   const custom = build({ publicDns: ['https://dns.example/dns-query', 'udp://192.0.2.53'] });
-  assert.deepEqual(custom.dns.nameserver, ['https://dns.example/dns-query', 'udp://192.0.2.53', ...doh]);
-  assert.deepEqual(build({ publicDns: doh }).dns.nameserver, doh);
+  assert.deepEqual(custom.dns.nameserver, ['https://dns.example/dns-query#CLAUDE-PIN', 'udp://192.0.2.53#CLAUDE-PIN']);
+  assert.deepEqual(build({ publicDns: doh }).dns.nameserver, doh.map(server => `${server}#CLAUDE-PIN`));
+  assert.deepEqual(strictKernelConfig({ ...config, secret: 'a'.repeat(32) }).dns.nameserver, config.dns.nameserver);
 });
 
 test('支持 IPv6 的节点启用双栈 TUN、AAAA 和同一套 Claude 固定出口规则', () => {
@@ -125,4 +126,40 @@ test('区域锁定：Claude 域名在置顶代理规则之前被 REJECT，严格
   assert.equal(strict['proxy-groups'].some((group) => group.name === CLAUDE_GUARD_GROUP), false);
   assert.equal(strict.rules.at(-1), `MATCH,${DEFAULT_GROUP}`);
   assert.doesNotThrow(() => assertStrictKernelConfig(strict));
+});
+
+// 不存在的网卡代表公司 VPN / 有线网络离线；公网配置必须与未配置内网时一致。
+test('公司网卡离线：公司 DNS 仅限内网域名，公网直连与 Claude 保护保持独立', () => {
+  for (const egressMode of ['rule', 'direct', 'global']) {
+    for (const binding of [{ directInterface: 'Offline Corp Adapter' }, { dnsInterface: 'Offline Corp DNS' }]) {
+      const baseline = build({ egressMode });
+      const config = build({ egressMode, localNetwork: {
+        directDomains: ['corp.example'], dnsServers: ['192.0.2.53'], ...binding,
+      } });
+      assert.deepEqual(config.dns['nameserver-policy']['+.corp.example'], ['192.0.2.53#ENVGUARD-LOCAL-DNS']);
+      assert.equal(config.proxies.find(node => node.name === 'ENVGUARD-LOCAL-DNS')['interface-name'], binding.dnsInterface ?? binding.directInterface);
+      assert.deepEqual(config.dns['direct-nameserver'], baseline.dns['direct-nameserver']);
+      assert.ok(config.dns['direct-nameserver'].length > 0);
+      assert.ok(config.dns['direct-nameserver'].every(server => server.endsWith('#DIRECT') && !server.includes('192.0.2.53')));
+      assert.equal(config.dns['direct-nameserver-follow-policy'], true);
+      assert.equal(config.dns['nameserver-policy']['+.baidu.com'], undefined);
+      if (egressMode === 'rule') assert.ok(config.rules.includes('DOMAIN-SUFFIX,baidu.com,DIRECT'));
+      if (egressMode === 'direct') assert.equal(config.rules.at(-1), 'MATCH,DIRECT');
+      assert.deepEqual(config.dns.nameserver, baseline.dns.nameserver);
+      assert.deepEqual(config['proxy-groups'], baseline['proxy-groups']);
+      assert.ok(config.rules.includes('DOMAIN-SUFFIX,claude.ai,CLAUDE-GUARD'));
+      assert.equal(config.tun['strict-route'], true);
+      assertKernelConfig(config, { egressMode });
+    }
+  }
+});
+
+test('公网直连 DNS 允许显式覆盖，内网 DNS 策略仍独立保留', () => {
+  const directDns = ['udp://192.0.2.54:53#DIRECT'];
+  const config = build({
+    localNetwork: { directDomains: ['corp.example'], dnsServers: ['192.0.2.53'], directInterface: 'Offline Corp Adapter' },
+    dns: { 'direct-nameserver': directDns },
+  });
+  assert.deepEqual(config.dns['direct-nameserver'], directDns);
+  assert.deepEqual(config.dns['nameserver-policy']['+.corp.example'], ['192.0.2.53#ENVGUARD-LOCAL-DNS']);
 });

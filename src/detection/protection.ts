@@ -6,6 +6,8 @@ export type ProtectionReport = {
   enabled: boolean; target: ProtectionTarget | null; issues: string[];
   /** 当前系统时区（由本机助手读取），用于和 target.timezone 对照。 */
   systemTimezone?: string | null;
+  systemTimezoneError?: string | null;
+  systemTimezonePending?: boolean;
   desiredEnabled?: boolean;
   /** 保护关闭时的 Claude 阻断：active 表示已生效，error 表示未能建立及原因。 */
   unprotectedBlock?: { active: boolean; error: string | null };

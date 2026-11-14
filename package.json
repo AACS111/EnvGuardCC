@@ -1,7 +1,7 @@
 {
   "name": "envguardcc",
   "productName": "EnvGuardCC",
-  "version": "0.2.4",
+  "version": "0.2.5",
   "description": "Claude environment checker and account-risk analysis tool.",
   "license": "MIT",
   "homepage": "https://github.com/AACS111/EnvGuardCC",
@@ -40,7 +40,7 @@
     "test:firewall:live": "node scripts/run-firewall-live.mjs",
     "test:gateway": "node --test scripts/check-gateway.mjs scripts/check-gateway-model.cjs scripts/check-gateway-simulation.mjs scripts/check-simulation-runner.mjs scripts/check-gateway-proxy.mjs",
     "test:simulation": "node --test scripts/check-gateway-simulation.mjs",
-    "test:netcore": "node --test --test-timeout=120000 scripts/check-kernel-config.mjs scripts/check-claude-regions.mjs scripts/check-exit-quality.mjs scripts/check-subscription.mjs scripts/check-region-lock.mjs scripts/check-system-ipv6.mjs scripts/check-host-upgrade.mjs scripts/check-kernel-vendor.cjs scripts/check-kernel-lifecycle.cjs scripts/check-host-install.mjs scripts/check-net-core-sources.mjs scripts/check-net-core-store.mjs scripts/check-network-safety.mjs scripts/check-connection-log.mjs scripts/check-firewall.mjs scripts/check-claude-guard.mjs",
+    "test:netcore": "node --test --test-timeout=120000 scripts/check-kernel-config.mjs scripts/check-loopback-fetch.mjs scripts/check-log-limiter.mjs scripts/check-rotating-log.mjs scripts/check-claude-regions.mjs scripts/check-exit-quality.mjs scripts/check-subscription.mjs scripts/check-region-lock.mjs scripts/check-system-ipv6.mjs scripts/check-host-upgrade.mjs scripts/check-kernel-vendor.cjs scripts/check-kernel-lifecycle.cjs scripts/check-host-install.mjs scripts/check-net-core-sources.mjs scripts/check-net-core-store.mjs scripts/check-network-safety.mjs scripts/check-connection-log.mjs scripts/check-firewall.mjs scripts/check-claude-guard.mjs",
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
@@ -53,7 +53,7 @@
     "timezone:build": "node scripts/build-timezone-service.mjs",
     "test:timezone": "node --test scripts/check-timezone-service.mjs",
     "dev:tauri": "node scripts/dev-tauri.mjs",
-    "test:tauri": "node --test scripts/check-tauri.mjs",
+    "test:tauri": "node --test scripts/check-tauri.mjs scripts/check-desktop-startup.mjs",
     "test:desktop:smoke": "node scripts/smoke-desktop.mjs",
     "test:installer": "node scripts/test-installer-guard.mjs"
   },
@@ -76,5 +76,10 @@
     "eslint-config-next": "16.2.10",
     "tailwindcss": "^4",
     "typescript": "^5"
+  },
+  "pnpm": {
+    "overrides": {
+      "browserslist": "4.28.7"
+    }
   }
 }

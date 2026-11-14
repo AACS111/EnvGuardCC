@@ -7,8 +7,9 @@ import { mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { checkHostHealth, hostInstallDecision, HOST_CAPABILITIES, HOST_PROTOCOL } from "./net-core/host-protocol.mjs";
+import { checkHostHealth, hostInstallDecision, HOST_CAPABILITIES, HOST_PROTOCOL, HOST_BUILD_VERSION } from "./net-core/host-protocol.mjs";
 import { HOST_BUNDLE_FILES, stageHostBundle } from "./net-core/host-bundle.mjs";
+import { hostBuildVersion } from './net-core/host-version.mjs';
 import { createKernelRuntime } from "./net-core/runtime.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -25,22 +26,22 @@ async function startFakeHost(payload, status = 200) {
   return { port: server.address().port, close: () => new Promise((resolve) => server.close(resolve)) };
 }
 
-async function createRuntime(port, savedStateDir = null) {
+async function createRuntime(port, savedStateDir = null, hostInstaller = async () => { throw new Error('test-install-attempt'); }) {
   const stateDir = savedStateDir ?? await mkdtemp(path.join(tmpdir(), "checkcc-host-upgrade-"));
   await writeFile(path.join(stateDir, "host-token"), "token-token-token-token\n");
   const logs = [];
   const runtime = await createKernelRuntime({
     stateDir, platform: 'win32',
-    hostInstaller: async () => { throw new Error('test-install-attempt'); },
+    hostInstaller,
     root,
-    env: { CHECKCC_NET_CORE: "0", CHECKCC_NET_CORE_HOST_PORT: String(port) },
+    env: { CHECKCC_NET_CORE: "0", CHECKCC_NET_CORE_BINARY: process.execPath, CHECKCC_NET_CORE_HOST_PORT: String(port) },
     logger: (message) => logs.push(message),
   });
   return { runtime, stateDir, logs, cleanup: () => rm(stateDir, { recursive: true, force: true }) };
 }
 
 test('已授权宿主跨应用重启复用；重复或并发安装请求不再次提权', async () => {
-  const host = await startFakeHost({ ok: true, hostProtocol: HOST_PROTOCOL, capabilities: [...HOST_CAPABILITIES] });
+  const host = await startFakeHost({ ok: true, hostProtocol: HOST_PROTOCOL, hostBuildVersion: HOST_BUILD_VERSION, capabilities: [...HOST_CAPABILITIES] });
   const first = await createRuntime(host.port);
   try {
     for (const result of await Promise.all([first.runtime.installHost(), first.runtime.installHost()])) {
@@ -63,7 +64,7 @@ test('宿主明确拒绝凭据时允许进入修复，不误报暂时离线', as
 });
 
 test('凭据存在但宿主暂时离线，重复安装入口不弹 UAC', async () => {
-  const host = await startFakeHost({ ok: true, hostProtocol: HOST_PROTOCOL, capabilities: [...HOST_CAPABILITIES] });
+  const host = await startFakeHost({ ok: true, hostProtocol: HOST_PROTOCOL, hostBuildVersion: HOST_BUILD_VERSION, capabilities: [...HOST_CAPABILITIES] });
   const first = await createRuntime(host.port);
   await host.close();
   try {
@@ -80,11 +81,11 @@ test("健康检查：认不出版本字段的宿主一律算过旧", () => {
   assert.deepEqual(legacy.missing, HOST_CAPABILITIES);
 
   assert.equal(checkHostHealth({ hostProtocol: 1, capabilities: [...HOST_CAPABILITIES] }).ok, false);
-  const partial = checkHostHealth({ hostProtocol: HOST_PROTOCOL, capabilities: [] });
+  const partial = checkHostHealth({ hostProtocol: HOST_PROTOCOL, hostBuildVersion: HOST_BUILD_VERSION, capabilities: [] });
   assert.equal(partial.ok, false);
   assert.deepEqual(partial.missing, HOST_CAPABILITIES);
 
-  const current = checkHostHealth({ hostProtocol: HOST_PROTOCOL, capabilities: [...HOST_CAPABILITIES] });
+  const current = checkHostHealth({ hostProtocol: HOST_PROTOCOL, hostBuildVersion: HOST_BUILD_VERSION, capabilities: [...HOST_CAPABILITIES] });
   assert.equal(current.ok, true);
   assert.equal(current.required, HOST_PROTOCOL);
 });
@@ -97,6 +98,49 @@ test("授权决策：只在缺权限且没有可用宿主时弹一次系统授�
   assert.equal(hostInstallDecision({ ...base, platform: "linux" }).action, "none");
   assert.equal(hostInstallDecision({ ...base, disabled: true }).action, "none");
   assert.equal(hostInstallDecision({ ...base, failure: "上次装完仍不可用" }).action, "fail");
+});
+
+test('相同协议也必须校验代码版本，缺失或不同指纹不复用', async () => {
+  const payload = { ok: true, hostProtocol: HOST_PROTOCOL, capabilities: [...HOST_CAPABILITIES] };
+  assert.equal(checkHostHealth(payload).ok, false);
+  assert.equal(checkHostHealth({ ...payload, hostBuildVersion: 'old-build' }).ok, false);
+  assert.equal(checkHostHealth({ ...payload, hostBuildVersion: HOST_BUILD_VERSION }).ok, true);
+  assert.equal(checkHostHealth({ ...payload, hostBuildVersion: HOST_BUILD_VERSION, hostProtocol: HOST_PROTOCOL + 1 }).ok, false);
+  const host = await startFakeHost({ ...payload, hostBuildVersion: 'old-build' });
+  const f = await createRuntime(host.port);
+  try {
+    const report = await f.runtime.report();
+    assert.equal(report.hostMode, false);
+    assert.equal(report.hostStale.buildVersion, 'old-build');
+    assert.equal(report.hostStale.requiredBuildVersion, HOST_BUILD_VERSION);
+    await assert.rejects(f.runtime.installHost(), /test-install-attempt|未找到内核二进制/);
+  } finally { await f.cleanup(); await host.close(); }
+});
+
+test('授权更新后必须重新验证代码版本；更新成功后并发请求复用', async () => {
+  const payload = { ok: true, hostProtocol: HOST_PROTOCOL, hostBuildVersion: 'old', capabilities: [...HOST_CAPABILITIES] };
+  const host = await startFakeHost(payload);
+  let installs = 0;
+  const f = await createRuntime(host.port, null, async () => {
+    installs++;
+    payload.hostBuildVersion = HOST_BUILD_VERSION;
+    return { installed: true };
+  });
+  try {
+    assert.equal((await f.runtime.installHost()).hostMode, true);
+    const results = await Promise.all([f.runtime.installHost(), f.runtime.installHost()]);
+    assert.ok(results.every(result => result.reused));
+    assert.equal(installs, 1);
+  } finally { await f.cleanup(); await host.close(); }
+});
+
+test('安装器成功退出但旧宿主仍应答时不能报告安装成功', async () => {
+  const host = await startFakeHost({ ok: true, hostProtocol: HOST_PROTOCOL, hostBuildVersion: 'old', capabilities: [...HOST_CAPABILITIES] });
+  const f = await createRuntime(host.port, null, async () => ({ installed: true }));
+  try {
+    await assert.rejects(f.runtime.installHost(), /安装后版本或健康状态未通过验证/);
+    assert.equal((await f.runtime.report()).hostMode, false);
+  } finally { await f.cleanup(); await host.close(); }
 });
 
 test("旧宿主在线时按本机模式运行，并留下过旧标记", async () => {
@@ -117,7 +161,7 @@ test("旧宿主在线时按本机模式运行，并留下过旧标记", async ()
 });
 
 test("新宿主被正常识别，不带过旧标记", async () => {
-  const host = await startFakeHost({ ok: true, running: false, requiresAdmin: true, hostProtocol: HOST_PROTOCOL, capabilities: [...HOST_CAPABILITIES] });
+  const host = await startFakeHost({ ok: true, running: false, requiresAdmin: true, hostProtocol: HOST_PROTOCOL, hostBuildVersion: HOST_BUILD_VERSION, capabilities: [...HOST_CAPABILITIES] });
   const { runtime, cleanup } = await createRuntime(host.port);
   try {
     const report = await runtime.report();
@@ -151,7 +195,7 @@ test("Windows 宿主文件显式授权，目录继承权限单独设置", async 
   const executable = path.join(directory, "executable");
   await writeFile(executable, "fixture");
   const calls = [];
-  await stageHostBundle({
+  const staged = await stageHostBundle({
     nodePath: executable,
     hostScript: path.join(root, "scripts/net-core/host.mjs"),
     binary: executable,
@@ -159,6 +203,9 @@ test("Windows 宿主文件显式授权，目录继承权限单独设置", async 
     platform: "win32",
     run: async (command, args) => { calls.push({ command, args }); },
   });
+  assert.equal(await hostBuildVersion(staged.root), HOST_BUILD_VERSION, '复制后的运行包指纹必须一致');
+  await writeFile(path.join(staged.root, 'scripts/net-core/rotating-log.mjs'), '// changed implementation');
+  assert.notEqual(await hostBuildVersion(staged.root), HOST_BUILD_VERSION, '日志代码变化也必须触发版本差异');
   const grants = calls.filter(call => call.args.includes("/grant:r"));
   const recursive = grants.filter(call => call.args.includes("/T"));
   assert.equal(recursive.length, 2, "安装根目录与暂存运行包都要保护");

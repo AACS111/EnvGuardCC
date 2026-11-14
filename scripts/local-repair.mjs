@@ -14,6 +14,7 @@ import { findBrowser, findDesktop } from "./application-paths.mjs";
 import { proxyStatus } from "./gateway-proxy.mjs";
 import { DesktopLauncher } from "./desktop-launcher.mjs";
 import { HELPER_PROTOCOL, assertCurrentHelper, shutdownHelper } from "./helper-connection.mjs";
+import { createTimezoneStatusReader } from "./timezone-status.mjs";
 
 const port = 3001;
 const localOrigin = /^https?:\/\/(127\.0\.0\.1|localhost)(:\d+)?$/;
@@ -57,14 +58,17 @@ const environmentRuntime = new EnvironmentRuntime({ stateDir, browserPathProvide
 } });
 const browserCloak = new BrowserCloakController(environmentRuntime, { gatewayUrl: process.env.CHECKCC_GATEWAY_URL || "http://127.0.0.1:3010", acquire: () => { if (changing || protectionChanging || closing) return false; changing = true; return true; }, release: () => { changing = false; } });
 
-const currentZone = () => readSystemTimezone();
+let timezoneReader = readSystemTimezone;
+const currentZone = () => timezoneReader();
+const timezoneStatus = createTimezoneStatusReader(currentZone);
 const setZone = async zone => {
   if (process.platform === "darwin") {
     const current = await currentZone();
     if (sameTimezone(current, zone) && !await readAutomaticTimezone()) return current;
     if (!await readBackup()) await saveBackup(current);
   }
-  return setSystemTimezone(zone);
+  try { return await setSystemTimezone(zone); }
+  finally { timezoneStatus.invalidate(); }
 };
 async function capabilities() {
   const exists = async find => { try { await find(); return true; } catch { return false; } };
@@ -181,7 +185,7 @@ async function closeRuntime({ reusable = false, kernelWillStop = false } = {}) {
   return pending;
 }
 
-const server = http.createServer(async (req, res) => {
+async function handleRequest(req, res) {
   const send = (status, data) => { res.writeHead(status, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" }); res.end(JSON.stringify(data)); };
   const origin = req.headers.origin;
   if (req.headers.host !== `127.0.0.1:${server.address()?.port ?? port}` || req.socket.remoteAddress !== "127.0.0.1" || !localOrigin.test(origin)) return send(403, { error: "仅允许本机 EnvGuardCC 页面访问。" });
@@ -229,7 +233,7 @@ const server = http.createServer(async (req, res) => {
   if (req.url === "/protection") {
     if (req.method === "GET") {
       const report = protection.report();
-      if (timezoneSupported(process.platform)) report.systemTimezone = await currentZone();
+      if (timezoneSupported(process.platform)) Object.assign(report, changing || protectionChanging ? timezoneStatus.invalidate() : timezoneStatus());
       return send(200, report);
     }
     if (req.method !== "POST") return send(405, { error: "仅支持 GET/POST。" });
@@ -393,11 +397,23 @@ const server = http.createServer(async (req, res) => {
     console.error("[repair] Timezone operation failed:", error.message);
     return send(500, { error: error.message || "时区操作未完成，请核对系统设置；原始备份已保留。" });
   } finally { changing = false; }
+}
+// Node's HTTP server does not consume rejected promises from async listeners.
+// Keep an unexpected request failure local to that request, not the desktop process.
+const server = http.createServer((req, res) => {
+  void handleRequest(req, res).catch(error => {
+    console.error('[repair] Request failed:', req.method, req.url, error.message);
+    if (res.destroyed || res.writableEnded) return;
+    if (res.headersSent) { res.destroy(); return; }
+    res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+    res.end(JSON.stringify({ error: '本机助手请求失败：' + error.message }));
+  });
 });
 server.requestTimeout = 120000;
 server.headersTimeout = 10000;
 server.on("error", (error) => { if (error.code !== "EADDRINUSE") console.error(`[repair] ${error.code}: ${error.message}`); });
-export async function startRepairHelper(listenPort = port, { netCore = null } = {}) {
+export async function startRepairHelper(listenPort = port, { netCore = null, readTimezone = readSystemTimezone } = {}) {
+  timezoneReader = readTimezone;
   networkRuntime = netCore;
   try {
     // Never silently abandon an active routing configuration from an older version.

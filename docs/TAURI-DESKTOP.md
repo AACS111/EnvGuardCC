@@ -38,7 +38,7 @@ pnpm desktop:package
 pnpm desktop:installer
 ```
 
-打包先在隔离源目录导出 Next 页面并核验 CSS 与源码哈希，再构建 Tauri。完整前端只作为后台资源复制一次。后台携带官方 Node v22.23.2，下载文件必须匹配官方 SHASUMS256；保留 TypeScript、运行时源码和对应平台的 classic-level 原生依赖，支持内置模拟测试。
+打包先在隔离源目录导出 Next 页面并核验 CSS 与源码哈希，再构建 Tauri。完整前端只作为后台资源复制一次。后台携带官方 Node v22.23.2，版本与官方 SHASUMS256 校验值固定在 `scripts/node-runtime-manifest.json`；已缓存的压缩包每次仍须通过 SHA-256 校验，缓存存在时不再联网获取校验文件。更新 Node 版本时须从清单中的官方来源同步校验值。保留 TypeScript、运行时源码和对应平台的 classic-level 原生依赖，支持内置模拟测试。
 
 产物位于 `node_modules/.checkcc-dist`：Windows 为 `EnvGuardCC-Windows-x64.zip` 和 `EnvGuardCC-Setup-<版本>.exe`；macOS 为 `EnvGuardCC-macOS-arm64.zip` 和 `EnvGuardCC-<版本>-arm64.dmg`。
 

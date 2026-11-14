@@ -9,6 +9,8 @@ import { fileURLToPath } from "node:url";
 import { buildHostInstallPlan, describePlan, waitForMacHostUnload } from "./service.mjs";
 import { resolveKernelBinary } from "./runtime.mjs";
 import { stageHostBundle } from "./host-bundle.mjs";
+import { checkHostHealth } from './host-protocol.mjs';
+import { loopbackFetch } from './loopback-fetch.mjs';
 import { createFirewallGuard } from "./firewall.mjs";
 import { cleanupClaudeGuard, uninstallHost } from './cleanup-claude-guard.mjs';
 
@@ -124,8 +126,8 @@ async function main() {
     if (process.platform === "darwin") { await chmod(file.path, file.mode); await chown(file.path, 0, 0); }
     process.stdout.write(`[install] 已写入 ${file.path}\n`);
   }
-  // 计划任务会把宿主输出写到这里；每次安装前清空，失败时才能看到本次的崩溃原因。
-  if (process.platform === "win32" && plan.hostLog) await rm(plan.hostLog, { force: true }).catch(() => {});
+  // 启动诊断与滚动运行日志分离，升级不再清空运行历史。
+  if (process.platform === "win32" && plan.startupLog) await rm(plan.startupLog, { force: true }).catch(() => {});
   for (const step of plan.commands) {
     process.stdout.write(`[install] 执行 ${step.cmd} ${step.args.join(" ")}\n`);
     execFileSync(step.cmd, step.args, { stdio: "inherit", windowsHide: true });
@@ -133,9 +135,15 @@ async function main() {
   // 安装后立刻探测宿主：装成功但起不来，必须当场说清楚。
   for (let attempt = 0; attempt < 20; attempt += 1) {
     try {
-      const response = await fetch(`http://127.0.0.1:${hostPort}/health`, { headers: { "X-EnvGuardCC-Host-Token": token }, signal: AbortSignal.timeout(1000) });
+      const response = await loopbackFetch(`http://127.0.0.1:${hostPort}/health`, { headers: { "X-EnvGuardCC-Host-Token": token }, signal: AbortSignal.timeout(1000) });
       if (response.ok) {
-        process.stdout.write(`[install] 宿主已在线：${JSON.stringify(await response.json())}\n`);
+        const health = await response.json();
+        if (!checkHostHealth(health).ok) {
+          process.stdout.write('[install] 应答宿主版本不匹配，继续等待新宿主。\n');
+          await new Promise(resolve => setTimeout(resolve, 500));
+          continue;
+        }
+        process.stdout.write(`[install] 宿主版本已验证：${JSON.stringify(health)}\n`);
         process.stdout.write("[install] 完成。网络页会自动检测到宿主并以宿主模式运行。\n");
         return;
       }
@@ -172,7 +180,7 @@ async function diagnoseHostStartup({ installed, stateDir, token }) {
     await new Promise((resolve) => setTimeout(resolve, 400));
     if (child.exitCode !== null) break;
     try {
-      const response = await fetch(`http://127.0.0.1:${port}/health`, { headers: { "X-EnvGuardCC-Host-Token": token }, signal: AbortSignal.timeout(800) });
+      const response = await loopbackFetch(`http://127.0.0.1:${port}/health`, { headers: { "X-EnvGuardCC-Host-Token": token }, signal: AbortSignal.timeout(800) });
       if (response.ok) answered = await response.json();
     } catch { /* 还在启动 */ }
   }
@@ -288,6 +296,7 @@ async function win32TaskDiagnostics(plan, hostPort, installed, stateDir, token) 
   lines.push(`[install] ${owner}`);
   lines.push("[install] 宿主启动日志（最后 15 行）：");
   lines.push(await readHostLog(plan?.hostLog));
+  if (plan?.startupLog) lines.push(await readHostLog(plan.startupLog));
   // 直接跑一遍运行包：能起来 ⇒ 问题在计划任务/安全软件；起不来 ⇒ 包或环境本身的问题。
   const probe = installed ? await diagnoseHostStartup({ installed, stateDir, token }).catch(() => null) : null;
   if (probe?.answered) {

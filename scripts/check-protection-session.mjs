@@ -671,11 +671,15 @@ test('关闭保护时建立未保护阻断，开启保护先解除阻断', async
   const stateDir = await mkdtemp(path.join(os.tmpdir(), 'checkcc-unprotected-block-'));
   t.after(() => rm(stateDir, { recursive: true, force: true }));
   const calls = [];
+  const guardOptions = [];
   const kernel = {
     report: async () => ({ state: 'running', tunEnabled: true, tunCaptured: true }),
     verifyConnection: async () => ({ state: 'running', tunEnabled: true, tunCaptured: true }),
     setTunnel: async value => { calls.push(`tunnel:${value}`); },
-    setUnprotectedGuard: async value => { calls.push(`guard:${value}`); },
+    setUnprotectedGuard: async (value, options) => {
+      calls.push(`guard:${value}`);
+      guardOptions.push(options);
+    },
     connectionState: () => ({ strictEnabled: false }),
     probeSelectedExit: async () => ({ ip: '203.0.113.9', countryCode: 'KR', timezone: 'Asia/Seoul' }),
   };
@@ -694,6 +698,7 @@ test('关闭保护时建立未保护阻断，开启保护先解除阻断', async
   service.detect = async () => ({ ip: '203.0.113.9', language: 'ko', locale: 'ko-KR' });
   await service.start('http://localhost:3000');
   assert.deepEqual(calls.slice(0, 2), ['guard:false', 'tunnel:true']);
+  assert.deepEqual(guardOptions[0], { deferRelease: true }, '开启保护时系统阻断必须交给隧道验证后解除');
 
   calls.length = 0;
   const stopped = await service.stop();

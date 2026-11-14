@@ -21,7 +21,16 @@ for (const name of ['src', 'public', 'package.json', 'tsconfig.json', 'next-env.
 }
 await mkdir(path.join(buildRoot, 'scripts/net-core'), { recursive: true });
 await cp(path.join(root, 'scripts/net-core/public-dns.mjs'), path.join(buildRoot, 'scripts/net-core/public-dns.mjs'));
-await symlink(path.join(root, 'node_modules'), link, 'junction');
+let linkedDependencies = false;
+try {
+  await symlink(path.join(root, 'node_modules'), link, 'junction');
+  linkedDependencies = true;
+} catch (error) {
+  if (error.code !== 'EPERM' && error.code !== 'EACCES') throw error;
+  // The isolated source is a direct child of root, so Node/webpack can also
+  // resolve the existing dependencies from its parent without a junction.
+  console.warn('Temporary dependency link unavailable; using parent project dependencies.');
+}
 const run = (args, env, cwd = root) => new Promise((resolve, reject) => {
   const child = spawn(process.execPath, args, { cwd, env, windowsHide: true, stdio: 'inherit' });
   child.once('error', reject); child.once('exit', code => code === 0 ? resolve() : reject(new Error(`Build failed: ${code}`)));
@@ -43,6 +52,6 @@ for (const file of ['src/app/globals.css', 'src/components/detector/workspace.cs
 await writeFile(path.join(exportRoot, 'checkcc-build.json'), JSON.stringify({ builtAt: new Date().toISOString(), sources }, null, 2));
 await run([path.join(root, 'scripts/build-desktop.mjs')], { ...process.env, CHECKCC_EXPORT_DIR: exportRoot });
 } finally {
-  await unlink(link);
+  if (linkedDependencies) await unlink(link);
   await rm(buildRoot, { recursive: true, force: true });
 }
