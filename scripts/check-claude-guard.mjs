@@ -13,6 +13,7 @@ import {
 } from "../scripts/net-core/claude-guard.mjs";
 
 const token = "testtoken01";
+const ruleCount = script => (script.match(/New-NetFirewallRule -PolicyStore/g) ?? []).length;
 
 test('常驻桌面规则覆盖全部端口和 IPv6，IPv4 仅放行 loopback 与配置的 fake-IP', () => {
   const specs = claudeDirectSpecs({ token, programs: ['C:/Claude.exe'], packages: ['Claude_family'] });
@@ -39,10 +40,18 @@ test('允许隧道后仍保留常驻规则，宿主重启恢复规则，明确�
   const groups = new Map();
   const exec = async (_file, args) => {
     const script = args.at(-1);
-    const group = script.match(/-Group '([^']+)'/)[1];
-    if (script.includes('New-NetFirewallRule')) groups.set(group, (script.match(/New-NetFirewallRule -PolicyStore/g) ?? []).length);
-    else if (script.includes('Remove-NetFirewallRule')) groups.delete(group);
-    return { stdout: JSON.stringify({ count: groups.get(group) ?? 0 }) };
+    for (const match of script.matchAll(/New-NetFirewallRule[^\n]+?-Group '([^']+)'/g)) {
+      if (!groups.has(match[1])) groups.set(match[1], 0);
+    }
+    for (const group of groups.keys()) {
+      const created = [...script.matchAll(/New-NetFirewallRule[^\n]+?-Group '([^']+)'/g)].filter(match => match[1] === group).length;
+      if (created) groups.set(group, created);
+    }
+    const removed = script.match(/Remove-NetFirewallRule -Group '([^']+)'/);
+    if (removed) groups.delete(removed[1]);
+    const query = script.match(/Get-NetFirewallRule -Group ([^\n]+?) -(?:PolicyStore|ErrorAction)/)?.[1] ?? '';
+    const queried = [...query.matchAll(/'([^']+)'/g)].map(match => match[1]);
+    return { stdout: JSON.stringify({ count: queried.reduce((count, group) => count + (groups.get(group) ?? 0), 0) }) };
   };
   const options = { platform: 'win32', stateDir, hostsPath: null, exec };
   const guard = createClaudeGuard(options);
@@ -64,6 +73,70 @@ test('允许隧道后仍保留常驻规则，宿主重启恢复规则，明确�
 test('目标合并保留默认域名，不能把 hosts 防护字段丢掉', async () => {
   const merged = await mergeClaudeGuardTargets({ packages: [], programs: [], domains: CLAUDE_GUARD_DOMAINS });
   assert.deepEqual(merged.domains, CLAUDE_GUARD_DOMAINS);
+});
+
+test('常驻与临时规则一次布防，逐条回读；任一条缺失仍拒绝成功', async () => {
+  const calls = [];
+  let missing = 0;
+  const guard = createClaudeGuard({ platform: 'win32', hostsPath: null, exec: async (_file, args) => {
+    const script = args.at(-1);
+    calls.push(script);
+    return { stdout: JSON.stringify({ count: ruleCount(script) - missing }) };
+  } });
+  const result = await guard.arm({ token, programs: ['C:/Claude.exe'], packages: ['Claude_family'] });
+  assert.equal(calls.length, 1, '两组规则共享一次 PowerShell 执行');
+  assert.equal(result.count, 4);
+  assert.equal(result.directProtected, true);
+  assert.equal(ruleCount(calls[0]), 6);
+  assert.equal((calls[0].match(/if \(Test-GuardRule /g) ?? []).length, 6);
+  assert.match(calls[0], /-Group 'EnvGuardCC-Claude-Guard-testtoken01-Direct','EnvGuardCC-Claude-Guard-testtoken01'/);
+  missing = 1;
+  await assert.rejects(guard.arm({ token, programs: ['C:/Claude.exe'], packages: ['Claude_family'] }), /未全部生效/);
+  assert.equal(guard.snapshot().armed, null);
+});
+
+test('撤防复核常驻规则，正确时不重写；被删后先修复，修复失败不撤全阻断', async () => {
+  const calls = [];
+  let missing = false, repairFails = false;
+  const guard = createClaudeGuard({ platform: 'win32', hostsPath: null, exec: async (_file, args) => {
+    const script = args.at(-1); calls.push(script);
+    if (script.includes('New-NetFirewallRule')) return { stdout: JSON.stringify({ count: repairFails ? 0 : ruleCount(script) }) };
+    if (script.includes('Remove-NetFirewallRule')) return { stdout: '{"count":0}' };
+    return { stdout: JSON.stringify({ count: missing ? 0 : 1 }) };
+  } });
+  await guard.arm({ token, programs: ['C:/Claude.exe'] });
+  calls.length = 0;
+  await guard.release({ keepDirect: true });
+  assert.equal(calls.some(script => script.includes('New-NetFirewallRule')), false);
+  assert.equal(guard.snapshot().directProtected, true);
+  missing = true; calls.length = 0;
+  await guard.release({ keepDirect: true });
+  const repaired = calls.findIndex(script => script.includes('New-NetFirewallRule'));
+  assert.ok(repaired >= 0);
+  assert.ok(calls.findIndex(script => script.includes('Remove-NetFirewallRule')) > repaired);
+  repairFails = true; calls.length = 0;
+  await assert.rejects(guard.release({ keepDirect: true }), /拒绝放行/);
+  assert.equal(calls.some(script => script.includes('Remove-NetFirewallRule')), false);
+});
+
+test('安装多个客户端版本时按原分组执行，避免合并超过 Windows 命令行长度', async () => {
+  const calls = [];
+  const guard = createClaudeGuard({ platform: 'win32', hostsPath: null, exec: async (_file, args) => {
+    const script = args.at(-1); calls.push(script);
+    return { stdout: JSON.stringify({ count: ruleCount(script) }) };
+  } });
+  const programs = Array.from({ length: 8 }, (_,i) => `C:/Applications/Claude-${i}/Claude.exe`);
+  assert.equal((await guard.arm({ token, programs })).count, 16);
+  assert.equal(calls.length, 2);
+  assert.ok(calls.every(script => script.length < 32767));
+});
+
+test('Windows 原生解析器接受合并规则脚本，不执行防火墙操作', { skip: process.platform !== 'win32' }, () => {
+  const selectors = { token, programs: ["C:/Claude's App/Claude.exe"], packages: ['Claude_family'] };
+  const source = claudeGuardArmScript([...claudeDirectSpecs(selectors), ...claudeGuardSpecs(selectors)]);
+  const encoded = Buffer.from(source).toString('base64');
+  const parse = `$tokens = $null; $errors = $null; [void][System.Management.Automation.Language.Parser]::ParseInput([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${encoded}')), [ref]$tokens, [ref]$errors); if ($errors.Count) { throw ($errors | Out-String) }; 'parsed'`;
+  assert.equal(execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', parse], { windowsHide: true, timeout: 20000, encoding: 'utf8' }).trim(), 'parsed');
 });
 
 test('防火墙回读缺失 count 时拒绝把未知当作零条规则', async () => {
@@ -135,7 +208,7 @@ test("arm 以回读数量为准：规则数不足时报错，不能当作已布�
   const exec = async (_file, args) => {
     const script = args.at(-1);
     if (script.includes("New-NetFirewallRule")) {
-      return { stdout: JSON.stringify({ count: mode === "partial" ? 1 : 2 }) };
+      return { stdout: JSON.stringify({ count: mode === "partial" ? 1 : ruleCount(script) }) };
     }
     return { stdout: JSON.stringify({ count: 0 }) };
   };
@@ -151,7 +224,7 @@ test("release 回读仍有残留时必须报错", async () => {
   const stateDir = await mkdtemp(path.join(tmpdir(), "checkcc-claude-guard-"));
   const exec = async (_file, args) => {
     const script = args.at(-1);
-    if (script.includes("New-NetFirewallRule")) return { stdout: JSON.stringify({ count: 2 }) };
+    if (script.includes("New-NetFirewallRule")) return { stdout: JSON.stringify({ count: ruleCount(script) }) };
     if (script.includes("Remove-NetFirewallRule")) return { stdout: JSON.stringify({ count: 2 }) };
     return { stdout: JSON.stringify({ count: 2 }) };
   };
@@ -165,7 +238,7 @@ test("宿主重启后按落盘的 desired 收敛：期望布防但规则丢了�
   let present = 0;
   const exec = async (_file, args) => {
     const script = args.at(-1);
-    if (script.includes("New-NetFirewallRule")) { present = 2; return { stdout: JSON.stringify({ count: present }) }; }
+    if (script.includes("New-NetFirewallRule")) { present = 2; return { stdout: JSON.stringify({ count: ruleCount(script) }) }; }
     if (script.includes("Remove-NetFirewallRule")) { present = 0; return { stdout: JSON.stringify({ count: 0 }) }; }
     return { stdout: JSON.stringify({ count: present }) };
   };
@@ -290,7 +363,7 @@ test("布防同时写防火墙规则与 hosts；撤防两者都清干净", async
   let present = 0;
   const exec = async (_file, args) => {
     const script = args.at(-1);
-    if (script.includes("New-NetFirewallRule")) { present = 4; return { stdout: JSON.stringify({ count: present }) }; }
+    if (script.includes("New-NetFirewallRule")) { present = ruleCount(script); return { stdout: JSON.stringify({ count: present }) }; }
     if (script.includes("Remove-NetFirewallRule")) { present = 0; return { stdout: JSON.stringify({ count: 0 }) }; }
     return { stdout: JSON.stringify({ count: present }) };
   };

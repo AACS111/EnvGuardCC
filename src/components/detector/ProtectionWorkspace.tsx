@@ -158,9 +158,9 @@ export function ProtectionWorkspace(props: Props) {
   const hostingWarning = props.target?.hosting
     ? text(`当前出口是云机房/托管 IP（${describeExit(props.target)}），Claude 可能拒绝登录；建议切换到住宅/原生 IP 节点。`, `The exit is a cloud/hosting IP (${describeExit(props.target)}); Claude may refuse login. Prefer a residential/native-IP node.`)
     : '';
-  const targetTimezone = props.target?.timezone ?? report?.target?.timezone ?? null;
+  const targetTimezone = report?.target?.timezone ?? props.target?.timezone ?? null;
   const systemTimezone = report?.systemTimezone ?? null;
-  const timezoneMismatch = Boolean(systemTimezone && targetTimezone && systemTimezone !== targetTimezone && systemTimezone !== windowsTimezoneFor(targetTimezone));
+  const timezoneMismatch = Boolean(protectionEnabled && !starting && !stopping && !report?.systemTimezonePending && systemTimezone && targetTimezone && systemTimezone !== targetTimezone && systemTimezone !== windowsTimezoneFor(targetTimezone));
   const timezoneNotice = timezoneMismatch
     ? { id: 'system-timezone', message: text(`系统时区是 ${systemTimezone}，目标是 ${targetTimezone}；系统时区与出口地区不匹配，请重新应用修复。`, `System timezone is ${systemTimezone}, target is ${targetTimezone}. The system timezone does not match the exit region. Reapply protection to fix it.`), tone: 'error' as const, action: props.onRepair ? { label: text('重新应用并修复', 'Reapply and fix'), onClick: () => props.onRepair?.() } : undefined }
     : null;
@@ -171,6 +171,7 @@ export function ProtectionWorkspace(props: Props) {
     unprotectedBlockError ? { id: 'unprotected-block-error', message: text('未能阻断 Claude：', 'Claude was not blocked: ') + unprotectedBlockError, tone: 'error' as const } : null,
     unprotectedBlocked ? { id: 'unprotected-block', message: text('环境防护未开启，Claude 已被阻断；开启环境防护后才能继续使用 Claude。', 'Environment protection is off, so Claude is blocked. Enable environment protection to use Claude again.'), tone: 'error' as const } : null,
     timezoneNotice,
+    report?.systemTimezoneError && !starting && !stopping ? { id: 'timezone-unavailable', message: text('暂时无法读取系统时区，后台将自动重试；时区一致性尚未确认。', 'System timezone is temporarily unavailable and will be retried; timezone alignment is unverified.'), tone: 'warning' as const } : null,
     !connected ? { id: 'disconnected', message: text('本机服务未连接，请先启动本机服务。', 'Local service disconnected. Start the local service first.'), tone: 'error' as const } : null,
     report?.phase === 'restore_failed' ? { id: 'restore-failed', message: text('配置恢复未完成，备份已保留。请点击“关闭保护”重试恢复。', 'Restoration incomplete. Backup retained; select Stop protection to retry restoration.'), tone: 'error' as const } : null,
     report?.alarm ? { id: 'score-alarm', message: text('验证得分较上次有效检测下降至少40%，请查看异常项目。', 'Verification score dropped at least 40% since the previous valid check. Review the flagged items.'), tone: 'error' as const } : null,

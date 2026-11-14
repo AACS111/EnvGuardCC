@@ -10,6 +10,8 @@
 
 // v6 requires the persistent Windows task settings and effective rule validation.
 export const HOST_PROTOCOL = 6;
+import { HOST_BUILD_VERSION } from './host-version.mjs';
+export { HOST_BUILD_VERSION } from './host-version.mjs';
 
 /** 界面依赖的宿主动作；缺少任何一个都必须重新授权安装。 */
 export const HOST_CAPABILITIES = ["ipv6", "owner-lease", "claude-guard", "claude-direct-guard"];
@@ -25,7 +27,9 @@ export function checkHostHealth(value) {
     : [];
   const missing = HOST_CAPABILITIES.filter((name) => !capabilities.includes(name));
   return {
-    ok: protocol >= HOST_PROTOCOL && missing.length === 0,
+    ok: protocol === HOST_PROTOCOL && missing.length === 0 && value?.hostBuildVersion === HOST_BUILD_VERSION,
+    buildVersion: typeof value?.hostBuildVersion === 'string' ? value.hostBuildVersion : null,
+    requiredBuildVersion: HOST_BUILD_VERSION,
     protocol,
     required: HOST_PROTOCOL,
     capabilities,

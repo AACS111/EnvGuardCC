@@ -68,7 +68,9 @@ export function createProtectionService({ stateDir, runtime, browserCloak, curre
       if (!kernel) return;
       previousTunnel ??= kernel.connectionState?.().tunEnabled === true;
       // 先解除未保护阻断，否则保护自己的模拟测试会被 REJECT 规则挡住。
-      if (kernel.setUnprotectedGuard) await kernel.setUnprotectedGuard(false);
+      // Keep the system guard armed until setTunnel has verified takeover.
+      // Releasing and immediately rearming it adds two privileged round trips.
+      if (kernel.setUnprotectedGuard) await kernel.setUnprotectedGuard(false, { deferRelease: true });
       signal?.throwIfAborted();
       unprotectedBlock = { active: false, error: null };
       await kernel.setTunnel(true, { ensureHost: true });

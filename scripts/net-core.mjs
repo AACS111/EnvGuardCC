@@ -10,6 +10,8 @@ import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 import { inIpv4Range } from "./net-core/config.mjs";
 import { findPortOwner, processName } from "./net-core/ports.mjs";
 import { fileURLToPath } from "node:url";
+import { createLogLimiter, kernelWarningKey } from "./net-core/log-limiter.mjs";
+import { loopbackFetch } from './net-core/loopback-fetch.mjs';
 
 const LOOPBACK = "127.0.0.1";
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -49,7 +51,7 @@ export function createNetCore({
   portOwnerName = (pid) => processName(pid),
   lookup = (host, options) => dns.lookup(host, options),
   spawn = nodeSpawn,
-  fetchImpl = globalThis.fetch,
+  fetchImpl = loopbackFetch,
   logger = () => {},
 } = {}) {
   if (typeof binary !== "string" || !binary) throw new Error("缺少内核可执行文件路径。");
@@ -58,6 +60,7 @@ export function createNetCore({
   if (!Number.isInteger(apiPort) || apiPort < 1 || apiPort > 65535) throw new Error("外部控制器端口无效。");
 
   const wantsTunnel = () => (typeof verifyTunnel === "function" ? Boolean(verifyTunnel()) : Boolean(verifyTunnel));
+  const kernelLogs = createLogLimiter(logger, { intervalMs: 5 * 60 * 1000 });
   let child = null;
   let ready = false;
   let stopping = false;
@@ -111,7 +114,12 @@ export function createNetCore({
       buffer += chunk;
       const lines = buffer.split("\n");
       buffer = lines.pop() ?? "";
-      for (const line of lines) if (line.trim()) logger(`${label}: ${line.trim()}`);
+      for (const line of lines) if (line.trim()) {
+        if (line.includes('default interface changed by monitor')) kernelLogs.flush();
+        const key = kernelWarningKey(line);
+        if (key) kernelLogs.write(key, `${label}: ${line.trim()}`);
+        else logger(`${label}: ${line.trim()}`);
+      }
     });
   }
 
@@ -120,6 +128,7 @@ export function createNetCore({
       if (message?.type === 'kernel-pid' && Number.isInteger(message.pid) && message.pid > 0) kernelPids.set(next, message.pid);
     });
     next.on?.("exit", (code, signal) => {
+      kernelLogs.flush();
       exits.set(next, { code, signal });
       if (child !== next) return;
       exitInfo = { code, signal };

@@ -4,7 +4,7 @@
 //   2. Claude 出口组固定为 select，禁止 url-test 自动切节点（IP 漂移本身就是风控信号）；
 //   3. tun.strict-route 默认开启；公司 VPN 的 Windows DNS 兼容需用户显式关闭；
 //   4. IPv6 仅在节点能力验证后启用双栈 TUN；DNS 使用 fake-ip 且 respect-rules，查询也走隧道；
-//      境外域名通过隧道并行使用地区解析器与 DoH，避免地区 DNS 失效导致断网，见 public-dns.mjs；
+//      默认使用加密 DoH，上游不依赖出口地区探测；显式 DNS 覆盖仍受分流规则约束；
 //   5. 最后一条规则必须是 MATCH，否则内核拒绝启动；
 //   6. 非 Claude 流量的兜底出口是带健康检查的故障转移组（fallback / url-test），
 //      不允许绑定单个节点：单节点抖动会让全部境外流量 fail-closed 中断（FlClash 同样用组兜底）。
@@ -189,7 +189,7 @@ export function buildKernelConfig({
   if (!Array.isArray(dnsServers) || !dnsServers.length || dnsServers.some((server) => typeof server !== "string" || !server.trim())) throw new Error("dnsServers 必须是非空 DNS 地址字符串组成的数组。");
   if (dnsInterface && dnsServers.some((server) => server.trim() === "system" || server.includes("#"))) throw new Error("dnsInterface 需要显式 DNS 地址，且不能同时指定 # 路由参数。");
   // 严格模式只允许内核代转 DNS；显式解析器须直连，不能被 global 模式的兜底规则送往节点。
-  const directDnsServers = dnsServers.map((value) => {
+  const localDnsServers = dnsServers.map((value) => {
     const server = value.trim();
     return server === "system" || server.includes("#") ? server : `${server}#${dnsInterface ? LOCAL_DNS_PROXY : "DIRECT"}`;
   });
@@ -320,16 +320,18 @@ export function buildKernelConfig({
       "fake-ip-filter": [...internalDomains.map((domain) => `+.${domain}`), "+.msftconnecttest.com", "+.msftncsi.com"],
       "default-nameserver": ["223.5.5.5", "1.1.1.1"],
       "proxy-server-nameserver": (Array.isArray(proxyServerDns) && proxyServerDns.length ? proxyServerDns : ["223.5.5.5", "1.1.1.1"]).map((item) => item.trim()),
-      // 同组并行查询：地区解析器无响应时也能用 DoH，避免等待主解析超时耗尽整个查询时限。
-      nameserver: [...new Set([...(Array.isArray(publicDns) ? publicDns : []), ...ANYCAST_DOH])],
+      // 公共解析固定走 Claude 出口，不混入异地区 anycast 兜底。
+      nameserver: [...new Set(publicDns)].map(server => `${server.split('#')[0]}#${groupName}`),
       // respect-rules 会让 DNS 查询也走节点，而解析「代理服务器域名 / DoH 引导域名」又必须先有 DNS ——
       // 不把这两类域名钉死在直连解析上就会互相等待（实测：全部节点超时、/dns/query 超时）。
       "nameserver-policy": Object.fromEntries([
-        ...internalDomains.map((domain) => [`+.${domain}`, [...directDnsServers]]),
+        ...internalDomains.map((domain) => [`+.${domain}`, [...localDnsServers]]),
         ...[...nodeServerHosts].map((host) => [`+.${host}`, [nodeDomainResolver]]),
         ...[...dohHosts].map((host) => [`+.${host}`, [`${directBootstrapServer}#DIRECT`]]),
       ]),
-      "direct-nameserver": [...directDnsServers],
+      // 公网直连使用独立解析器与自动检测的出口网卡，不依赖公司 DNS / VPN 是否在线。
+      // 公司 DNS 仅由上面的内网域名策略引用；不得放入全局直连解析或作为其兜底。
+      "direct-nameserver": ["223.5.5.5#DIRECT", "1.1.1.1#DIRECT"],
       "direct-nameserver-follow-policy": true,
       "respect-rules": true,
       "use-hosts": true,

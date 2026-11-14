@@ -27,6 +27,7 @@ test('使用系统目录绝对路径读取 Windows 时区，不依赖 PATH', asy
   assert.equal(calls[0][0], 'D:\\Windows\\System32\\tzutil.exe');
   assert.deepEqual(calls[0][1], ['/g']);
   assert.equal(calls[0][2].windowsHide, true);
+  assert.equal(calls[0][2].timeout, 3000);
 });
 test('连续空输出时读取 Windows 时区注册值，不将空值作为备份', async () => {
   const calls = [];
@@ -50,6 +51,7 @@ test('所有读取方式失败时拒绝修改，不伪造时区', async () => {
   const cause = new Error('access denied');
   await assert.rejects(readWindowsTimezone({ ...windows, run: async () => { throw cause; } }), error => /已拒绝修改/.test(error.message) && error.cause === cause);
   await assert.rejects(readWindowsTimezone({ ...windows, run: async () => ({ stdout: '' }) }), /已拒绝修改/);
+  await assert.rejects(readWindowsTimezone({ ...windows, run: async () => { throw Object.assign(new Error('denied'), { code: 'EACCES' }); } }), /tzutil\[1\]: EACCES.*registry: EACCES/);
 });
 test('不接受多行内容作为时区，非 Windows 不运行命令', async () => {
   await assert.rejects(readWindowsTimezone({ ...windows, run: async () => ({ stdout: 'UTC\nUnexpected output' }) }), /已拒绝修改/);

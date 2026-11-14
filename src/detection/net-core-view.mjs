@@ -164,11 +164,11 @@ export function netCoreView(report, { locale = "zh", exitHistory = null } = {}) 
     };
   } else if (state === "starting") {
     // 启动阶段（建隧道、验证出口）比页面加载慢：告诉用户正在做什么，而不是报未启动。
-    // 同时必须说清此刻没有保护：启动窗口里的 Claude 请求会绕过隧道直连。
+    // 没有接管证据只能说明尚未确认；系统阻断状态在下方单独展示。
     tone = "warn";
     conclusion = {
       tone: "warn",
-      title: t("内核正在启动 · Claude 当前无保护", "Kernel starting · Claude is unprotected"),
+      title: t("内核正在启动 · 保护尚未确认", "Kernel starting · protection unconfirmed"),
       detail: report.reason || t("正在建立隧道并验证出口；此期间请勿使用 Claude 客户端，完成后本视图自动刷新。", "Establishing the tunnel and verifying the exit; do not use the Claude client until this completes. This view refreshes automatically."),
     };
   } else if (state === "idle") {
@@ -272,19 +272,6 @@ export function netCoreView(report, { locale = "zh", exitHistory = null } = {}) 
       conclusion.detail,
     ].filter(Boolean).join(zh ? " " : " ");
   }
-  // fail-closed 未生效（宿主过旧/未装/收敛失败）时必须显式告警，不能因为“理论上已布防”而沉默。
-  if ((report.failClosed?.hostGuard?.desired === "armed" && report.failClosed.hostGuard.armed !== true) ||
-      (report.failClosed?.hostGuard?.desired === "protected" && report.failClosed.hostGuard.scope !== 'browser' && report.failClosed.hostGuard.directProtected !== true)) {
-    if (tone !== "danger") { tone = "warn"; conclusion.tone = "warn"; }
-    conclusion.detail = [
-      t("内核缺位阻断未生效：Claude 可能在隧道验证前直连；请更新特权宿主（需要一次系统授权）。", "Kernel-absent guard is not active: Claude may go direct before the tunnel is verified. Update the privileged host (one system authorization)."),
-      report.failClosed.hostGuard.error,
-      conclusion.detail,
-    ].filter(Boolean).join(zh ? " " : " ");
-  }
-  if (report.failClosed?.hostGuard?.scope === 'browser') {
-    conclusion.detail += t(' 未安装桌面客户端，当前保护浏览器访问 Claude。内核恢复期间的域名阻断不保证覆盖浏览器缓存连接或独立安全 DNS。', 'No desktop client is installed; protection applies to browser access to Claude. Domain blocking during kernel recovery may not cover cached browser connections or independent secure DNS.');
-  }
   if (state === "running" && !tunEnabled) {    // 宿主模式下 TUN 关闭是「关闭保护 / 暂停接管」的正常态，不是故障：
     // 内核仍在跑（节点可测速、39080 可当代理），只是系统流量直连。
     if (hostMode) tone = "muted";
@@ -306,13 +293,50 @@ export function netCoreView(report, { locale = "zh", exitHistory = null } = {}) 
     conclusion.tone = "warn";
     conclusion.detail += t(" 隧道接管状态未知，不能确认系统流量已受保护。", " Tunnel capture is unknown; system traffic protection is unverified.");
   }
+  // Pending, confirmed blocking and failed verification are different states.
+  // In particular, a configured TUN is not proof of either capture or direct traffic.
+  const hostGuard = report.failClosed?.hostGuard;
+  const guardConfirmed = hostGuard?.desired === 'armed' && hostGuard.armed === true && !hostGuard.error &&
+    (hostGuard.scope === 'browser' || hostGuard.directProtected === true);
+  const guardUnconfirmed = (hostGuard?.desired === 'armed' && !guardConfirmed) ||
+    (hostGuard?.desired === 'protected' && hostGuard.scope !== 'browser' && hostGuard.directProtected !== true);
+  let guardNotice = null;
+  if (hostGuard?.arming === true) {
+    guardNotice = { title: t('系统阻断建立中 · 保护尚未确认', 'System block is being established · protection unconfirmed'),
+      detail: t('正在建立并核验系统阻断规则，请等待完成后再使用 Claude。', 'Establishing and verifying system blocking rules. Wait for verification before using Claude.'),
+      label: t('建立中', 'Establishing'), tone: 'warn' };
+  } else if (guardConfirmed && (state === 'starting' || (tunEnabled && tunCaptured !== true))) {
+    guardNotice = { title: t('Claude 已阻断 · 等待隧道验证', 'Claude blocked · waiting for tunnel verification'),
+      detail: t('系统阻断已确认，Claude 流量暂时被阻断；隧道与出口验证通过后恢复。', 'System blocking is confirmed. Claude traffic remains blocked until tunnel and exit verification succeeds.'),
+      label: t('已阻断', 'Blocked'), tone: 'warn' };
+  } else if (guardUnconfirmed) {
+    guardNotice = { title: hostGuard.error ? t('系统阻断核验失败', 'System block verification failed') : t('系统阻断状态未确认', 'System block status unconfirmed'),
+      detail: [t('尚未确认系统阻断有效，Claude 存在直连风险，请暂勿使用。', 'System blocking is unconfirmed. Claude may connect directly; do not use it yet.'), hostGuard.error,
+        report.hostStale ? t('特权宿主版本不匹配，请按提示授权更新。', 'The privileged host version does not match. Authorize the update when prompted.') : hostGuard.error ? t('请查看失败原因并重试。', 'Review the failure reason and retry.') : t('请稍后复检；若持续未确认，请检查宿主状态。', 'Recheck shortly. If the status remains unconfirmed, inspect the privileged host.')].filter(Boolean).join(' '),
+      label: t('未确认', 'Unconfirmed'), tone: hostGuard.error ? 'danger' : 'warn' };
+  }
+  if (guardNotice) {
+    const independentRisk = routing?.state === 'violation' || Number(routing?.direct ?? 0) > 0 || report.failClosed?.ipv6Unprotected;
+    if (!independentRisk && !report.regionLock?.locked && !report.unprotectedGuard?.active && !['error', 'offline'].includes(state)) {
+      tone = guardNotice.tone;
+      label = guardNotice.label;
+      conclusion = { tone, title: guardNotice.title, detail: guardNotice.detail };
+    } else {
+      if (independentRisk) { tone = 'danger'; conclusion.tone = tone; }
+      else if (tone !== 'danger') { tone = guardNotice.tone; conclusion.tone = tone; }
+      conclusion.detail = [guardNotice.detail, conclusion.detail].join(' ');
+    }
+  }
+  if (hostGuard?.scope === 'browser') {
+    conclusion.detail += t(' 未安装桌面客户端，当前保护浏览器访问 Claude。内核恢复期间的域名阻断不保证覆盖浏览器缓存连接或独立安全 DNS。', 'No desktop client is installed; protection applies to browser access to Claude. Domain blocking during kernel recovery may not cover cached browser connections or independent secure DNS.');
+  }
   // 有线 + 无线同时在线时默认接口会跳，TUN 跟着重建，表现为“一波动就断”。
   if (state === "running" && Number(report.network?.links) > 1) {
     conclusion.detail = [conclusion.detail, t("检测到多个网络同时在线（例如同时连有线和无线），出口可能抖动；建议只保留一条网络。", "Multiple networks are online (e.g. Ethernet and Wi-Fi); the exit may flap. Keeping a single link is recommended.")]
       .filter(Boolean).join(zh ? " " : " ");
   }
   // 宿主暂时探测不到：保持宿主模式，不降级自起内核（否则会抢 39090/TUN）。
-  if (report.hostProbeFailed === true) {
+  if (report.hostProbeFailed === true || report.hostHeartbeatError) {
     conclusion.detail = [conclusion.detail, t("特权宿主暂时无响应，已在保持现有模式；稍后重试即可，不会另起一个内核。", "The privileged helper is temporarily unresponsive; the current mode is kept. Retry shortly — no second kernel is started.")]
       .filter(Boolean).join(zh ? " " : " ");
     if (tone === "ok") { tone = "warn"; conclusion.tone = "warn"; }
@@ -325,7 +349,7 @@ export function netCoreView(report, { locale = "zh", exitHistory = null } = {}) 
 
   // 未启用 TUN 时必须说明原因，而不是让用户以为内核坏了。
   const hostStaleHint = !hostMode && report.hostStale
-    ? t("特权助手版本过旧：开启环境防护时会请求一次系统授权更新，之后不再提示。", "The privileged helper is outdated: enabling protection will request a one-time system authorization to update it.")
+    ? t("特权助手版本不匹配：开启环境防护时会请求系统授权更新；版本一致后直接复用。", "The privileged helper version does not match: enabling protection will request system authorization to update it; matching versions are reused.")
     : null;
   const tunHint = hostStaleHint ?? (state === "running" && !tunEnabled
     ? (hostMode

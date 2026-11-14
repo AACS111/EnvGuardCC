@@ -144,6 +144,14 @@ test('Windows 与 IANA 时区按同一地区比较，真实不匹配仍提醒', 
   assert.match(workspace('active', { report, target: { timezone: 'America/New_York' } }), /系统时区是/);
 });
 
+test('启动期间不把旧目标当成时区故障，完成后优先使用已应用目标', () => {
+  const report = { phase: 'starting', enabled: false, issues: [], history: [], systemTimezone: 'Korea Standard Time', target: { timezone: 'Asia/Shanghai' } };
+  assert.doesNotMatch(workspace('starting', { report }), /系统时区是/);
+  assert.doesNotMatch(workspace('idle', { report: { ...report, phase: 'idle' } }), /系统时区是/);
+  assert.doesNotMatch(workspace('active', { report: { ...report, phase: 'active', enabled: true, target: { timezone: 'Asia/Seoul' } }, target: { timezone: 'Asia/Shanghai' } }), /系统时区是/);
+  assert.match(workspace('active', { report: { ...report, phase: 'active', enabled: true, systemTimezone: null, systemTimezoneError: 'read failed' } }), /暂时无法读取系统时区/);
+});
+
 test('IPv6 状态放在出口结论内，区分双栈、降级及失败', () => {
   const report = { phase: 'active', enabled: true, issues: [], history: [] };
   const render = ipv6 => workspace('active', { report, netCore: { state: 'running', tunEnabled: true, ipv6 } });

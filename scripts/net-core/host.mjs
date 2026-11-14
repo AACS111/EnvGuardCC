@@ -18,7 +18,7 @@ import { createNetCore } from "../net-core.mjs";
 import { findPortOwner, processCommandLine, processName } from "./ports.mjs";
 import { createFirewallGuard } from "./firewall.mjs";
 import { createClaudeGuard } from "./claude-guard.mjs";
-import { HOST_CAPABILITIES, HOST_PROTOCOL } from "./host-protocol.mjs";
+import { HOST_CAPABILITIES, HOST_PROTOCOL, HOST_BUILD_VERSION } from "./host-protocol.mjs";
 import { disableSystemIpv6, restoreSystemIpv6 } from "./system-ipv6.mjs";
 import { assertStrictKernelConfig } from "./config.mjs";
 import os from "node:os";
@@ -196,7 +196,7 @@ export function createKernelHost({ token, binary, stateDir, apiPort = 39090, hos
     const url = new URL(request.url ?? "/", "http://127.0.0.1");
     if (request.method === "GET" && url.pathname === "/health") {
       const failClosed = claudeGuard.snapshot();
-      send(response, 200, { ok: true, running: Boolean(core?.state().running), apiPort, requiresAdmin, guard: firewall.status(), claudeGuard: failClosed, hostProtocol: HOST_PROTOCOL, capabilities: HOST_CAPABILITIES });
+      send(response, 200, { ok: true, running: Boolean(core?.state().running), apiPort, requiresAdmin, guard: firewall.status(), claudeGuard: failClosed, hostProtocol: HOST_PROTOCOL, hostBuildVersion: HOST_BUILD_VERSION, capabilities: HOST_CAPABILITIES });
       return;
     }
     if (request.method !== "POST" || url.pathname !== "/kernel") {
@@ -348,6 +348,10 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
     process.stderr.write("[host] 缺少 --state-dir / --token-file / --binary\n");
     process.exit(1);
   }
+  const { createRotatingLog } = await import('./rotating-log.mjs');
+  const writeLog = createRotatingLog(path.join(stateDir, 'host-log.txt'), {
+    onError: error => process.stderr.write(`[host] 日志写入失败：${error.message}\n`),
+  });
   let token;
   try {
     token = (await readFile(tokenFile, "utf8")).trim();
@@ -362,9 +366,9 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
     token, binary, stateDir,
     apiPort: Number(flag("api-port", "39090")),
     port: Number(flag("port", "39091")),
-    logger: (line) => process.stderr.write(`[host] ${line}\n`),
+    logger: (line) => writeLog(`[host] ${line}`),
   });
   const { url } = await host.listen();
-  process.stderr.write(`[host] 监听 ${url}\n`);
+  writeLog(`[host] 监听 ${url}`);
   for (const signal of ["SIGTERM", "SIGINT"]) process.on(signal, () => { void host.close().finally(() => process.exit(0)); });
 }

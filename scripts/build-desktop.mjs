@@ -20,7 +20,9 @@ const tools = path.join(root, 'node_modules/.tauri-tools');
 const stage = path.join(root, 'node_modules/.checkcc-tauri-backend');
 const output = path.join(root, 'node_modules/.checkcc-dist');
 const isMac = process.platform === 'darwin' && process.arch === 'arm64';
-const nodeVersion = 'v22.23.2';
+const nodeRelease = JSON.parse(await readFile(new URL('./node-runtime-manifest.json', import.meta.url), 'utf8'));
+const nodeVersion = nodeRelease.version;
+if (!/^v\d+\.\d+\.\d+$/.test(nodeVersion)) throw new Error('Invalid pinned Node runtime version');
 const manifest = JSON.parse(await readFile(path.join(root, 'package.json'), 'utf8'));
 if (!isMac && (process.platform !== 'win32' || process.arch !== 'x64')) throw new Error('打包需要 Windows x64 或 macOS arm64。');
 if (!process.env.CHECKCC_EXPORT_DIR) throw new Error('请使用 pnpm desktop:package 构建最新页面后打包。');
@@ -88,9 +90,9 @@ const nodeArchive = nodeName + (isMac ? '.tar.gz' : '.zip');
 const nodeDirectory = path.join(tools, nodeName);
 const runtime = path.join(nodeDirectory, isMac ? 'bin/node' : 'node.exe');
 const base = `https://nodejs.org/dist/${nodeVersion}`;
-const checksumResponse = await fetch(`${base}/SHASUMS256.txt`, { signal: AbortSignal.timeout(15000) });
-if (!checksumResponse.ok) throw new Error('无法下载 Node 运行时校验值。');
-const expected = (await checksumResponse.text()).split('\n').find(line => line.trim().endsWith(' ' + nodeArchive))?.trim().split(/\s+/)[0];
+// Pin official SHASUMS256 values alongside the version. Cached archives can then
+// be verified offline; a missing or mismatching digest still stops the build.
+const expected = nodeRelease.archives[nodeArchive];
 if (!/^[a-f0-9]{64}$/.test(expected || '')) throw new Error('未找到 Node 运行时校验值。');
 const tarball = path.join(tools, nodeArchive);
 try { await access(tarball); } catch { await download(`${base}/${nodeArchive}`, tarball); }

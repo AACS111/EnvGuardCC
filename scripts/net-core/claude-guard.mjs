@@ -166,11 +166,11 @@ export function claudeDirectSpecs(selectors) {
 /** 按稳定 Name 更新，不先删旧规则；重试和补齐部分失败不会制造新的直连窗口。 */
 export function claudeGuardArmScript(specs) {
   if (!Array.isArray(specs) || !specs.length) throw new Error("fail-closed 规则为空。");
-  const group = specs[0].group;
+  const groups = [...new Set(specs.map(spec => spec.group))];
   const lines = [
     "$ErrorActionPreference = 'Stop'",
     FIREWALL_CHECK_SCRIPT,
-    `$existing = @(Get-NetFirewallRule -Group ${quote(group)} -PolicyStore PersistentStore -ErrorAction SilentlyContinue)`,
+    `$existing = @(Get-NetFirewallRule -Group ${groups.map(quote).join(',')} -PolicyStore PersistentStore -ErrorAction SilentlyContinue)`,
   ];
   if (specs.some(spec => spec.package)) lines.push(PACKAGE_SID_SCRIPT);
   for (const spec of specs) {
@@ -184,7 +184,7 @@ export function claudeGuardArmScript(specs) {
     const settings = `-Direction Outbound -Action Block -Profile Any -Enabled True -Service Any -InterfaceType Any -InterfaceAlias Any -LocalAddress Any -LocalPort Any -Protocol ${spec.protocol} -RemotePort ${spec.port} ${selector} ${remote}`;
     lines.push(`if (${quote(name)} -in $existing.Name) { Set-NetFirewallRule -PolicyStore PersistentStore -Name ${quote(name)} ${settings} } else { New-NetFirewallRule -PolicyStore PersistentStore -Name ${quote(name)} -DisplayName ${quote(spec.name)} -Group ${quote(spec.group)} ${settings} | Out-Null }`);
   }
-  lines.push(guardVerifiedCount(group, specs));
+  lines.push(guardVerifiedCount(groups, specs));
   lines.push("ConvertTo-Json -Compress -InputObject @{ count = $count }");
   return lines.join("\n");
 }
@@ -209,9 +209,10 @@ export function claudeGuardStatusScript(group, specs = null) {
 }
 
 function guardVerifiedCount(group, specs) {
-  if (!specs?.length) return `$count = @(Get-NetFirewallRule -Group ${quote(group)} -PolicyStore ActiveStore -ErrorAction SilentlyContinue).Count`;
+  const groups = (Array.isArray(group) ? group : [group]).map(quote).join(',');
+  if (!specs?.length) return `$count = @(Get-NetFirewallRule -Group ${groups} -PolicyStore ActiveStore -ErrorAction SilentlyContinue).Count`;
   return [FIREWALL_RULE_CHECK,
-    `$rules = @(Get-NetFirewallRule -Group ${quote(group)} -PolicyStore ActiveStore -ErrorAction SilentlyContinue)`, '$count = 0',
+    `$rules = @(Get-NetFirewallRule -Group ${groups} -PolicyStore ActiveStore -ErrorAction SilentlyContinue)`, '$count = 0',
     ...specs.map(spec => `if (Test-GuardRule ($rules | Where-Object { $_.Name -eq ${quote(ruleName(spec))} } | Select-Object -First 1) ${quote(spec.program || 'Any')} ${spec.package ? `([EnvGuardPackageSid]::Resolve(${quote(spec.package)}))` : "'Any'"} ${quote(spec.protocol)} ${quote(spec.port)} @(${(spec.addresses || ['Any']).map(quote).join(',')})) { $count++ }`),
   ].join('\n');
 }
@@ -331,9 +332,11 @@ export function createClaudeGuard({ platform = process.platform, stateDir, exec 
     try {
       const selectors = { ...state.selectors, token: state.token };
       const fullSpecs = selectors.packages?.length || selectors.programs?.length || selectors.addresses?.length ? claudeGuardSpecs(selectors) : [];
-      const count = await expect(claudeGuardStatusScript(guardGroupName(state.token), state.desired === 'armed' ? fullSpecs : null));
       const directSpecs = claudeDirectSpecs(selectors);
-      const directCount = await expect(claudeGuardStatusScript(`${guardGroupName(state.token)}-Direct`, directSpecs));
+      const [count, directCount] = await Promise.all([
+        expect(claudeGuardStatusScript(guardGroupName(state.token), state.desired === 'armed' ? fullSpecs : null)),
+        expect(claudeGuardStatusScript(`${guardGroupName(state.token)}-Direct`, directSpecs)),
+      ]);
       const fullCount = fullSpecs.length;
       const hostsReady = !hostsPath || !(selectors.domains?.length) || hosts === true;
       return (cached = { supported, armed: state.desired === 'armed' && count >= fullCount && hostsReady,
@@ -357,13 +360,25 @@ export function createClaudeGuard({ platform = process.platform, stateDir, exec 
     if (!specs.length && !(domains?.length)) throw new Error("fail-closed 缺少阻断目标：需要程序/包/地址或域名之一。");
     await save({ token: useToken, desired: "armed", selectors: { packages, programs, addresses, domains }, at: new Date().toISOString() });
     const directSpecs = claudeDirectSpecs({ token: useToken, packages, programs });
-    if (directSpecs.length && await expect(claudeGuardArmScript(directSpecs)) < directSpecs.length) throw new Error('fail-closed 桌面直连阻断规则未全部生效。');
     const errors = [];
     let count = 0;
     if (specs.length) {
       try {
-        count = await expect(claudeGuardArmScript(specs));
-        if (count < specs.length) errors.push(`规则未全部生效：期望 ${specs.length} 条，实际 ${count} 条`);
+        // Both groups share one PowerShell process and one effective-store scan.
+        // Direct rules are installed first; every expected rule is still verified.
+        const allSpecs = [...directSpecs, ...specs];
+        const script = claudeGuardArmScript(allSpecs);
+        // Windows has a command-line length limit. Multiple installed versions
+        // may exceed it when combined; retain the separate-group path then.
+        if (script.length > 24000 && directSpecs.length) {
+          if (await expect(claudeGuardArmScript(directSpecs)) < directSpecs.length) throw new Error('桌面直连阻断规则未全部生效。');
+          count = await expect(claudeGuardArmScript(specs));
+          if (count < specs.length) errors.push(`规则未全部生效：期望 ${specs.length} 条，实际 ${count} 条`);
+        } else {
+          const verified = await expect(script);
+          if (verified !== allSpecs.length) errors.push(`规则未全部生效：期望 ${allSpecs.length} 条，实际 ${verified} 条`);
+          count = Math.max(0, verified - directSpecs.length);
+        }
       } catch (error) { errors.push(`规则：${error.message}`); }
     }
     let hosts = false;
@@ -378,7 +393,12 @@ export function createClaudeGuard({ platform = process.platform, stateDir, exec 
     if (!supported) return { armed: false, count: 0 };
     // 允许隧道时只移除临时全阻断，桌面直连规则一直存在，覆盖无法预知的内核崩溃。
     const directSpecs = state.token ? claudeDirectSpecs({ ...state.selectors, token: state.token }) : [];
-    if (keepDirect && directSpecs.length && await expect(claudeGuardArmScript(directSpecs)) < directSpecs.length) throw new Error('桌面直连阻断未确认，拒绝放行。');
+    if (keepDirect && directSpecs.length) {
+      // Read effective filters before releasing. Correct persistent rules need
+      // no rewrite; repair missing/altered rules before removing full blocking.
+      const directCount = await expect(claudeGuardStatusScript(`${guardGroupName(state.token)}-Direct`, directSpecs));
+      if (directCount < directSpecs.length && await expect(claudeGuardArmScript(directSpecs)) < directSpecs.length) throw new Error('桌面直连阻断未确认，拒绝放行。');
+    }
     await save({ desired: keepDirect ? 'protected' : 'released', at: new Date().toISOString() });
     const errors = [];
     let count = 0;

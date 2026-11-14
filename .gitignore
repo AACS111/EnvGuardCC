@@ -27,6 +27,9 @@
 # misc
 .DS_Store
 *.pem
+*.key
+*.p12
+*.pfx
 
 # debug
 /logs
@@ -37,8 +40,14 @@ yarn-error.log*
 
 # env files
 .env
-.env*.local
+.env.*
 !.env.example
+!.env.*.example
+.npmrc.local
+
+# local agent/editor settings
+/.codex/
+/.agents/
 
 # vercel
 .vercel
