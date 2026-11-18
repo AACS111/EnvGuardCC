@@ -51,7 +51,7 @@ let initializing = true;
 let networkRuntime = null;
 // 受管浏览器按偏好挑选：列表里被排除的浏览器不会被拉起。
 const browserChoice = async () => pickBrowser(await detectInstalledBrowsers(), await loadBrowserPreference(stateDir));
-const environmentRuntime = new EnvironmentRuntime({ stateDir, browserPathProvider: async () => {
+const environmentRuntime = new EnvironmentRuntime({ stateDir, ...(process.platform === 'win32' ? { protectedWebProxy: () => networkRuntime?.localProxy } : {}), browserPathProvider: async () => {
   const choice = await browserChoice();
   if (!choice?.path) throw new Error("没有可接入的浏览器：请至少在列表里保留一个 Chromium 内核浏览器（Chrome / Edge / Brave / Vivaldi / Chromium）。");
   return { id: choice.id, path: choice.path };
@@ -423,6 +423,7 @@ export async function startRepairHelper(listenPort = port, { netCore = null, rea
     } catch (error) { if (error.code !== 'ENOENT') throw error; }
     await new Promise((resolve, reject) => { server.once("error", reject); server.listen(listenPort, "127.0.0.1", resolve); });
     await protection.recover();
+    if (process.platform === 'win32' && netCore) await protection.ensureUnprotectedBlock();
     await desktopLauncher.localeProfile.restore();
     initializing = false;
     return { server, url: `http://127.0.0.1:${server.address().port}`, closeRuntime };

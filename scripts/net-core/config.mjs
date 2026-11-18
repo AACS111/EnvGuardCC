@@ -29,9 +29,14 @@ export const CLAUDE_GUARD_GROUP = "CLAUDE-GUARD";
 export const DEFAULT_AUTO_GROUP = "AUTO-PROXY";
 export const DEFAULT_AUTO_GROUP_TYPE = "fallback";
 export const AUTO_GROUP_TYPES = new Set(["fallback", "url-test"]);
+// 与 FlClash 默认测速地址一致；手动测速与健康检查共用 HTTPS 204 探针。
+// HTTP 可能遭到劫持或不兼容重复 HEAD，不能只按是否省掉 TLS 判断快慢。
+export const DELAY_TEST_URL = "https://www.gstatic.com/generate_204";
+// 对齐 FlClash 当前主分支的手动测速默认预算；它的 Go 回退值与旧版本可能不同。
+export const DELAY_TEST_TIMEOUT_MS = 8000;
 // 与 FlClash 一致：用 204 探针定时体检，节点连续失败后由组自动换到下一个可用节点。
 // fallback 只在失败时切换（不因延迟抖动换出口），url-test 才使用 tolerance。
-export const DEFAULT_HEALTH_CHECK = { url: "https://www.gstatic.com/generate_204", interval: 300, tolerance: 50, lazy: false };
+export const DEFAULT_HEALTH_CHECK = { url: DELAY_TEST_URL, interval: 300, tolerance: 50, lazy: false };
 // 网络可观测面：TLS 握手指纹要与声明面一致，STUN/UDP 不洩漏。
 // （字体/Emoji 属于系统事实，内核无法伪造，不在这里假装能做到。）
 export const DEFAULT_CLIENT_FINGERPRINT = "chrome";
@@ -166,6 +171,7 @@ export function buildKernelConfig({
   blockStun = true,
   // 区域锁定：出口落回 Claude 不支持地区时，直接把 Claude 域名的 TCP 连接拒绝掉。
   blockClaude = false,
+  guardInitiallyBlocked = false,
   ipv6 = false,
 } = {}) {
   const nodes = (proxies ?? []).map(assertProxy).map((node) => {
@@ -284,6 +290,14 @@ export function buildKernelConfig({
     mode: "rule",
     "log-level": logLevel,
 
+    // 与 FlClash 开启同名开关时的测速方式对齐：
+    //   unified-delay：首次 HEAD 预热后尝试复用连接计时，第二次失败则保留首次耗时；不是纯 RTT。
+    //   tcp-concurrent：目标域名多 IP 时并发拨号取最快，避免按序拨号撞上慢 IP。
+    "unified-delay": true,
+    "tcp-concurrent": true,
+    // Mihomo otherwise restores the last open guard from cache.db on a cold start.
+    ...(guardInitiallyBlocked ? { profile: { 'store-selected': false } } : {}),
+
     ipv6,
     ...(hosts && Object.keys(hosts).length ? { hosts } : {}),
     ...(sniffer ? {
@@ -349,7 +363,7 @@ export function buildKernelConfig({
         // 阻断 Claude 只需把这里切到 REJECT；放行则切回固定出口组。
         name: guardGroupName,
         type: "select",
-        proxies: [groupName, "REJECT"],
+        proxies: guardInitiallyBlocked ? ["REJECT", groupName] : [groupName, "REJECT"],
       },
       ...(usesAutoGroup ? [{
         name: autoGroupName,
@@ -389,6 +403,9 @@ export function buildProbeConfig({ proxies, names, basePort = 39381, mixedPort =
     "mixed-port": mixedPort,
     mode: "direct",
     "log-level": "silent",
+    // 出口探测内核沿用同一测速口径，避免两套内核报出不同风格的延迟数字。
+    "unified-delay": true,
+    "tcp-concurrent": true,
     ipv6,
     "external-controller": "127.0.0.1:0",
     ...(secret ? { secret } : {}),
@@ -453,6 +470,9 @@ export function assertStrictKernelConfig(config) {
 export function assertKernelConfig(config, { groupName = DEFAULT_GROUP, guardGroupName = CLAUDE_GUARD_GROUP, domains = CLAUDE_DOMAINS, strictRoute = true, egressMode, autoGroupName = DEFAULT_AUTO_GROUP, sniffer = true, blockStun = true, requireTlsFingerprint = true, blockClaude = false } = {}) {
   if (!config || typeof config !== "object") throw new Error("内核配置为空。");
   assertIpv6Config(config);
+  // 固定测速与拨号策略，避免生成的配置意外退回其他模式。
+  if (config["unified-delay"] !== true) throw new Error("必须启用 unified-delay：测速应优先使用复用连接后的请求耗时。");
+  if (config["tcp-concurrent"] !== true) throw new Error("必须启用 tcp-concurrent：否则多 IP 节点按序拨号会拖高延迟。");
   if (sniffer) {
     if (config.sniffer?.enable !== true) throw new Error("必须启用 sniffer：否则纯 IP 连接无法按域名分流，QUIC/SNI 也读不到。");
     if (config.sniffer?.["override-destination"] !== true) throw new Error("sniffer 必须 override-destination，否则分流仍然按 IP 而不是域名。");

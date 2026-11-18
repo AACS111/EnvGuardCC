@@ -52,7 +52,9 @@ export function TrafficFlow({ report, protectionEnabled = false, locale, onDetai
     if (!element.matches(':hover') && !element.matches(':focus-visible')) setRevealed(current => current?.id === id ? null : current);
   };
   const motion = useSyncExternalStore(subscribeMotion, canAnimate, () => false);
-  const mascotAt = protectionEnabled && report?.state === 'running' ? 'proxy' : 'gateway';
+  // 复检/短暂波动期间内核仍在运行：保持流转动画与螃蟹果位置，避免看起来像断开。
+  const kernelLive = report?.state === 'running' || report?.state === 'verifying';
+  const mascotAt = protectionEnabled && kernelLive ? 'proxy' : 'gateway';
   const mascotRef = useRef<HTMLSpanElement>(null);
   const previousMascotAt = useRef(mascotAt);
   const mascotTransform = useRef('translate(-50%, 0)');
@@ -119,7 +121,7 @@ export function TrafficFlow({ report, protectionEnabled = false, locale, onDetai
     const at = (axis: number) => (1-t)**3 * points[0][axis] + 3*(1-t)**2*t * points[1][axis] + 3*(1-t)*t*t * points[2][axis] + t**3 * points[3][axis];
     return `translate(${at(0)} ${at(1)})`;
   };
-  const ambient = motion && report?.state === 'running';
+  const ambient = motion && kernelLive;
   return <div className="workspace-flow" data-tone={violation ? 'danger' : proxied || direct ? 'ok' : 'muted'} role="group" aria-label={text('网络路径：代理出口与直连；代理出口包含 Claude；仅覆盖内核当前连接采样', 'Routing: proxy exit and direct; proxy includes Claude; current kernel connection samples only')}>
     <div className="workspace-flow__diagram">
     <svg className="workspace-flow__lines" viewBox="0 0 500 208" preserveAspectRatio="none" role="group" aria-label={text('活动连接，点击查看传输详情', 'Active connections; select to view transfer details')}>

@@ -64,12 +64,12 @@ type DialogProps = {
   locale: LocaleCode; data: ConnectionsResult | null; selected: ConnectionRecord | null;
   host: string; claude: boolean; route?: ConnectionRouteFilter; recordState?: ConnectionStateFilter; offset: number; clearing: boolean; error: string;
   onHost: (value: string) => void; onClaude: (value: boolean) => void; onRoute?: (value: ConnectionRouteFilter) => void; onState?: (value: ConnectionStateFilter) => void;
-  kind?: 'all' | 'connection' | 'request'; at?: string | null; replayBase?: number; replayPosition?: number; playing?: boolean; speed?: number; exporting?: boolean;
-  onKind?: (kind: 'all' | 'connection' | 'request') => void; onReplay?: () => void; onSeek?: (seconds: number) => void; onPlay?: () => void; onSpeed?: (speed: number) => void; onExport?: (format: 'json' | 'csv') => void;
+  kind?: 'all' | 'connection' | 'request'; at?: string | null; exporting?: boolean;
+  onKind?: (kind: 'all' | 'connection' | 'request') => void; onLive?: () => void; onExport?: (format: 'json' | 'csv') => void;
   onPage: (offset: number) => void; onSelect: (record: ConnectionRecord | null) => void; onClear: () => void; onClose: () => void;
 };
 export function TransferLogDialog(props: DialogProps) {
-  const { locale, data, selected, host, claude, route = 'all', recordState = 'all', offset, clearing, error, onHost, onClaude, onRoute, onState, onPage, onSelect, onClear, onClose, kind = 'all', at = null, replayBase = 0, replayPosition = 172800, playing = false, speed = 60, exporting = false, onKind, onReplay, onSeek, onPlay, onSpeed, onExport } = props;
+  const { locale, data, selected, host, claude, route = 'all', recordState = 'all', offset, clearing, error, onHost, onClaude, onRoute, onState, onPage, onSelect, onClear, onClose, kind = 'all', at = null, exporting = false, onKind, onLive, onExport } = props;
   const zh = locale.startsWith('zh');
   const text = (cn: string, en: string) => zh ? cn : en;
   const dialog = useRef<HTMLDialogElement>(null);
@@ -99,9 +99,8 @@ export function TransferLogDialog(props: DialogProps) {
         <label>{text('连接路径', 'Route')}<select value={route} onChange={event => onRoute?.(event.target.value as ConnectionRouteFilter)}><option value="all">{text('全部', 'All')}</option><option value="proxied">{text('代理出口', 'Proxy exit')}</option><option value="direct">{text('直连', 'Direct')}</option><option value="blocked">{text('已阻断', 'Blocked')}</option><option value="unknown">{text('未知', 'Unknown')}</option></select></label>
         <label>{text('连接状态', 'Connection state')}<select value={recordState} disabled={Boolean(at)} onChange={event => onState?.(event.target.value as ConnectionStateFilter)}><option value="all">{text('全部记录', 'All records')}</option><option value="active">{text('活动连接', 'Active connections')}</option><option value="ended">{text('已结束', 'Ended')}</option></select></label>
       </div>
-      <div className="transfer-log-tools"><button type="button" className="repair-button repair-button--quiet" onClick={onReplay} aria-pressed={Boolean(at)}>{at ? text('返回实时', 'Return to live') : text('48 小时回放', '48-hour replay')}</button><button type="button" className="repair-button repair-button--quiet" disabled={exporting || !data?.total} onClick={() => onExport?.('json')}>{text('导出 JSON', 'Export JSON')}</button><button type="button" className="repair-button repair-button--quiet" disabled={exporting || !data?.total} onClick={() => onExport?.('csv')}>{text('导出 CSV', 'Export CSV')}</button></div>
+      <div className="transfer-log-tools">{at && <button type="button" className="repair-button repair-button--quiet" onClick={onLive}>{text('返回实时', 'Return to live')}</button>}<button type="button" className="repair-button repair-button--quiet" disabled={exporting || !data?.total} onClick={() => onExport?.('json')}>{text('导出 JSON', 'Export JSON')}</button><button type="button" className="repair-button repair-button--quiet" disabled={exporting || !data?.total} onClick={() => onExport?.('csv')}>{text('导出 CSV', 'Export CSV')}</button></div>
       {kind === 'request' && <p className="workspace-meta">{text('仅记录经应用 HTTP 网关转发的请求；TUN 内加密 HTTPS 仅有连接记录。', 'Only requests forwarded by the app HTTP gateway are captured; encrypted HTTPS in TUN has connection records only.')}</p>}
-      {at && <section className="transfer-log-replay" aria-label={text('传输记录回放', 'Transfer log replay')}><div><strong>{text('回放时刻', 'Replay time')} · {timeLabel(at, locale)}</strong><button type="button" className="repair-button repair-button--quiet" onClick={onPlay}>{playing ? text('暂停', 'Pause') : text('播放', 'Play')}</button><label>{text('速度', 'Speed')}<select value={speed} onChange={event => onSpeed?.(Number(event.target.value))}><option value={1}>1×</option><option value={60}>60×</option><option value={600}>600×</option></select></label></div><input type="range" min={0} max={172800} step={1} value={replayPosition} onChange={event => onSeek?.(Number(event.target.value))} aria-label={text('48 小时回放时间轴', '48-hour replay timeline')} /><div className="workspace-meta"><span>{timeLabel(new Date(replayBase - 172800000).toISOString(), locale)}</span><span>{timeLabel(new Date(replayBase).toISOString(), locale)}</span></div><p className="workspace-meta">{text('按起止时间还原活动连接；字节为最终或最近累计值，不是所选时刻的流量。', 'Activity is reconstructed from start/end times. Bytes are final or latest totals, not traffic at the selected time.')}</p><p role="status">{data?.at === at ? text(`当时活动 ${data.total} 条`, `${data.total} active at this time`) : text('正在读取回放…', 'Loading replay…')}</p></section>}
       {!data?.available && !at && <p className="workspace-meta" role="status">{text('当前未采样，已有记录仍可查看。', 'Sampling is paused. Existing records remain available.')}</p>}
       {data?.storageError && <p className="netcore-alert" role="status">{text('本机记录保存失败，请检查磁盘空间或权限。', 'Could not save local records. Check disk space or permissions.')}</p>}
       {error && <p className="netcore-alert" role="alert">{error}</p>}
@@ -122,7 +121,7 @@ export function TransferLogDialog(props: DialogProps) {
   </dialog>;
 }
 
-export type TransferLogHandle = { open: (record?: ConnectionRecord) => void; openRoute: (route: 'proxied' | 'direct' | 'blocked') => void };
+export type TransferLogHandle = { open: (record?: ConnectionRecord) => void; openRoute: (route: 'proxied' | 'direct' | 'blocked') => void; openAt: (at: string) => void };
 
 export function TransferLog({ locale, visible = true, controllerRef }: { locale: LocaleCode; visible?: boolean; controllerRef?: Ref<TransferLogHandle> }) {
   const [data, setData] = useState<ConnectionsResult | null>(null);
@@ -137,20 +136,19 @@ export function TransferLog({ locale, visible = true, controllerRef }: { locale:
   const [error, setError] = useState('');
   const [revision, setRevision] = useState(0);
   const [kind, setKind] = useState<'all' | 'connection' | 'request'>('all');
-  const [replay, setReplay] = useState(false);
-  const [replayBase, setReplayBase] = useState(() => Date.now());
-  const [replayPosition, setReplayPosition] = useState(172800);
-  const [playing, setPlaying] = useState(false);
-  const [speed, setSpeed] = useState(60);
+  const [at, setAt] = useState<string | null>(null);
   const [exporting, setExporting] = useState(false);
-  const at = replay ? new Date(replayBase - (172800 - replayPosition) * 1000).toISOString() : null;
-  const openLog = useCallback((record?: ConnectionRecord) => { setSelected(record ?? null); setHost(''); setClaude(false); setRoute('all'); setRecordState('all'); setKind('all'); setOffset(0); setReplay(false); setPlaying(false); setOpen(true); }, []);
-  useImperativeHandle(controllerRef, () => ({ open: openLog, openRoute: value => { openLog(); setRoute(value); setRecordState(value === 'blocked' ? 'all' : 'active'); setKind('connection'); } }), [openLog]);
-  useEffect(() => {
-    if (!playing || !replay || !open || !visible || replayPosition >= 172800) return;
-    const timer = window.setInterval(() => { if (!document.hidden) setReplayPosition(value => Math.min(172800, value + speed)); }, 1000);
-    return () => window.clearInterval(timer);
-  }, [playing, replay, open, visible, speed, replayPosition]);
+  const openLog = useCallback((record?: ConnectionRecord) => { setSelected(record ?? null); setHost(''); setClaude(false); setRoute('all'); setRecordState('all'); setKind('all'); setOffset(0); setAt(null); setOpen(true); }, []);
+  // 打开传输记录并定位到指定时间点（用于出口历史：查看该出口生效期间的记录）。
+  const openAt = useCallback((iso: string) => {
+    openLog();
+    const point = Date.now();
+    setAt(new Date(Math.min(point, Math.max(point - 172800000, Date.parse(iso)))).toISOString());
+    setRecordState('all');
+    setKind('all');
+    setSelected(null);
+  }, [openLog]);
+  useImperativeHandle(controllerRef, () => ({ open: openLog, openRoute: value => { openLog(); setRoute(value); setRecordState(value === 'blocked' ? 'all' : 'active'); setKind('connection'); }, openAt }), [openLog, openAt]);
   const requestRevision = useRef(0);
   useEffect(() => {
     if (!visible || clearing) return;
@@ -200,8 +198,8 @@ export function TransferLog({ locale, visible = true, controllerRef }: { locale:
   const current = selected && data?.detailId === selected.id ? data.selected ?? null : selected ? data?.items.find(record => record.id === selected.id) ?? data?.recent.find(record => record.id === selected.id) ?? selected : null;
   return <>
     <TransferLogCard locale={locale} data={data} onOpen={openLog} />
-    {open && visible && <TransferLogDialog locale={locale} data={data} selected={current} host={host} claude={claude} route={route} recordState={recordState} offset={offset} clearing={clearing} error={error} kind={kind} at={at} replayBase={replayBase} replayPosition={replayPosition} playing={playing && replayPosition < 172800} speed={speed} exporting={exporting}
-      onKind={value => { setKind(value); setOffset(0); }} onReplay={() => { const point = Date.now(); setReplayBase(point); setReplayPosition(172740); setReplay(value => !value); setRecordState('all'); setPlaying(false); setOffset(0); setSelected(null); }} onSeek={value => { setReplayPosition(value); setPlaying(false); setOffset(0); setSelected(null); }} onPlay={() => setPlaying(value => !value)} onSpeed={setSpeed} onExport={format => void download(format)}
-      onHost={value => { setHost(value); setOffset(0); }} onClaude={value => { setClaude(value); setOffset(0); }} onRoute={value => { setRoute(value); setOffset(0); setSelected(null); }} onState={value => { setRecordState(value); setOffset(0); setSelected(null); }} onPage={setOffset} onSelect={setSelected} onClear={() => void clear()} onClose={() => { setOpen(false); setPlaying(false); }} />}
+    {open && visible && <TransferLogDialog locale={locale} data={data} selected={current} host={host} claude={claude} route={route} recordState={recordState} offset={offset} clearing={clearing} error={error} kind={kind} at={at} exporting={exporting}
+      onKind={value => { setKind(value); setOffset(0); }} onLive={() => { setAt(null); setRecordState('all'); setOffset(0); setSelected(null); }} onExport={format => void download(format)}
+      onHost={value => { setHost(value); setOffset(0); }} onClaude={value => { setClaude(value); setOffset(0); }} onRoute={value => { setRoute(value); setOffset(0); setSelected(null); }} onState={value => { setRecordState(value); setOffset(0); setSelected(null); }} onPage={setOffset} onSelect={setSelected} onClear={() => void clear()} onClose={() => setOpen(false)} />}
   </>;
 }

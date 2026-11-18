@@ -53,7 +53,7 @@ async function fakeNode() {
   };
 }
 
-async function runLockFlow(t, platform, scenario) {
+async function runLockFlow(t, platform, scenario, { requireLock = true } = {}) {
   try { await fs.access(binary); } catch { t.skip("当前平台未准备内核"); return; }
   const proxy = await fakeNode();
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "checkcc-region-lock-"));
@@ -93,6 +93,10 @@ async function runLockFlow(t, platform, scenario) {
   try {
     await runtime.importNodes([{ name: "fake-node", type: "http", server: "127.0.0.1", port: proxy.port }], { selected: "fake-node" });
     assert.equal(await runtime.start(), true);
+    if (!requireLock) {
+      await scenario({ runtime, proxy, hasReject, guardBlocked, tick });
+      return;
+    }
     // 并行跑整套测试时首次出口探测可能超时（内核启动慢）：多复检几轮，直到拿到「网络锁 + 明确出口国家」。
     for (let attempt = 0; attempt < 10; attempt += 1) {
       const lock = (await runtime.report()).regionLock;
@@ -151,14 +155,19 @@ const escalateScenario = async ({ runtime, proxy, hasReject, guardBlocked, tick 
 };
 
 test("网络波动锁定后无需手动复检：出口恢复并连续验证通过就自动解除", { timeout: 60000 }, async (t) => {
-  await runLockFlow(t, process.platform, autoRecoverScenario);
+  await runLockFlow(t, 'linux', autoRecoverScenario);
 });
 
 test("出口连续三次确认不在支持地区才升级地区锁，升级后必须人工解除", { timeout: 60000 }, async (t) => {
-  await runLockFlow(t, process.platform, escalateScenario);
+  await runLockFlow(t, 'linux', escalateScenario);
 });
 
-test("Windows 平台路径：锁定与自动复检不依赖 macOS 专有逻辑", { timeout: 60000, skip: process.platform === "win32" ? "Windows 已在上一用例覆盖" : false }, async (t) => {
-  // 在 macOS 上以 platform=win32 运行同一流程，验证锁/解锁没有走 darwin 分支（如 osascript、PF）。
-  await runLockFlow(t, "win32", autoRecoverScenario);
+test("Windows 普通代理在未开启保护时始终拒绝 Claude", { timeout: 60000 }, async (t) => {
+  await runLockFlow(t, "win32", async ({ runtime, proxy, guardBlocked }) => {
+    assert.equal(await guardBlocked(), true);
+    proxy.setCountry('SG');
+    assert.equal((await runtime.probeSelectedExit()).countryCode, 'SG');
+    await runtime.unlockRegion();
+    assert.equal(await guardBlocked(), true);
+  }, { requireLock: false });
 });

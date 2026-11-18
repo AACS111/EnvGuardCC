@@ -474,7 +474,7 @@ export async function checkGateway(locale: LocaleCode, signalId?: string): Promi
 }
 
 // 内核状态只读：GET 不触发网络探测，页面轮询用它。
-export type ExitHistory = { windowHours: number; samples: number; changes: number; stable: boolean; current: string | null; ips: string[]; firstAt: string | null; lastAt: string | null };
+export type ExitHistory = { windowHours: number; samples: number; changes: number; stable: boolean; current: string | null; ips: string[]; entries?: { ip: string; at: string; countryCode?: string | null; connections?: number; requests?: number }[]; firstAt: string | null; lastAt: string | null };
 
 export async function readNetCore(): Promise<{ netCore: NetCoreReport | null; exitHistory: ExitHistory | null }> {
   const response = await fetch(`${gatewayUrl}/__checkcc/net-core`, {
@@ -674,6 +674,8 @@ export type NetCoreNetworkState = {
   interfaces: Array<{ name: string; address: string }>;
   pendingRestart: boolean;
   canRestart: boolean;
+  restarted?: boolean;
+  verificationPending?: boolean;
   reason?: string;
   netCore?: NetCoreReport | null;
 };

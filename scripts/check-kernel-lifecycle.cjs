@@ -293,6 +293,7 @@ test('真实内核保持固定出口，并采样国内网站的代理连接与�
     }
     assert.ok(observed.endedAt);
     assert.ok(observed.upload > 0);
+    await runtime.connectionLog.flush();
     const persisted = JSON.parse(await fs.readFile(path.join(directory, 'net-core-connections.json'), 'utf8'));
     assert.ok(persisted.records.some(record => record.id === observed.id && record.endedAt));
   } finally {

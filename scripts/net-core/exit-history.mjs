@@ -48,13 +48,18 @@ async function read(stateDir) {
 }
 
 /** 记录一次出口观测；返回窗口内的变化统计。 */
-export function recordExit(stateDir, ip, { now = Date.now(), windowMs = DEFAULT_WINDOW_MS } = {}) {
+export function recordExit(stateDir, ip, { now = Date.now(), windowMs = DEFAULT_WINDOW_MS, countryCode = null } = {}) {
   return serialize(stateDir, async () => {
     const entries = (await read(stateDir)).filter((entry) => entry.at <= now && now - entry.at <= windowMs).sort((a, b) => a.at - b.at);
     if (!isValidIp(ip)) return summarize(entries, { windowMs, current: null });
     const last = entries.at(-1);
+    const country = typeof countryCode === "string" && /^[A-Za-z]{2}$/.test(countryCode) ? countryCode.toUpperCase() : null;
     if (!last || last.ip !== ip) {
-      entries.push({ ip: String(ip).trim(), at: now });
+      entries.push({ ip: String(ip).trim(), at: now, ...(country ? { countryCode: country } : {}) });
+      await write(stateDir, entries);
+    } else if (country && !last.countryCode) {
+      // 旧记录没有地区：当前出口下次诊断时补上，其余历史保持“地区未知”。
+      last.countryCode = country;
       await write(stateDir, entries);
     }
     return summarize(entries, { windowMs, current: String(ip).trim() });
@@ -77,6 +82,8 @@ function summarize(entries, { windowMs, current }) {
     stable: entries.length > 0 && changes === 0,
     current: current ?? null,
     ips: unique.slice(-8),
+    // 完整变化点（升序）：界面用它在每个出口上标注 Claude 请求与地区合规。
+    entries: entries.map((entry) => ({ ip: entry.ip, at: new Date(entry.at).toISOString(), countryCode: entry.countryCode ?? null })),
     firstAt: entries[0]?.at ? new Date(entries[0].at).toISOString() : null,
     lastAt: entries.at(-1)?.at ? new Date(entries.at(-1).at).toISOString() : null,
   };

@@ -584,8 +584,8 @@ test('请求详情、导出和回放提供真实元数据与覆盖边界，设�
   for (const content of ['POST','/v1/messages','201','1000 ms','HTTP 网关','不解密','未知']) assert.ok(details.includes(content),content);
   const at = '2026-11-08T00:00:00.500Z';
   const data = {available:false,stats:{active:0,ended:1,total:1},total:1,offset:0,limit:50,items:[record],recent:[record],at};
-  const dialog = renderToStaticMarkup(React.createElement(TransferLogDialog, { locale:'zh',data,selected:record,host:'',claude:false,viaExit:'all',offset:0,clearing:false,error:'',kind:'request',at,replayBase:Date.parse('2026-11-08T00:01:00Z'),replayPosition:172740,playing:false,onHost:()=>{},onClaude:()=>{},onExit:()=>{},onPage:()=>{},onSelect:()=>{},onClear:()=>{},onClose:()=>{} }));
-  for (const content of ['导出 JSON','导出 CSV','回放时间轴','当时活动 1 条','不解密','最后采样的累计值']) assert.ok(dialog.includes(content),content);
+  const dialog = renderToStaticMarkup(React.createElement(TransferLogDialog, { locale:'zh',data,selected:record,host:'',claude:false,route:'all',offset:0,clearing:false,error:'',kind:'request',at,onHost:()=>{},onClaude:()=>{},onRoute:()=>{},onPage:()=>{},onSelect:()=>{},onClear:()=>{},onClose:()=>{} }));
+  for (const content of ['导出 JSON','导出 CSV','返回实时','当时活动','共 1 条','不解密','最后采样的累计值']) assert.ok(dialog.includes(content),content);
   const settings = renderToStaticMarkup(React.createElement(ConnectionLogSettings,{locale:'zh'}));
   assert.match(settings,/仅 Claude/); assert.match(settings,/>全部</); assert.match(settings,/数据只存放在本机，不会上传/);
 });

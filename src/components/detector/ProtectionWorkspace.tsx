@@ -19,7 +19,7 @@ import { verificationScores, verificationItem, verificationSampleStatus, environ
 import { EnvironmentIcon } from './EnvironmentIcon';
 import { ScoreMeter } from './ScoreMeter';
 import { exitNetworkType } from '@/detection/network-type';
-import { useState, useSyncExternalStore, useRef } from 'react';
+import { useState, useSyncExternalStore } from 'react';
 import type { SignalView } from '@/detection/client-engine';
 import { windowsTimezoneFor, type ExitGeo, type ExitTarget } from '@/detection/exit-geo';
 import type { ProtectionReport } from '@/detection/protection';
@@ -105,7 +105,7 @@ export function ProtectionWorkspace(props: Props) {
   const currentExitGeo = geo?.ip && geo.ip === displayedExitIp ? geo : null;
   const networkType = exitNetworkType(currentExitGeo?.org, locale, currentExitGeo?.asn);
   const [tab, setTab] = useState('basic');
-  const transferLogRef = useRef<TransferLogHandle>(null);
+  const [transferLogHandle, setTransferLogHandle] = useState<TransferLogHandle | null>(null);
   const [settingsSection, setSettingsSection] = useState<SettingsSection | null>(null);
   const [docsOpen, setDocsOpen] = useState(false);
   const [onlyChanges, setOnlyChanges] = useState(true);
@@ -215,7 +215,7 @@ export function ProtectionWorkspace(props: Props) {
             <div className="workspace-flow-status" data-tone={kernel.tone}><span aria-hidden="true" />{kernel.conclusion.title}</div>
             <p className="workspace-flow-description">{text('以已观测连接为准，未覆盖全部系统流量', 'Observed connections only; not all system traffic')}</p>
           </div>
-          <TrafficFlow report={props.netCore} protectionEnabled={protectionEnabled} locale={locale} onDetails={() => setTab('network')} onConnection={record => { setTab('network'); transferLogRef.current?.open(record); }} onRoute={route => { setTab('network'); transferLogRef.current?.openRoute(route); }} />
+          <TrafficFlow report={props.netCore} protectionEnabled={protectionEnabled} locale={locale} onDetails={() => setTab('network')} onConnection={record => { setTab('network'); transferLogHandle?.open(record); }} onRoute={route => { setTab('network'); transferLogHandle?.openRoute(route); }} />
         </header>
         {noticeItems.length > 0 && <div className="workspace-notices" data-tone={noticeTone} role={noticeTone === 'error' ? 'alert' : 'status'} aria-live={noticeTone === 'error' ? 'assertive' : 'polite'}>
           {noticeItems.map((notice) => <div key={notice.id} className="workspace-alert" data-tone={notice.tone}>
@@ -269,7 +269,7 @@ export function ProtectionWorkspace(props: Props) {
           {Boolean(report?.issues.length) && <details className="workspace-panel workspace-details"><summary>{text('执行详情', 'Operation details')} · {report!.issues.length}</summary><ul>{report!.issues.map((issue, index) => <li key={index}>{issue}</li>)}</ul></details>}
         </div>
         <div id="panel-network" role="tabpanel" aria-labelledby="tab-network" tabIndex={0} hidden={tab !== 'network'}>
-          <NetCorePanel locale={locale} report={props.netCore} visible={tab === 'network'} transferLogRef={transferLogRef} busy={Boolean(props.netCoreBusy) || busy} error={props.netCoreError} onRefresh={props.onNetCoreRefresh} onOpenSettings={() => setSettingsSection('network')} onRestart={props.onNetCoreRestart} onSelectNode={props.onNetCoreSelect} onMeasure={props.onNetCoreMeasure} onModeChange={props.onNetCoreModeChange} measuring={props.netCoreMeasuring} delays={props.netCoreDelays} exits={props.netCoreExits ?? {}} exitsAt={props.netCoreExitsAt ?? null} probingExits={props.netCoreExiting} onProbeExits={props.onNetCoreProbeExits} exitHistory={props.netCoreExitHistory ?? null} />
+          <NetCorePanel locale={locale} report={props.netCore} visible={tab === 'network'} onTransferLogHandle={setTransferLogHandle} busy={Boolean(props.netCoreBusy) || busy} error={props.netCoreError} onRefresh={props.onNetCoreRefresh} onOpenSettings={() => setSettingsSection('network')} onRestart={props.onNetCoreRestart} onSelectNode={props.onNetCoreSelect} onMeasure={props.onNetCoreMeasure} onModeChange={props.onNetCoreModeChange} measuring={props.netCoreMeasuring} delays={props.netCoreDelays} exits={props.netCoreExits ?? {}} exitsAt={props.netCoreExitsAt ?? null} probingExits={props.netCoreExiting} onProbeExits={props.onNetCoreProbeExits} exitHistory={props.netCoreExitHistory ?? null} />
         </div>
         <div id="panel-tests" role="tabpanel" aria-labelledby="tab-tests" tabIndex={0} hidden={tab !== 'tests'}>
           <section className="workspace-panel workspace-test-overview"><div className="workspace-section-heading"><h2>{text('检测结果', 'Test results')}</h2><span className="netcore-pill">{text(`检测目录 · ${signals.length} 项`, `Test catalog · ${signals.length} items`)}</span></div><div className="workspace-test-coverage">{(['browser', 'claude'] as const).map(side => <div key={side}><strong>{side === 'browser' ? text('浏览器', 'Browser') : text('客户端', 'Client')}</strong><span>{coverageText(side)}</span></div>)}</div><p>{text('绿色表示通过，红色表示未通过；未判定与不适用分别标注。', 'Green indicates passed; red indicates not passed. Unresolved and inapplicable results are labeled separately.')}</p></section>

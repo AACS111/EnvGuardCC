@@ -58,6 +58,7 @@ export function createProtectionService({ stateDir, runtime, browserCloak, curre
     if (!kernel) return;
     const report = kernel.verifyConnection ? await kernel.verifyConnection() : await kernel.report();
     if (report.state !== "running" || report.tunEnabled !== true || report.tunCaptured !== true) throw new Error(report.reason || "隧道接管尚未验证，环境防护未生效。");
+    if (platform === 'win32' && report.claudeBlocked === true) throw new Error(report.regionLock?.reason || 'Claude 固定出口尚未验证，保持阻断。');
   };
   const browserErrors = report => [...report.results.filter(result => result.state !== "verified").map(result => result.detail), ...(report.requestProbe?.state !== "verified" ? [report.requestProbe?.detail || "浏览器实际请求尚未验证。"] : [])];
   const session = new ProtectionSession({
@@ -67,13 +68,11 @@ export function createProtectionService({ stateDir, runtime, browserCloak, curre
       const kernel = network();
       if (!kernel) return;
       previousTunnel ??= kernel.connectionState?.().tunEnabled === true;
-      // 先解除未保护阻断，否则保护自己的模拟测试会被 REJECT 规则挡住。
-      // Keep the system guard armed until setTunnel has verified takeover.
-      // Releasing and immediately rearming it adds two privileged round trips.
-      if (kernel.setUnprotectedGuard) await kernel.setUnprotectedGuard(false, { deferRelease: true });
+      // Windows 只在明确开启保护、隧道和所选出口验证后放行 Claude。
+      if (platform !== 'win32' && kernel.setUnprotectedGuard) await kernel.setUnprotectedGuard(false, { deferRelease: true });
       signal?.throwIfAborted();
       unprotectedBlock = { active: false, error: null };
-      await kernel.setTunnel(true, { ensureHost: true });
+      await kernel.setTunnel(true, platform === 'win32' ? { ensureHost: true, protectClaude: true } : { ensureHost: true });
       signal?.throwIfAborted();
       await assertNetwork();
     },

@@ -78,11 +78,12 @@ async function unusedPort() {
   return port;
 }
 
-export function browserNetworkArgs(proxy = selectedProxy()) {
+export function browserNetworkArgs(proxy = selectedProxy(), { protectedWeb = false } = {}) {
   if (!proxy) return [];
   if (proxy.url.username || proxy.url.password) throw new Error("隔离浏览器暂不支持带认证的上游代理，请使用本机 HTTP 混合代理端口。");
   return [
     `--proxy-server=${proxy.url.origin}`, "--disable-quic",
+    ...(protectedWeb ? ['--proxy-bypass-list=<-loopback>;localhost;127.0.0.1;[::1]', '--force-webrtc-ip-handling-policy=disable_non_proxied_udp'] : []),
     `--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE ${proxy.url.hostname}, EXCLUDE localhost, EXCLUDE 127.0.0.1, EXCLUDE [::1]`,
   ];
 }
@@ -110,7 +111,15 @@ async function clearStaleManaged(pidFile) {
 
 export class EnvironmentRuntime {
   clients = new Map(); policy = {}; loaded = false; enabled = true;
-  constructor({ stateDir, browserPath, browserPathProvider, headless = false, networkProxy }) { this.stateDir = stateDir; this.browserPath = browserPath; this.browserPathProvider = browserPathProvider; this.headless = headless; this.networkProxy = networkProxy; }
+  constructor({ stateDir, browserPath, browserPathProvider, headless = false, networkProxy, protectedWebProxy }) { this.stateDir = stateDir; this.browserPath = browserPath; this.browserPathProvider = browserPathProvider; this.headless = headless; this.networkProxy = networkProxy; this.protectedWebProxy = protectedWebProxy; }
+
+  proxyFor(kind) {
+    if (kind !== 'web' || !this.protectedWebProxy) return this.networkProxy === undefined ? selectedProxy() : this.networkProxy;
+    let url;
+    try { url = new URL(this.protectedWebProxy()); } catch { /* Fail closed below. */ }
+    if (url?.protocol !== 'http:' || url.hostname !== '127.0.0.1' || !url.port || url.username || url.password || url.href !== `${url.origin}/`) throw new Error('受保护浏览器需要有效的本机内核代理。');
+    return { url };
+  }
   // macOS 的浏览器清单给的是 .app bundle；直接 spawn bundle 会 EACCES。接入时解析到真正的可执行文件。
   // 受管浏览器由偏好决定：provider 优先，其次显式路径，最后才回退到默认候选。
   async managedBrowser() {
@@ -135,6 +144,7 @@ export class EnvironmentRuntime {
     return `(() => { const u = new URL(location.href); if (u.hostname === 'claude.ai' || u.hostname.endsWith('.claude.ai') || u.origin === ${JSON.stringify(origin)} || u.protocol === 'file:') return ${install}; return null; })()`;
   }
   async launch(kind, origin) {
+    const networkProxy = this.proxyFor(kind);
     const startPage = this.headless ? "about:blank" : "https://www.google.com/";
     const profile = path.join(this.stateDir, `protected-${kind}`);
     await mkdir(profile, { recursive: true });
@@ -146,8 +156,7 @@ export class EnvironmentRuntime {
       await rm(path.join(profile, "Default", name), { force: true }).catch(() => {});
     }
     // Use the same real upstream as the gateway, without sending proxy credentials to argv.
-    const networkProxy = this.networkProxy === undefined ? selectedProxy() : this.networkProxy;
-    const networkArgs = browserNetworkArgs(networkProxy);
+    const networkArgs = browserNetworkArgs(networkProxy, { protectedWeb: kind === 'web' && Boolean(this.protectedWebProxy) });
     let client, child, spawnError;
     // 受管浏览器由偏好决定；provider 可返回路径或 { id, path }。
     const chosen = kind === "web" ? await this.managedBrowser() : null;
@@ -274,7 +283,7 @@ export class EnvironmentRuntime {
           this.clients.delete(kind);
           existing = undefined;
         }
-        const proxy = this.networkProxy === undefined ? selectedProxy() : this.networkProxy;
+        const proxy = this.proxyFor(kind);
         if (existing && existing.networkKey !== (proxy?.url.href || null)) {
           await stopManagedProcess(existing.child);
           existing.client.disconnect();

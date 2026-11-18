@@ -27,12 +27,18 @@ function Test-GuardValues($actual, $expected, $addresses = $false) {
 }
 function Test-GuardRule($rule, $program, $package, $protocol, $port, $addresses) {
   if (!$rule -or $rule.Enabled -ne 'True' -or $rule.Action -ne 'Block' -or $rule.Direction -ne 'Outbound' -or $rule.Profile -ne 'Any') { return $false }
+  $filterWatch = [Diagnostics.Stopwatch]::StartNew()
+  try {
   $app = $rule | Get-NetFirewallApplicationFilter -ErrorAction Stop
   $addr = $rule | Get-NetFirewallAddressFilter -ErrorAction Stop
   $ports = $rule | Get-NetFirewallPortFilter -ErrorAction Stop
   $service = $rule | Get-NetFirewallServiceFilter -ErrorAction Stop
   $iface = $rule | Get-NetFirewallInterfaceTypeFilter -ErrorAction Stop
   $alias = $rule | Get-NetFirewallInterfaceFilter -ErrorAction Stop
+  } finally {
+    $script:guardFilterMs = [long]$script:guardFilterMs + $filterWatch.ElapsedMilliseconds
+    $script:guardFilterRules = [long]$script:guardFilterRules + 1
+  }
   $actualPackage = if ([string]::IsNullOrEmpty($app.Package)) { 'Any' } else { $app.Package }
   $actualProtocol = [string]$ports.Protocol
   if ($actualProtocol -eq '256') { $actualProtocol = 'Any' }

@@ -6,14 +6,74 @@ import { mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import {
-  CLAUDE_GUARD_GROUP_PREFIX, claudeGuardSpecs, claudeGuardArmScript, claudeGuardReleaseScript,
+  CLAUDE_GUARD_GROUP_PREFIX, claudeGuardSpecs, claudeGuardArmScript, claudeGuardReleaseScript, claudeGuardCountsScript,
   createClaudeGuard, discoverClaudeTargets, guardGroupName, hostsBlockText, hostsBlocked, mergeClaudeGuardTargets, stripHostsBlock,
   CLAUDE_GUARD_DOMAINS, CLAUDE_DIRECT_BLOCK_ADDRESSES, claudeDirectSpecs, PACKAGE_SID_SCRIPT, enableFirewallScript,
 } from "../scripts/net-core/claude-guard.mjs";
 
 const token = "testtoken01";
 const ruleCount = script => (script.match(/New-NetFirewallRule -PolicyStore/g) ?? []).length;
+
+test('撤防规则核验失败时保留 hosts 阻断并记录失败阶段', async () => {
+  let content = '', rejectRelease = false;
+  const logs = [];
+  const guard = createClaudeGuard({ platform: 'win32', hostsPath: 'mock-hosts', logger: line => logs.push(line),
+    readText: async () => content, writeText: async (_file, next) => { content = next; },
+    exec: async (_file, args) => {
+      if (rejectRelease) throw new Error('direct verification failed');
+      return { stdout: JSON.stringify({ count: ruleCount(args.at(-1)) }) };
+    },
+  });
+  await guard.arm({ token, programs: ['C:/Claude.exe'] });
+  rejectRelease = true;
+  await assert.rejects(guard.release({ keepDirect: true }), /direct verification failed/);
+  assert.equal(hostsBlocked(content), true, '规则核验失败不能先清除浏览器 hosts 保护');
+  assert.ok(logs.some(line => /release.*rules.*failed.*ms=/.test(line)), '失败日志需要规则阶段耗时');
+});
+
+test('PowerShell 非零退出仍记录白名单计时，不输出异常中的凭证或完整脚本', async () => {
+  const logs = [];
+  const guard = createClaudeGuard({ platform: 'win32', hostsPath: null, logger: line => logs.push(line),
+    exec: async () => { throw Object.assign(new Error('failed'), { stderr: '[guard-timing] body-ms=12 filter-ms=7 filter-rules=2\nsecret=do-not-log' }); },
+  });
+  await assert.rejects(guard.arm({ token, programs: ['C:/Claude.exe'] }));
+  assert.ok(logs.some(line => /body-ms=12 filter-ms=7 filter-rules=2/.test(line)));
+  assert.equal(logs.some(line => line.includes('do-not-log')), false);
+});
+
+test('实际 PowerShell 核对过滤器漂移：巡检拒绝误报，撤防拒绝放行', { skip: process.platform !== 'win32' }, () => {
+  const specs = claudeDirectSpecs({ token, programs: ['C:/Claude.exe'] });
+  const group = specs[0].group;
+  const name = `${group}-${createHash('sha256').update(JSON.stringify(specs[0])).digest('hex').slice(0, 24)}`;
+  for (const field of ['program', 'address', 'protocol', 'service', 'interface']) {
+    const prelude = `
+$global:removed = $false
+function Get-Service { [pscustomobject]@{ Status = 'Running' } }
+function Get-NetFirewallProfile { 1..3 | ForEach-Object { [pscustomobject]@{ Enabled = 'True'; AllowLocalFirewallRules = 'True' } } }
+function Get-NetFirewallRule { param($Group, $PolicyStore, $ErrorAction)
+  if ('${group}' -in $Group) { [pscustomobject]@{ Name = '${name}'; Enabled = 'True'; Action = 'Block'; Direction = 'Outbound'; Profile = 'Any' } }
+}
+function Get-NetFirewallApplicationFilter { [pscustomobject]@{ Program = '${field === 'program' ? 'C:/Other.exe' : 'C:/Claude.exe'}'; Package = 'Any' } }
+function Get-NetFirewallAddressFilter { [pscustomobject]@{ RemoteAddress = @(${(field === 'address' ? ['127.0.0.1'] : CLAUDE_DIRECT_BLOCK_ADDRESSES).map(value => `'${value}'`).join(',')}); LocalAddress = 'Any' } }
+function Get-NetFirewallPortFilter { [pscustomobject]@{ Protocol = '${field === 'protocol' ? 'TCP' : 'Any'}'; LocalPort = 'Any'; RemotePort = 'Any' } }
+function Get-NetFirewallServiceFilter { [pscustomobject]@{ Service = '${field === 'service' ? 'OtherService' : 'Any'}' } }
+function Get-NetFirewallInterfaceTypeFilter { [pscustomobject]@{ InterfaceType = 'Any' } }
+function Get-NetFirewallInterfaceFilter { [pscustomobject]@{ InterfaceAlias = '${field === 'interface' ? 'WLAN' : 'Any'}' } }
+function Set-NetFirewallRule { throw 'repair denied' }
+function New-NetFirewallRule { throw 'repair denied' }
+function Remove-NetFirewallRule { param($Group, $ErrorAction) $global:removed = $true }
+`;
+    const status = claudeGuardCountsScript([{ group, specs }]);
+    const release = claudeGuardReleaseScript(guardGroupName(token), { directGroup: group, directSpecs: specs });
+    const source = `${prelude}\n$counts = (& { ${status} } | ConvertFrom-Json)\n$accepted = $false\ntry { & { ${release} } | Out-Null; $accepted = $true } catch {}\nConvertTo-Json -Compress -InputObject @{ count = $counts.'${group}'; accepted = $accepted; removed = $global:removed }`;
+    const result = JSON.parse(execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', source], { windowsHide: true, timeout: 20000, encoding: 'utf8' }));
+    assert.equal(result.count, 0, `${field} 漂移必须被巡检识别`);
+    assert.equal(result.accepted, false, `${field} 修复失败必须拒绝撤防`);
+    assert.equal(result.removed, false, `${field} 未确认前不能删除临时阻断`);
+  }
+});
 
 test('常驻桌面规则覆盖全部端口和 IPv6，IPv4 仅放行 loopback 与配置的 fake-IP', () => {
   const specs = claudeDirectSpecs({ token, programs: ['C:/Claude.exe'], packages: ['Claude_family'] });
@@ -47,11 +107,19 @@ test('允许隧道后仍保留常驻规则，宿主重启恢复规则，明确�
       const created = [...script.matchAll(/New-NetFirewallRule[^\n]+?-Group '([^']+)'/g)].filter(match => match[1] === group).length;
       if (created) groups.set(group, created);
     }
-    const removed = script.match(/Remove-NetFirewallRule -Group '([^']+)'/);
-    if (removed) groups.delete(removed[1]);
-    const query = script.match(/Get-NetFirewallRule -Group ([^\n]+?) -(?:PolicyStore|ErrorAction)/)?.[1] ?? '';
-    const queried = [...query.matchAll(/'([^']+)'/g)].map(match => match[1]);
-    return { stdout: JSON.stringify({ count: queried.reduce((count, group) => count + (groups.get(group) ?? 0), 0) }) };
+    for (const removed of script.matchAll(/Remove-NetFirewallRule -Group '([^']+)'/g)) groups.delete(removed[1]);
+    const queried = [...new Set([...script.matchAll(/Get-NetFirewallRule -Group ([^\n]+?) -(?:PolicyStore|ErrorAction)/g)]
+      .flatMap(match => [...match[1].matchAll(/'([^']+)'/g)].map(item => item[1])))];
+    const count = group => groups.get(group) ?? 0;
+    // 合并撤防脚本同时回读常驻组与全阻断组。
+    if (script.includes('directCount = $directCount')) {
+      const directGroup = queried.find(group => group.endsWith('-Direct'));
+      const group = queried.find(item => !item.endsWith('-Direct'));
+      return { stdout: JSON.stringify({ count: count(group), directCount: count(directGroup) }) };
+    }
+    // 多分组回读脚本按分组返回，单个脚本仍返回总数。
+    if (/\$count0/.test(script)) return { stdout: JSON.stringify(Object.fromEntries(queried.map(group => [group, count(group)]))) };
+    return { stdout: JSON.stringify({ count: queried.reduce((total, group) => total + count(group), 0) }) };
   };
   const options = { platform: 'win32', stateDir, hostsPath: null, exec };
   const guard = createClaudeGuard(options);
@@ -100,23 +168,35 @@ test('撤防复核常驻规则，正确时不重写；被删后先修复，修�
   let missing = false, repairFails = false;
   const guard = createClaudeGuard({ platform: 'win32', hostsPath: null, exec: async (_file, args) => {
     const script = args.at(-1); calls.push(script);
-    if (script.includes('New-NetFirewallRule')) return { stdout: JSON.stringify({ count: repairFails ? 0 : ruleCount(script) }) };
+    // 合并撤防脚本：先核对/补齐常驻规则，不足时在脚本内抛错，不会走到删除。
+    if (script.includes('directCount = $directCount')) {
+      if (repairFails) throw new Error('常驻桌面阻断未确认，拒绝撤防。');
+      return { stdout: JSON.stringify({ count: 0, directCount: 1 }) };
+    }
+    if (script.includes('New-NetFirewallRule')) return { stdout: JSON.stringify({ count: ruleCount(script) }) };
     if (script.includes('Remove-NetFirewallRule')) return { stdout: '{"count":0}' };
     return { stdout: JSON.stringify({ count: missing ? 0 : 1 }) };
   } });
   await guard.arm({ token, programs: ['C:/Claude.exe'] });
   calls.length = 0;
   await guard.release({ keepDirect: true });
-  assert.equal(calls.some(script => script.includes('New-NetFirewallRule')), false);
+  assert.equal(calls.length, 1, '常驻核对与全阻断删除共用一个 PowerShell 进程');
+  // 补齐只在回读不足的条件块里，规则完整时不会重写。
+  const guardStart = calls[0].indexOf('if ($directCount -lt 1) {'), guardNew = calls[0].indexOf('New-NetFirewallRule');
+  assert.ok(guardStart >= 0 && guardNew > guardStart, '补齐只在回读不足的条件块里，规则完整时不会重写');
   assert.equal(guard.snapshot().directProtected, true);
   missing = true; calls.length = 0;
   await guard.release({ keepDirect: true });
-  const repaired = calls.findIndex(script => script.includes('New-NetFirewallRule'));
-  assert.ok(repaired >= 0);
-  assert.ok(calls.findIndex(script => script.includes('Remove-NetFirewallRule')) > repaired);
+  const script = calls[0];
+  const repair = script.indexOf('New-NetFirewallRule');
+  assert.ok(repair >= 0, '常驻规则缺失时先补齐');
+  assert.ok(script.indexOf('Remove-NetFirewallRule') > repair, '先修复常驻规则，再删除全阻断');
   repairFails = true; calls.length = 0;
-  await assert.rejects(guard.release({ keepDirect: true }), /拒绝放行/);
-  assert.equal(calls.some(script => script.includes('Remove-NetFirewallRule')), false);
+  await assert.rejects(guard.release({ keepDirect: true }), /拒绝放行|拒绝撤防/);
+  assert.equal(calls.length, 1);
+  const blocking = calls[0];
+  assert.ok(blocking.includes("throw '常驻桌面阻断未确认，拒绝撤防。'"), '补齐失败时脚本自身抛错');
+  assert.ok(blocking.indexOf('throw') < blocking.indexOf('Remove-NetFirewallRule'), '抛错在删除全阻断之前');
 });
 
 test('安装多个客户端版本时按原分组执行，避免合并超过 Windows 命令行长度', async () => {
@@ -137,6 +217,22 @@ test('Windows 原生解析器接受合并规则脚本，不执行防火墙操作
   const encoded = Buffer.from(source).toString('base64');
   const parse = `$tokens = $null; $errors = $null; [void][System.Management.Automation.Language.Parser]::ParseInput([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${encoded}')), [ref]$tokens, [ref]$errors); if ($errors.Count) { throw ($errors | Out-String) }; 'parsed'`;
   assert.equal(execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', parse], { windowsHide: true, timeout: 20000, encoding: 'utf8' }).trim(), 'parsed');
+});
+
+test('多分组巡检脚本与合并撤防脚本都能被 Windows 原生解析器接受', { skip: process.platform !== 'win32' }, () => {
+  const selectors = { token, programs: ["C:/Claude's App/Claude.exe"], packages: ['Claude_family'] };
+  const scripts = [
+    claudeGuardCountsScript([
+      { group: guardGroupName(token), specs: claudeGuardSpecs(selectors) },
+      { group: `${guardGroupName(token)}-Direct`, specs: claudeDirectSpecs(selectors) },
+    ]),
+    claudeGuardReleaseScript(guardGroupName(token), { directGroup: `${guardGroupName(token)}-Direct`, directSpecs: claudeDirectSpecs(selectors) }),
+  ];
+  for (const source of scripts) {
+    const encoded = Buffer.from(source).toString('base64');
+    const parse = `$tokens = $null; $errors = $null; [void][System.Management.Automation.Language.Parser]::ParseInput([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${encoded}')), [ref]$tokens, [ref]$errors); if ($errors.Count) { throw ($errors | Out-String) }; 'parsed'`;
+    assert.equal(execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', parse], { windowsHide: true, timeout: 20000, encoding: 'utf8' }).trim(), 'parsed');
+  }
 });
 
 test('防火墙回读缺失 count 时拒绝把未知当作零条规则', async () => {

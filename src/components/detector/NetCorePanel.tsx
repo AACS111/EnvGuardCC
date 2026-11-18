@@ -1,6 +1,6 @@
 "use client";
 // 网络页展示出口证据和常用操作；低频配置统一由设置弹窗管理。
-import { useId, useRef, useState, type Ref } from "react";
+import { useCallback, useId, useRef, useState } from "react";
 import type { LocaleCode } from "@/i18n/messages";
 import type { ExitHistory, NetCoreExit, NetCoreReport } from "@/detection/gateway-check";
 import { netCoreView, nodeLatencyTone, nodeSelectionState, visibleViolations } from "@/detection/net-core-view.mjs";
@@ -13,7 +13,7 @@ type Props = {
   locale: LocaleCode;
   report: NetCoreReport | null;
   visible?: boolean;
-  transferLogRef?: Ref<TransferLogHandle>;
+  onTransferLogHandle?: (handle: TransferLogHandle | null) => void;
   busy?: boolean;
   error?: string;
   onRefresh: () => void;
@@ -64,7 +64,7 @@ const exitRegion = (name: string, exit: { countryCode: string | null; country: s
 export function NetCorePanel({
   locale, report, busy = false, error, onRefresh, onRestart, onSelectNode, onOpenSettings,
   onMeasure, measuring = false, delays = {}, exits = {}, exitsAt = null, onProbeExits, probingExits = false,
-  onModeChange, exitHistory = null, visible = true, transferLogRef,
+  onModeChange, exitHistory = null, visible = true, onTransferLogHandle,
 }: Props) {
   const zh = locale.startsWith("zh");
   const text = (cn: string, en: string) => zh ? cn : en;
@@ -77,8 +77,31 @@ export function NetCorePanel({
   const ipv6Issue = Boolean(ipv6 && !ipv6.protected && ipv6.system !== 'disabled');
   const view = netCoreView(report, { locale, exitHistory });
   const { items: violations, hidden } = visibleViolations(view, 20);
+  // 出口历史：每个 IP 标注该期间结束的 Claude 请求；点击回放到该时间点。
+  const exitEntries = exitHistory?.entries ?? [];
+  // 同一出口 IP 可能出现多次；合并为一个 tag，请求数相加，时间取最近一次。
+  const exitTags = (() => {
+    const merged = new Map<string, { ip: string; at: string; countryCode?: string | null; requests: number }>();
+    for (const entry of exitEntries) {
+      const current = merged.get(entry.ip);
+      if (!current) merged.set(entry.ip, { ip: entry.ip, at: entry.at, countryCode: entry.countryCode, requests: entry.requests ?? 0 });
+      else {
+        current.requests += entry.requests ?? 0;
+        if (entry.countryCode) current.countryCode = entry.countryCode;
+        if (Date.parse(entry.at) >= Date.parse(current.at)) current.at = entry.at;
+      }
+    }
+    return [...merged.values()];
+  })();
+  const claudeRequests = exitTags.reduce((sum, entry) => sum + entry.requests, 0);
   // 代理范围会影响新连接的路由；确认后热加载，已有连接可能沿用原路径。
   const [pendingMode, setPendingMode] = useState<Mode | null>(null);
+  // 出口历史需要主动打开传输记录；用状态保存句柄，避免在渲染期读取 ref。
+  const [transferLogHandle, setTransferLogHandle] = useState<TransferLogHandle | null>(null);
+  const attachTransferLog = useCallback((handle: TransferLogHandle | null) => {
+    setTransferLogHandle(handle);
+    onTransferLogHandle?.(handle);
+  }, [onTransferLogHandle]);
   const [pendingNode, setPendingNode] = useState<{ name: string; from: string | null; sourceId: string | null } | null>(null);
   const nodeTrigger = useRef<HTMLButtonElement | null>(null);
   const measureHelpId = useId();
@@ -200,7 +223,7 @@ export function NetCorePanel({
               {activeSource && <span className="netcore-source-name">{activeSource.name}</span>}
             </h3>
             <div className="netcore-block__actions netcore-probe-actions">
-              <span className="netcore-action-help"><button type="button" className="repair-button repair-button--quiet" aria-describedby={measureHelpId} onClick={onMeasure} disabled={busy || measuring || !view.actions.canSelect}>{measuring ? text("测速中…", "Measuring…") : text("测速", "Measure")}</button><span id={measureHelpId} role="tooltip" className="netcore-action-tooltip">{text('测量节点访问检测地址的响应延迟（毫秒），用于比较连接快慢，不是下载带宽测速。', 'Measure response latency to a test endpoint in milliseconds to compare nodes. This is not a download bandwidth test.')}</span></span>
+              <span className="netcore-action-help"><button type="button" className="repair-button repair-button--quiet" aria-describedby={measureHelpId} onClick={onMeasure} disabled={busy || measuring || !view.actions.canSelect}>{measuring ? text("测速中…", "Measuring…") : text("测速", "Measure")}</button><span id={measureHelpId} role="tooltip" className="netcore-action-tooltip">{text('测量节点访问检测地址的往返延迟（毫秒）。', 'Measure the node’s round-trip latency to the test endpoint in milliseconds.')}</span></span>
               {onProbeExits && <span className="netcore-action-help"><button type="button" className="repair-button repair-button--quiet" aria-describedby={exitHelpId} onClick={onProbeExits} disabled={busy || probingExits || !view.actions.canSelect}>{probingExits ? text("检测出口中…", "Probing exits…") : text("检测出口", "Probe exits")}</button><span id={exitHelpId} role="tooltip" className="netcore-action-tooltip">{text('通过各节点查询实际出口 IP 与地区，完成后显示在节点卡片中；不以节点名称推断。', 'Query each node’s actual exit IP and region and show them on its card. The node name is not used to infer its exit.')}</span></span>}
             </div>
           </div>
@@ -264,7 +287,7 @@ export function NetCorePanel({
 
       </div>
       <div className="netcore-stack">
-        <TransferLog locale={locale} visible={visible} controllerRef={transferLogRef} />
+        <TransferLog locale={locale} visible={visible} controllerRef={attachTransferLog} />
         <section className="netcore-block" aria-label={text('连接保护', 'Connection protection')}>
           <div className="netcore-block__head"><h3>{text('连接保护', 'Connection protection')}</h3></div>
           <dl className="workspace-fields">
@@ -279,12 +302,27 @@ export function NetCorePanel({
             <h3>{text("出口稳定性", "Exit stability")}<span className="netcore-state-pill" data-tone={view.exitStability.stable ? "ok" : "warn"}>{view.exitStability.stable ? text("稳定", "Stable") : text("存在漂移", "Drifting")}</span></h3>
           </div>
           <p className="netcore-detail">{text(
-            `近 ${view.exitStability.windowHours} 小时出口 IP 变化 ${view.exitStability.changes} 次，当前 ${view.exitStability.current ?? exitIp ?? "—"}。`,
-            `Exit IP changed ${view.exitStability.changes} time(s) in the last ${view.exitStability.windowHours}h; current ${view.exitStability.current ?? exitIp ?? "—"}.`,
+            `近 ${view.exitStability.windowHours} 小时出口 IP 变化 ${view.exitStability.changes} 次${claudeRequests > 0 ? `，Claude 请求 ${claudeRequests} 次` : ""}，当前 ${view.exitStability.current ?? exitIp ?? "—"}。`,
+            `Exit IP changed ${view.exitStability.changes} time(s)${claudeRequests > 0 ? ` and ${claudeRequests} Claude request(s) were sent` : ""} in the last ${view.exitStability.windowHours}h; current ${view.exitStability.current ?? exitIp ?? "—"}.`,
           )}{!view.exitStability.stable && text(" 频繁变化可能让 Claude 重新验证登录，也可能只是节点故障转移。", " Frequent changes may trigger a login re-check, or may just be node failover.")}</p>
-          {(exitHistory?.ips?.length ?? 0) > 0 && <details className="netcore-history">
+          {(exitTags.length > 0 || (exitHistory?.ips?.length ?? 0) > 0) && <details className="netcore-history">
             <summary>{text("查看记录", "View history")}</summary>
-            <ul>{exitHistory!.ips.map((ip) => <li key={ip}>{ip}{ip === exitHistory!.current ? text(" · 当前", " · current") : ""}</li>)}</ul>
+            <ul>{exitTags.length > 0 ? exitTags.map((entry) => {
+              const requests = entry.requests ?? 0;
+              const support = claudeRegionSupport(entry.countryCode);
+              const regionTone = support === "supported" ? "ok" : support === "unsupported" ? "danger" : "muted";
+              const regionNote = support === "supported" ? text("Claude 支持地区", "Claude supported region") : support === "unsupported" ? text("Claude 不支持地区", "Claude unsupported region") : null;
+              // 0 次不占版面：只有真实发生过 Claude 请求的出口才显示次数徽标。
+              const requestNote = requests > 0 ? text(`Claude 请求 ${requests} 次`, `${requests} Claude request(s)`) : null;
+              return <li key={`${entry.ip}-${entry.at}`} data-claude={requests > 0 ? "true" : "false"}>
+                <button type="button" className="netcore-history__pill" data-tone={regionTone} onClick={() => transferLogHandle?.openAt(entry.at)} title={[entry.countryCode ? entry.countryCode : text("地区未知", "Region unknown"), regionNote, requestNote].filter(Boolean).join(" · ")}>
+                  <span className="netcore-history__address">{entry.ip}</span>
+                  {requests > 0 && <span className="netcore-history__requests">{requests}</span>}
+                  {entry.ip === exitHistory!.current && <span className="netcore-history__current">{text("当前", "current")}</span>}
+                </button>
+              </li>;
+            }) : exitHistory!.ips.map((ip) => <li key={ip}>{ip}{ip === exitHistory!.current ? text(" · 当前", " · current") : ""}</li>)}</ul>
+            {exitTags.length > 0 && <p className="netcore-history__hint">{text("点击任一出口，回看该时段的传输记录。", "Select an exit to replay transfer records from that period.")}</p>}
           </details>}
         </section>}
 

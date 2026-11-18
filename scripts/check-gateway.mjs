@@ -397,7 +397,7 @@ test("内核订阅刷新接口：到期跳过与强制刷新都能如实返回",
 
 test("诊断接口附带出口历史，且不因历史文件缺失而失败", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "checkcc-exithist-"));
-  const gateway = createGateway({ collect: async () => ({ exit: { primary: { ip: "8.8.8.8" }, sources: [] } }), stateDir: directory });
+  const gateway = createGateway({ collect: async () => ({ exit: { primary: { ip: "8.8.8.8", countryCode: "US" }, sources: [] } }), stateDir: directory });
   const url = await listen(gateway);
   try {
     for (const expected of [0, 0]) {
@@ -407,8 +407,50 @@ test("诊断接口附带出口历史，且不因历史文件缺失而失败", as
     }
     const stored = JSON.parse(await readFile(path.join(directory, "exit-history.json"), "utf8"));
     assert.equal(stored.entries[0].ip, "8.8.8.8");
+    assert.equal(stored.entries[0].countryCode, "US");
   } finally {
     await close(gateway);
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('出口历史不把同一时段的 Claude 连接或请求猜成该 IP 的流量', async () => {
+  const { createConnectionLog } = await import('./net-core/connection-log.mjs');
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'checkcc-exit-attribution-'));
+  const at = Date.now() - 60000;
+  const log = await createConnectionLog({ stateDir: directory, now: () => at });
+  const observed = [
+    { ip: '203.0.113.10', at: at - 1000, countryCode: 'CN' },
+    { ip: '198.51.100.20', at: at + 1000, countryCode: 'US' },
+  ];
+  const gateway = createGateway({
+    stateDir: directory,
+    netCore: { report: async () => ({ state: 'running' }), connectionLog: log },
+    collect: async () => ({ exit: { primary: { ip: '198.51.100.20', countryCode: 'US' } } }),
+  });
+  const url = await listen(gateway);
+  try {
+    await writeFile(path.join(directory, 'exit-history.json'), JSON.stringify({ entries: observed }));
+    await log.sample(Array.from({ length: 5 }, (_, index) => ({
+      id: `claude-${index}`, metadata: { host: 'api.anthropic.com' },
+      chains: ['US-NODE', 'CLAUDE-PIN'], upload: 100, download: 200,
+    })));
+    const id = await log.beginRequest({ method: 'POST', endpoint: '/v1/messages', host: 'api.anthropic.com', port: 443 });
+    await log.finishRequest(id, { status: 200, upload: 100, download: 200 });
+    await log.stop();
+    for (const endpoint of ['/__checkcc/diagnostics?signal=country', '/__checkcc/net-core']) {
+      const response = await fetch(url + endpoint, { headers: ui });
+      assert.equal(response.status, 200);
+      const { exitHistory } = await response.json();
+      assert.equal(exitHistory.changes, 1);
+      assert.equal(exitHistory.current, '198.51.100.20');
+      assert.deepEqual(exitHistory.entries, observed.map(entry => ({ ...entry, at: new Date(entry.at).toISOString() })),
+        '公网出口未经逐条确认，不能按时间窗附加请求数或连接数');
+    }
+    assert.equal((await log.list({ claude: true })).total, 6, '未归属出口的记录仍可在传输记录中查看');
+  } finally {
+    await close(gateway);
+    await log.stop();
     await rm(directory, { recursive: true, force: true });
   }
 });

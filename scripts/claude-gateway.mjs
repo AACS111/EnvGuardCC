@@ -143,6 +143,7 @@ export function createGateway({ upstreamBase = "https://api.anthropic.com", prof
   const upstream = new URL(upstreamBase);
   if (!["http:", "https:"].includes(upstream.protocol) || upstream.username || upstream.password || upstream.search || upstream.hash) throw new Error("CHECKCC_UPSTREAM 必须是无凭证、无查询参数的 HTTP(S) 地址。");
   const probeTargets = new Map();
+  // 出口探测仅证明探测请求的出口；传输记录没有逐条公网出口证据，不能按时间窗猜测归属。
   // 内核状态 + 出口历史：两者都不依赖网络探测，可以随只读接口一起返回。
   const kernelPayload = async () => {
     const report = await Promise.resolve(netCore?.report()).catch((error) => ({ state: "unavailable", reason: error.message }));
@@ -517,7 +518,7 @@ export function createGateway({ upstreamBase = "https://api.anthropic.com", prof
               if (typeof netCore.setTunnel !== "function") { ok = false; reason = "本次启动未支持单独的 TUN 开关。"; }
               else await netCore.setTunnel(kernelValue.enabled, { ensureHost: true });
             }
-            else if (action === "stop") await netCore.stop();
+            else if (action === "stop") await netCore.stop({ keepClaudeGuard: true });
             else if (action === "restart") { ok = await netCore.restart(); }
             else ok = await netCore.select(node);
           } catch (error) { ok = false; reason = error.message; }
@@ -606,9 +607,10 @@ export function createGateway({ upstreamBase = "https://api.anthropic.com", prof
           Object.assign(report, signalId ? await collect(upstream, { signalId }) : await networkDiagnostics());
           // 出口 IP 历史：只记录观测，不参与打分；变化次数由界面展示。
           const exitIp = report.exit?.primary?.ip;
-          report.exitHistory = exitIp
-            ? await recordExit(stateDir, exitIp).catch(() => null)
+          const exitHistory = exitIp
+            ? await recordExit(stateDir, exitIp, { countryCode: report.exit?.primary?.countryCode ?? null }).catch(() => null)
             : await readExitHistory(stateDir).catch(() => null);
+          report.exitHistory = exitHistory;
           if (!signalId || ["edgeCountry", "edgeCity", "edgeColo"].includes(signalId)) {
             report.edge = await collectEdgeTrace();
             report.testedSignals = [...(report.testedSignals ?? []), "edgeCountry", "edgeCity", "edgeColo"];

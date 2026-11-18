@@ -51,8 +51,10 @@ export function regionOfNode(node) {
 }
 
 /** 按国别码取解析器；未知地区退回 anycast DoH。 */
-export function publicDnsForCountry(code) {
-  return REGION_SERVERS[String(code ?? "").toUpperCase()] ?? ANYCAST_DOH;
+export function publicDnsForCountry(code, { preferTcp = false } = {}) {
+  const servers = REGION_SERVERS[String(code ?? "").toUpperCase()] ?? ANYCAST_DOH;
+  // 部分节点的 UDP 转发不可用；TCP 仍使用同一地区、同一固定代理出口。
+  return preferTcp ? servers.map(server => server.includes('://') ? server : `tcp://${server}`) : [...servers];
 }
 
 // 按节点服务器 IP 缓存实测结果，避免每次重建配置都探一次。

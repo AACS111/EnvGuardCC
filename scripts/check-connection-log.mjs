@@ -1,6 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs/promises';
 import { mkdtemp, readFile, writeFile, rm, readdir } from 'node:fs/promises';
+import { syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { createConnectionLog, CONNECTION_RETENTION_MS, CONNECTION_MAX_ENTRIES, CONNECTION_MAX_BYTES } from './net-core/connection-log.mjs';
@@ -15,6 +17,21 @@ async function fixture(t, options = {}) {
   return { dir, file: path.join(dir, 'net-core-connections.json'), log, advance: ms => { at += ms; } };
 }
 const finish = async f => { f.advance(1000); await f.log.sample([]); f.advance(1000); await f.log.sample([]); };
+function recordRetries() {
+  const retries = [];
+  const scheduler = {
+    after(callback, delay) {
+      const retry = { callback, delay };
+      retries.push(retry);
+      return retry;
+    },
+    cancel(retry) {
+      const index = retries.indexOf(retry);
+      if (index !== -1) retries.splice(index, 1);
+    },
+  };
+  return { scheduler, retries };
+}
 
 test('每秒采样按 id 合并，活动只放内存，两次缺失收尾，字节不倒退', async t => {
   const f = await fixture(t);
@@ -141,6 +158,185 @@ test('清空使未完成的旧采样失效；网络失败不作为空快照结�
   assert.equal((await f.log.list()).stats.ended, 1);
 });
 
+test('采样失败退避有上限，错误只记分类，恢复后立即回到正常采样', async t => {
+  let fail = true, calls = 0;
+  const logs = [];
+  const f = await fixture(t, { logger: message => logs.push(message), readConnections: async () => {
+    calls++;
+    if (fail) throw Object.assign(new Error('http://user:SECRET@127.0.0.1/private?token=SECRET'), { code: 'ECONNREFUSED' });
+    return [connection('live')];
+  } });
+  await f.log.sample([connection('existing')]);
+  await f.log.tick();
+  assert.equal(calls, 1);
+  assert.match(logs[0], /ECONNREFUSED/);
+  assert.doesNotMatch(logs.join('\n'), /SECRET|private|user:/);
+  f.advance(1000); await f.log.tick(); assert.equal(calls, 1, '首轮失败后不能继续每秒请求');
+  f.advance(1000); await f.log.tick(); assert.equal(calls, 2);
+  assert.equal(logs.length, 1, '相同错误连续失败不刷屏');
+  assert.equal((await f.log.list()).stats.active, 1, '失败不能结束已有连接');
+  for (let i = 0; i < 6; i++) { f.advance(30000); await f.log.tick(); }
+  const before = calls;
+  fail = false; f.advance(30000); await f.log.tick();
+  assert.equal(calls, before + 1, '退避不超过30秒');
+  assert.ok(logs.some(line => line.includes('采样已恢复') && line.includes('连续失败')));
+  f.advance(1000); await f.log.tick(); assert.equal(calls, before + 2);
+  assert.equal((await f.log.list()).available, true);
+});
+
+test('旧代次采样失败不能在清空后输出错误或影响下一次正常采样', async t => {
+  let rejectRead;
+  const logs = [];
+  let read = () => new Promise((_, reject) => { rejectRead = reject; });
+  const f = await fixture(t, { logger: message => logs.push(message), readConnections: () => read() });
+  const pending = f.log.tick();
+  await f.log.clear();
+  rejectRead(Object.assign(new Error('late timeout'), { name: 'TimeoutError' }));
+  await pending;
+  assert.deepEqual(logs, []);
+  read = async () => [connection('new')];
+  await f.log.tick();
+  assert.equal((await f.log.list()).available, true);
+  assert.equal((await f.log.list()).stats.active, 1);
+});
+
+test('历史文件替换遇到 EPERM 时继续采样和记录请求，合并重试后保存最新历史', async t => {
+  const messages = [];
+  const { scheduler, retries } = recordRetries();
+  let blocked = false, attempts = 0, reads = 0, connections = [connection('original')];
+  const f = await fixture(t, {
+    logger: message => messages.push(message),
+    readConnections: async () => { reads++; return connections; },
+    scheduler,
+  });
+  const rename = fs.rename;
+  const remove = fs.rm;
+  let blockTemporaryCleanup = false;
+  t.mock.method(fs, 'rename', async (from, to) => {
+    if (to === f.file) {
+      attempts++;
+      if (blocked) throw Object.assign(new Error('访问 SECRET_PATH 失败'), { code: 'EPERM' });
+    }
+    return rename(from, to);
+  });
+  t.mock.method(fs, 'rm', async (file, options) => {
+    if (blockTemporaryCleanup && file.startsWith(`${f.file}.`) && file.endsWith('.tmp')) {
+      throw Object.assign(new Error('临时文件占用'), { code: 'EPERM' });
+    }
+    return remove(file, options);
+  });
+  syncBuiltinESMExports();
+  try {
+    await f.log.tick();
+    connections = [];
+    f.advance(1000); await f.log.tick();
+    f.advance(1000); await f.log.tick();
+    const original = await readFile(f.file, 'utf8');
+
+    blocked = true;
+    connections = [connection('during-write')];
+    f.advance(1000); await f.log.tick();
+    connections = [connection('still-live')];
+    f.advance(1000); await f.log.tick();
+    f.advance(1000); await f.log.tick();
+    assert.equal(attempts, 2);
+    const failed = await f.log.list();
+    assert.equal(failed.available, true);
+    assert.equal(failed.storageError, true);
+    assert.deepEqual(failed.active.map(record => record.id), ['still-live']);
+    assert.equal(await readFile(f.file, 'utf8'), original);
+    assert.match(messages[0], /保存.*EPERM/);
+    assert.doesNotMatch(messages.join('\n'), /采样暂不可用|SECRET_PATH/);
+    assert.equal((await readdir(f.dir)).filter(name => name.endsWith('.tmp')).length, 0);
+
+    const request = await f.log.beginRequest({ method: 'POST', endpoint: '/v1/messages', host: 'api.anthropic.com', port: 443 });
+    await f.log.updateRequest(request, { status: 200, download: 50 });
+    await f.log.finishRequest(request, { status: 200, download: 100 });
+    assert.equal((await f.log.list({ detailId: request })).selected.download, 100);
+    assert.equal(JSON.parse(await f.log.export({ kind: 'request' })).records[0].id, request);
+    const beforeReads = reads;
+    f.advance(1000); await f.log.tick();
+    assert.equal(reads, beforeReads + 1);
+    assert.equal(attempts, 2);
+    assert.equal(retries.length, 1);
+
+    blockTemporaryCleanup = true;
+    const firstRetry = retries.shift();
+    f.advance(firstRetry.delay);
+    await firstRetry.callback();
+    const temporary = (await readdir(f.dir)).filter(name => name.endsWith('.tmp'));
+    assert.equal(temporary.length, 1);
+    assert.equal(attempts, 3);
+    for (let i = 0; i < 7; i++) {
+      assert.equal(retries.length, 1);
+      const retry = retries.shift();
+      assert.ok(retry.delay > 0 && retry.delay <= 30000);
+      f.advance(retry.delay);
+      await retry.callback();
+    }
+    assert.deepEqual((await readdir(f.dir)).filter(name => name.endsWith('.tmp')), temporary);
+    assert.equal(attempts, 3);
+    blocked = false;
+    blockTemporaryCleanup = false;
+    const retry = retries.shift();
+    f.advance(retry.delay);
+    await retry.callback();
+    assert.equal(retries.length, 0);
+    assert.equal((await f.log.list()).storageError, false);
+    assert.deepEqual(JSON.parse(await readFile(f.file, 'utf8')).records.map(record => record.id), ['original', 'during-write', request]);
+    assert.deepEqual(await readdir(f.dir), [path.basename(f.file)]);
+    assert.ok(messages.some(message => message.includes('保存已恢复')));
+    assert.doesNotMatch(messages.join('\n'), /采样暂不可用|SECRET_PATH/);
+  } finally {
+    t.mock.restoreAll();
+    syncBuiltinESMExports();
+  }
+});
+
+test('范围收窄和清空落盘失败后，取消的重试也不会恢复旧记录', async t => {
+  const { scheduler, retries } = recordRetries();
+  const f = await fixture(t, { scheduler });
+  const rename = fs.rename, remove = fs.rm;
+  let blocked = false;
+  const busy = () => Object.assign(new Error('历史文件占用'), { code: 'EPERM' });
+  t.mock.method(fs, 'rename', async (from, to) => {
+    if (blocked && to === f.file) throw busy();
+    return rename(from, to);
+  });
+  t.mock.method(fs, 'rm', async (file, options) => {
+    if (blocked && file === f.file) throw busy();
+    return remove(file, options);
+  });
+  syncBuiltinESMExports();
+  try {
+    const previous = await f.log.beginRequest({ method: 'POST', endpoint: '/v1/messages', host: 'api.anthropic.com', port: 443 });
+    await f.log.finishRequest(previous);
+    await f.log.sample([connection('excluded')]);
+    await finish(f);
+    blocked = true;
+    await assert.rejects(f.log.setScope('claude'), { code: 'EPERM' });
+    const staleRetry = retries[0];
+    assert.deepEqual((await f.log.list()).items.map(record => record.id), [previous]);
+    await assert.rejects(f.log.setScope('all'), { code: 'EPERM' });
+    assert.deepEqual(f.log.settings(), { scope: 'claude' });
+    const settings = path.join(f.dir, 'net-core-connection-settings.json');
+    assert.deepEqual(JSON.parse(await readFile(settings, 'utf8')), { scope: 'claude' });
+
+    await assert.rejects(f.log.clear(), { code: 'EPERM' });
+    assert.equal((await f.log.list()).total, 0);
+    const latest = await f.log.beginRequest({ method: 'POST', endpoint: '/v1/messages', host: 'api.anthropic.com', port: 443 });
+    await f.log.finishRequest(latest);
+    blocked = false;
+    await staleRetry.callback();
+    assert.equal(retries.length, 1);
+    await retries.shift().callback();
+    assert.deepEqual(JSON.parse(await readFile(f.file, 'utf8')).records.map(record => record.id), [latest]);
+  } finally {
+    t.mock.restoreAll();
+    syncBuiltinESMExports();
+  }
+});
+
 test('请求层记录 method/规范 endpoint/status/完整耗时，不存 query、动态标识或正文', async t => {
   const f = await fixture(t);
   const id = await f.log.beginRequest({ method: 'POST', endpoint: '/v1/messages?token=SECRET_QUERY', host: 'api.anthropic.com', port: 443, body: 'SECRET_BODY' });
@@ -239,4 +435,37 @@ test('路径集合精确区分代理、直连与拦截，并支持活动/结束�
   assert.equal((await f.log.list({ route: 'blocked', state: 'active', at: new Date(base + 500).toISOString() })).total, 1);
   const exported = JSON.parse(await f.log.export({ route: 'direct', state: 'ended' }));
   assert.deepEqual(exported.records.map(row => row.id), ['direct']);
+});
+
+test('写盘节流：多次收尾合并为一次快照，仍有定时落盘', async t => {
+  const { scheduler, retries } = recordRetries();
+  const f = await fixture(t, { storageDelayMs: 15000, scheduler });
+  await f.log.sample([connection('a')]);
+  f.advance(1000); await f.log.sample([]);
+  f.advance(1000); await f.log.sample([]);
+  assert.equal(retries.length, 1, '第一次收尾应排一个写盘定时器');
+  assert.equal(retries[0].delay, 15000);
+  await f.log.sample([connection('b')]);
+  f.advance(1000); await f.log.sample([]);
+  f.advance(1000); await f.log.sample([]);
+  assert.equal(retries.length, 1, '后续收尾不应叠加新的写盘定时器');
+  retries[0].callback();
+  await f.log.list(); // 与定时落盘共用串行队列，等待真实写入完成而非猜测磁盘耗时。
+  const saved = JSON.parse(await readFile(f.file, 'utf8'));
+  assert.equal(saved.records.length, 2);
+});
+
+test('按时间窗统计结束连接与 Claude 请求', async t => {
+  const f = await fixture(t);
+  await f.log.sample([
+    connection('claude-connection', { metadata: { host: 'api.anthropic.com' } }),
+    connection('other-connection'),
+  ]);
+  await finish(f);
+  const id = await f.log.beginRequest({ method: 'POST', endpoint: '/v1/messages', host: 'api.anthropic.com', port: 443 });
+  await f.log.finishRequest(id, { status: 200, upload: 10, download: 20 });
+  const counts = f.log.countsByWindows([{ from: new Date(base - 1000).toISOString(), to: new Date(base + 60000).toISOString() }]);
+  assert.deepEqual(counts, [{ connections: 3, requests: 1 }], 'Claude 域名的内核连接不是 HTTP 请求，不能重复计数');
+  const empty = f.log.countsByWindows([{ from: new Date(base + 60000).toISOString(), to: new Date(base + 120000).toISOString() }]);
+  assert.deepEqual(empty, [{ connections: 0, requests: 0 }]);
 });

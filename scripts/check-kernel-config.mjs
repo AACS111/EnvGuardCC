@@ -2,13 +2,36 @@
 // 只用 RFC 5737 保留地址，不依赖真实订阅、网络或内核二进制。
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { buildKernelConfig, strictKernelConfig, assertStrictKernelConfig, assertKernelConfig, CLAUDE_DOMAINS, DEFAULT_GROUP, DEFAULT_AUTO_GROUP, CLAUDE_GUARD_GROUP } from './net-core/config.mjs';
+import { publicDnsForCountry, ANYCAST_DOH } from './net-core/public-dns.mjs';
+import { buildKernelConfig, buildProbeConfig, strictKernelConfig, assertStrictKernelConfig, assertKernelConfig, CLAUDE_DOMAINS, DEFAULT_GROUP, DEFAULT_AUTO_GROUP, CLAUDE_GUARD_GROUP } from './net-core/config.mjs';
 
 const proxies = [
   { name: 'node-a', type: 'ss', server: '203.0.113.10', port: 443, cipher: 'aes-128-gcm', password: 'test' },
   { name: 'node-b', type: 'vless', server: '203.0.113.11', port: 443, uuid: '11111111-1111-1111-1111-111111111111', tls: true },
 ];
 const build = (overrides = {}) => buildKernelConfig({ proxies, selected: 'node-a', apiPort: 39090, mixedPort: 39080, egressMode: 'rule', ...overrides });
+
+test('地区 DNS 支持 TCP 避开节点 UDP 故障，所有候选仍走固定出口', () => {
+  const servers = publicDnsForCountry('US', { preferTcp: true });
+  assert.deepEqual(servers, ['tcp://4.2.2.1', 'tcp://4.2.2.2']);
+  assert.deepEqual(build({ publicDns: servers }).dns.nameserver, servers.map(server => `${server}#CLAUDE-PIN`));
+  assert.deepEqual(publicDnsForCountry('ZZ', { preferTcp: true }), ANYCAST_DOH);
+});
+
+test('主内核与临时内核统一使用复用连接测速及 TCP 并发拨号', () => {
+  for (const config of [build(), buildProbeConfig({ proxies, names: proxies.map(p => p.name) })]) {
+    assert.equal(config['unified-delay'], true);
+    assert.equal(config['tcp-concurrent'], true);
+  }
+  assert.equal(build()['proxy-groups'].find(group => group.name === DEFAULT_AUTO_GROUP).url, 'https://www.gstatic.com/generate_204');
+});
+
+test('默认阻断的内核不读取磁盘中上次放行的选择器', () => {
+  const blocked = build({ guardInitiallyBlocked: true });
+  assert.deepEqual(blocked.profile, { 'store-selected': false });
+  assert.deepEqual(blocked['proxy-groups'].find(group => group.name === CLAUDE_GUARD_GROUP).proxies, ['REJECT', DEFAULT_GROUP]);
+  assert.equal(blocked['proxy-groups'].find(group => group.name === DEFAULT_GROUP).proxies[0], 'node-a');
+});
 
 test('地区 DNS 不混入 anycast，全部固定到 Claude 出口', () => {
   const config = build({ publicDns: ['168.95.1.1', '168.95.192.1'] });
