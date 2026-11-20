@@ -7,9 +7,10 @@ import type { TransferLogHandle } from './TransferLog';
 import { TrafficFlow } from './TrafficFlow';
 import { WorkspaceSettingsDialog, type SettingsSection } from './WorkspaceSettingsDialog';
 import { NetCorePanel } from './NetCorePanel';
+import { VpsRecommendDialog } from './VpsRecommendDialog';
 import { BrowserCloakStatus } from './BrowserCloakStatus';
 import type { BrowserCloakExecution } from '@/detection/environment-runtime';
-import { netCoreView } from '@/detection/net-core-view.mjs';
+import { netCoreView, nodeLatencyTone } from '@/detection/net-core-view.mjs';
 import type { ExitHistory, NetCoreExit, NetCoreNetworkState, NetCoreReport } from '@/detection/gateway-check';
 import { describeExit } from '@/detection/exit-quality.mjs';
 import { measurementStatus, measurementPoints } from '@/detection/measurement-status';
@@ -103,11 +104,13 @@ export function ProtectionWorkspace(props: Props) {
   const dismissedNotices = useSyncExternalStore(subscribeDismissedNotices, readDismissedNotices, serverDismissedNotices);
   const displayedExitIp = report?.target?.ip ?? geo?.ip;
   const currentExitGeo = geo?.ip && geo.ip === displayedExitIp ? geo : null;
-  const networkType = exitNetworkType(currentExitGeo?.org, locale, currentExitGeo?.asn);
+  const exitOperator = currentExitGeo?.org ?? currentExitGeo?.asn;
+  const networkType = exitNetworkType(currentExitGeo?.org, locale, currentExitGeo?.asn, displayedExitIp, currentExitGeo?.networkEvidence);
   const [tab, setTab] = useState('basic');
   const [transferLogHandle, setTransferLogHandle] = useState<TransferLogHandle | null>(null);
   const [settingsSection, setSettingsSection] = useState<SettingsSection | null>(null);
   const [docsOpen, setDocsOpen] = useState(false);
+  const [vpsOpen, setVpsOpen] = useState(false);
   const [onlyChanges, setOnlyChanges] = useState(true);
   const [compareSide, setCompareSide] = useState<'browser' | 'claude'>('browser');
   const compact = useSyncExternalStore(subscribeNavigation, compactNavigation, () => false);
@@ -116,6 +119,11 @@ export function ProtectionWorkspace(props: Props) {
   const action = starting ? text('启动中', 'Starting') : stopping ? text('重试关闭', 'Retry stop') : turnOff ? text('关闭环境防护', 'Stop environment protection') : text('启动环境防护', 'Start environment protection');
   const tabs = [['basic', text('概览', 'Overview')], ['network', text('网络', 'Network')], ['tests', text('测试项目', 'Test items')], ['compare', text('保护对比', 'Comparison')]];
   const kernel = netCoreView(props.netCore, { locale });
+  const selectedNode = kernel.selected ?? null;
+  const selectedDelay = selectedNode && !props.netCoreMeasuring ? props.netCoreDelays?.[selectedNode] : undefined;
+  const selectedDelayText = selectedDelay === null ? text('超时', 'Timeout')
+    : typeof selectedDelay === 'number' && Number.isFinite(selectedDelay) && selectedDelay >= 0 ? `${selectedDelay} ms`
+      : selectedNode && props.netCoreMeasuring ? text('测速中…', 'Measuring…') : text('未测速', 'Not measured');
   const measured = signals.filter(signal => measurementStatus(signal.id, props.browser.find(item => item.id === signal.id), props.claude.find(item => item.id === signal.id)) === 'measured').length;
   const points = (signal: SignalView) => measurementPoints(signal.id, props.browser.find(item => item.id === signal.id), props.claude.find(item => item.id === signal.id));
   const failed = (signal: SignalView) => measurementStatus(signal.id, props.browser.find(item => item.id === signal.id), props.claude.find(item => item.id === signal.id)) === 'error';
@@ -199,6 +207,7 @@ export function ProtectionWorkspace(props: Props) {
         }}><WorkspaceIcon name={id as WorkspaceIconName} /><span className="workspace-tab-label">{label}</span>{id === 'tests' && <span className="workspace-nav-count">{signals.length}</span>}{id === 'network' && kernel.violationCount > 0 && <span className="workspace-nav-count">{kernel.violationCount}</span>}</button>)}
       </div>
       <div className="workspace-side-footer">
+        <button type="button" className="workspace-text-link" aria-haspopup="dialog" onClick={() => setVpsOpen(true)}><WorkspaceIcon name="server" />{text('自建节点推荐', 'Self-host a node')}</button>
         <AppUpdateNotice locale={locale} connected={connected} />
         <button type="button" className="workspace-text-link" aria-haspopup="dialog" onClick={() => setSettingsSection('general')}><WorkspaceIcon name="settings" />{text('设置', 'Settings')}</button>
         <div className="workspace-side-links">
@@ -255,7 +264,17 @@ export function ProtectionWorkspace(props: Props) {
             <div className="workspace-score-explanation"><p>{text('按项目权重折算，满分 100；未判定项暂计半分。检测得分不能推算账号封禁概率。', 'Weighted score out of 100; unresolved items receive half credit. Scores do not predict account bans.')}</p><p>{text(`可由环境防护处理的异常：${actionable.length}；保护范围外项目单独列示。`, `Protectable issues: ${actionable.length}; items outside protection are listed separately.`)}</p></div>
           </section>
           <div className="workspace-overview-grid">
-            <section className="workspace-panel workspace-summary-card"><h3><WorkspaceIcon name="globe" />{text('当前出口', 'Current exit')}</h3><div className="workspace-summary-value">{report?.target?.countryName ?? geo?.countryName ?? text('未识别', 'Unknown')}{(report?.target?.city ?? geo?.city) ? ` · ${report?.target?.city ?? geo?.city}` : ''}</div><p>{displayedExitIp ?? text('尚未采样', 'Not sampled')} · <button type="button" className="workspace-text-link" onClick={() => setTab('network')}>{text('管理网络', 'Manage network')} →</button></p><p title={networkType.detail}>{networkType.label} · {geo?.org ?? geo?.asn ?? '—'}</p><button className="workspace-text-link" type="button" disabled={busy || checking} aria-busy={checking} onClick={props.onRefresh}>{checking ? text('检测中…', 'Checking…') : text('刷新', 'Refresh')}</button></section>
+            <section className="workspace-panel workspace-summary-card">
+              <div className="workspace-section-heading"><h3><WorkspaceIcon name="globe" />{text('当前出口', 'Current exit')}</h3><button type="button" className="repair-button repair-button--quiet" aria-haspopup="dialog" onClick={() => setSettingsSection('network')}>{text('网络设置', 'Network settings')}</button></div>
+              <div className="workspace-summary-value">{report?.target?.countryName ?? geo?.countryName ?? text('未识别', 'Unknown')}{(report?.target?.city ?? geo?.city) ? ` · ${report?.target?.city ?? geo?.city}` : ''}</div>
+              <p className="workspace-summary-node"><span title={selectedNode ?? undefined}>{selectedNode || text('未选择节点', 'No node selected')}</span> · <span className="netcore-node__latency" data-tone={nodeLatencyTone(selectedDelay)}>{text('延迟：', 'Latency: ')}{selectedDelayText}</span></p>
+              <p>{displayedExitIp ?? text('尚未采样', 'Not sampled')} · <button type="button" className="workspace-text-link" onClick={() => setTab('network')}>{text('管理网络', 'Manage network')} →</button></p>
+              {(exitOperator || networkType.kind !== 'unknown') && <p title={networkType.detail}>
+                {networkType.kind !== 'unknown' && <span className={networkType.kind === 'datacenter' ? 'workspace-field-warning' : undefined}>{networkType.label}</span>}
+                {networkType.kind !== 'unknown' && exitOperator && ' · '}{exitOperator}
+              </p>}
+              <button className="workspace-text-link" type="button" disabled={busy || checking} aria-busy={checking} onClick={props.onRefresh}>{checking ? text('检测中…', 'Checking…') : text('刷新', 'Refresh')}</button>
+            </section>
             <section className="workspace-panel workspace-summary-card"><h3><WorkspaceIcon name="sliders" />{text('目标环境', 'Target environment')}</h3><div className="workspace-summary-value">{report?.target?.timezone ?? target?.timezone ?? '—'}</div><p>{text('系统时区', 'System timezone')} {systemTimezone ?? '—'}{timezoneMismatch && <span className="workspace-field-warning"> · {text('与目标不一致', 'Mismatch')}</span>}</p><p>{text('语言 / 区域', 'Language / locale')} {report?.target?.language ?? target?.language ?? '—'}</p><p>{text('配置目标与实测结果分别呈现', 'Configuration and measurements are shown separately')}</p></section>
             <section className="workspace-panel workspace-summary-card workspace-browser-card"><h3><WorkspaceIcon name="browser" />{text('浏览器保护', 'Browser protection')}</h3><BrowserCloakStatus report={props.browserCloak ?? null} locale={locale} /><div className="workspace-browser-actions"><button type="button" className="repair-button repair-button--primary" disabled={busy || props.linkingBrowser || !props.onLinkBrowser} onClick={() => props.onLinkBrowser?.()}>{props.linkingBrowser ? text('启动中…', 'Starting…') : text('启动保护浏览器', 'Launch protected browser')}</button><button type="button" className="repair-button" disabled={busy || !props.onOpenBrowserPicker} onClick={props.onOpenBrowserPicker} aria-haspopup="dialog">{text('选择浏览器', 'Choose browser')}</button></div></section>
           </div>
@@ -293,5 +312,6 @@ export function ProtectionWorkspace(props: Props) {
     {settingsSection && <WorkspaceSettingsDialog locale={locale} initialSection={settingsSection} onClose={() => setSettingsSection(null)} report={report} connected={connected} busy={busy} onMonitor={props.onMonitor} dismissedNoticeCount={dismissedNotices.length} onRestoreNotices={restoreDismissedNotices}
       network={{ locale, report: props.netCore, busy: Boolean(props.netCoreBusy) || busy, error: props.netCoreError, tunnelLocked: protectionEnabled, networkState: props.netCoreNetwork, onStart: props.onNetCoreStart, onStop: props.onNetCoreStop, onRestart: props.onNetCoreRestart, onTunnelChange: props.onNetCoreTunnel, onStrictChange: props.onNetCoreStrict, onNetworkFailureChange: props.onNetCoreNetworkFailure, onManageSources: props.onNetCoreManageSources, onAddSource: props.onNetCoreAddSource, onOpenNetworkConfig: props.onNetCoreOpenNetworkConfig, onAuthorizeHost: props.onNetCoreAuthorizeHost }} />}
     {docsOpen && <DocumentationDialog locale={locale} onClose={() => setDocsOpen(false)} />}
+    {vpsOpen && <VpsRecommendDialog locale={locale} onClose={() => setVpsOpen(false)} />}
   </section>;
 }

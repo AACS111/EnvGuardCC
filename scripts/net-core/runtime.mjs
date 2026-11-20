@@ -11,11 +11,13 @@ import os from "node:os";
 import path from "node:path";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
+import { verifiedConnectionExit, verifiedRequestExit } from './request-exit.mjs';
 import { DEFAULT_AUTO_GROUP, DEFAULT_FAKE_IP_RANGE, DEFAULT_GROUP, CLAUDE_GUARD_GROUP, DEFAULT_ROUTE_EXCLUSIONS, DELAY_TEST_TIMEOUT_MS, DELAY_TEST_URL, LOCAL_DIRECT_PROXY, assertKernelConfig, buildKernelConfig, ingressSummary, inIpv4Range, serializeKernelConfig, strictKernelConfig } from "./config.mjs";
 import { migrateStore, pickActive, publicSources, removeSource, renameSource, serializeStore, upsertSource } from "./sources.mjs";
 import { isClaudeHost, listConnections, routingEvidence, routingSummary } from "./routes.mjs";
 import { REGION_SERVERS, publicDnsForCountry, regionOfNode } from "./public-dns.mjs";
 import { createLogLimiter } from "./log-limiter.mjs";
+import { createEgressInterfaceResolver } from "./egress-interface.mjs";
 import { loopbackFetch } from './loopback-fetch.mjs';
 import { fetchSubscription, fetchTextViaProxy, normalizeProxies, parseSubscription } from "./subscription.mjs";
 import { elevationStatus } from "./privilege.mjs";
@@ -38,6 +40,14 @@ const DEFAULT_API_PORT = 39090;
  */
 const TUNNEL_BLOCK_STREAK = 2;
 const EXIT_BLOCK_STREAK = 2;
+// 宿主动作超时分级。布防/保留常驻规则只跑一个 PowerShell（实测 6–35 秒），给 60 秒；
+// 全量撤防要跑两个脚本，给 100 秒。这样宿主吊死时错误落在具体动作上，而不是笼统的 90 秒 abort。
+const GUARD_ACTION_TIMEOUT_MS = 60000;
+const GUARD_FULL_RELEASE_TIMEOUT_MS = 100000;
+// 宿主失联时布防/撤防快速失败：两次短探测总共不超过 ~7 秒，不再等满动作超时。
+const HOST_PROBE_TIMEOUT_MS = 2500;
+// 宿主确认无响应后短暂退避，避免每轮健康巡检都向已经吊死的宿主重发大脚本。
+const GUARD_UNREACHABLE_BACKOFF_MS = 15000;
 
 /** 用户网络声明的字段白名单；未知字段会让内核启动失败，所以读写两侧共用同一份。 */
 const NETWORK_FIELDS = ["directDomains", "dnsServers", "directInterface", "dnsInterface", "strictRoute", "routeExcludeAddresses"];
@@ -244,7 +254,7 @@ function demoNodes() {
  * @param {string} [options.platform]
  * @param {string} [options.root]
  */
-export async function createKernelRuntime({ stateDir, initialTunnel, env = process.env, root, logger = () => {}, spawn, fetchImpl, lookup, download, createCore = createNetCore, takeover, claudeProxy = null, hostInstaller = null, discoverTargets = discoverClaudeTargets, interfaces = () => os.networkInterfaces(), healthScheduler = { every: setInterval, clear: clearInterval }, heartbeatScheduler = { every: setInterval, clear: clearInterval }, systemIpv6 = { disable: disableSystemIpv6, restore: restoreSystemIpv6 }, ipv6Fetch = fetchTextViaProxy, exitFetch = fetchTextViaProxy, platform = process.platform } = {}) {
+export async function createKernelRuntime({ stateDir, initialTunnel, env = process.env, root, logger = () => {}, spawn, fetchImpl, lookup, download, createCore = createNetCore, takeover, claudeProxy = null, hostInstaller = null, discoverTargets = discoverClaudeTargets, interfaces = () => os.networkInterfaces(), egressInterface = createEgressInterfaceResolver(), healthScheduler = { every: setInterval, clear: clearInterval }, heartbeatScheduler = { every: setInterval, clear: clearInterval }, systemIpv6 = { disable: disableSystemIpv6, restore: restoreSystemIpv6 }, ipv6Fetch = fetchTextViaProxy, exitFetch = fetchTextViaProxy, platform = process.platform } = {}) {
   const binary = await resolveKernelBinary({ stateDir, env, platform, root });
   const networkTakeover = takeover ?? createNetworkTakeover({ platform, ownBinary: binary });
   // 特权宿主模式：优先用显式环境变量；否则尝试读取安装器写入的令牌并探测宿主健康。
@@ -351,6 +361,9 @@ export async function createKernelRuntime({ stateDir, initialTunnel, env = proce
   // 不能写成 const：launch() 会重新探测宿主后重算，否则「先启动应用、后装宿主」会让 TUN 永久写死成关闭。
   const resolveTunEnabled = () => env.CHECKCC_NET_CORE_TUN === "1" || (env.CHECKCC_NET_CORE_TUN !== "0" && savedTunnel);
   let tunEnabled = typeof initialTunnel === "boolean" ? initialTunnel : resolveTunEnabled();
+  // 启动即预热出口网卡探测：异步，不阻塞；用户点“开启保护”时缓存通常已有值。
+  // 无论初始 TUN 状态都预热：系统级接口查询在 Windows 上要 2-3 秒，点开启时再跑就来不及。
+  if (egressInterface?.warm) void egressInterface.warm();
   const strictFile = path.join(stateDir, "net-core-strict.json");
   let strictEnabled = false, strictBaselineIp = null, lastExitCheck = 0;
   try {
@@ -458,7 +471,21 @@ export async function createKernelRuntime({ stateDir, initialTunnel, env = proce
   let lastVerifiedNode = null;
   let lastVerifiedExit = null;
   let dnsExitEvidence = null;
+  const currentExitEvidence = () => ({
+    running: core?.state().running === true,
+    stable: !changing && !networkOffline && healthFailures === 0,
+    blocked: claudeBlocked(),
+    verificationPending: networkVerificationPending || failClosed.desired === 'armed' || failClosed.armed === true,
+    probeFailures: exitEvidence.failures,
+    matches: lastVerifiedExit?.key === exitProbeKey(nodes?.selected, interfacesKey()),
+    at: lastVerifiedExit?.at, ip: lastVerifiedExit?.exit.ip,
+    node: nodes?.selected,
+    proxyPort: mixedPort,
+    tunCaptured: tunEnabled && lastTunnelCaptured === true && Boolean(lastHealthAt) && Date.now() - Date.parse(lastHealthAt) < 15000,
+  });
   const connectionLog = await createConnectionLog({ stateDir, logger,
+    requestExit: info => verifiedRequestExit(info, currentExitEvidence()),
+    connectionExit: (record, at) => verifiedConnectionExit(record, currentExitEvidence(), at),
     // 合并写盘：连接结束很频繁，全量快照 30 秒写一次，减少磁盘写放大与 rename 占用。
     storageDelayMs: 30000,
     readConnections: () => core?.state().running ? core.request("/connections") : null,
@@ -807,6 +834,9 @@ export async function createKernelRuntime({ stateDir, initialTunnel, env = proce
     const links = physicalLinks();
     networkOffline = links.length === 0;
     networkLinks = new Set(links.map((link) => link.name)).size;
+    // 内核已退出（崩溃/被杀/宿主重启）时按退避自动重建，不等用户再点一次开启。
+    // 之前的重建只在「健康检查走到探测失败」时才置位，宿主吊死期间会被布防动作挡在巡检之前。
+    pendingRebuild ||= !core || !core.state().running;
     if (networkKey !== key || resumed) {
       networkKey = key;
       networkGeneration++;
@@ -964,6 +994,8 @@ export async function createKernelRuntime({ stateDir, initialTunnel, env = proce
   }
   // 控制面已确认加载的网络声明，也是运行时其他配置热加载使用的基准。
   let appliedNetwork = null;
+  // 上一次探测出口网卡时的网络指纹；变化时立即重建探测器缓存。
+  let egressInterfacesKey = "";
   // 上一次写进配置的公共 DNS；只在显式设置变化时热加载。
   let appliedPublicDns = null;
   // 最近一次节点地址解析结果（域名 → 已验证 IP），用于入口归组。
@@ -1026,8 +1058,33 @@ export async function createKernelRuntime({ stateDir, initialTunnel, env = proce
     }
   }
 
+  // 只有启用 TUN 才需要显式出口网卡；未启用时不碰系统路由。
+  // peek() 只读缓存；首次无结果时给异步探测一个很短的等待窗口，避免启动路径被系统查询拖慢。
+  async function resolveEgressInterface(enabled) {
+    if (!enabled || !egressInterface) return null;
+    const peeked = egressInterface.peek?.();
+    if (peeked) return peeked;
+    if (typeof egressInterface.warm === "function") {
+      await Promise.race([
+        egressInterface.warm().catch(() => null),
+        new Promise((resolve) => { const timer = setTimeout(resolve, 4000); timer.unref?.(); }),
+      ]);
+      return egressInterface.peek?.() ?? null;
+    }
+    return null;
+  }
+
   async function writeConfig({ forceBlockClaude = false, localNetwork } = {}) {
     localNetwork ??= appliedNetwork ?? networkRecovery ?? await loadLocalNetworkConfig(stateDir, env);
+    // 出口网卡按「网络指纹」缓存：网卡集合变化时立刻重探，其余时间用 TTL 缓存，
+    // 避免每次热重载都跑一次系统级接口查询（Windows 上可能耗时数百毫秒到数秒）。
+    const egressKey = interfacesKey();
+    if (egressKey !== egressInterfacesKey) {
+      egressInterfacesKey = egressKey;
+      egressInterface?.invalidate?.();
+    }
+    // 只有真正启用 TUN 时才需要显式出口网卡；独立本机代理模式不碰系统路由。
+    const egress = await resolveEgressInterface(tunEnabled);
     const publicDns = await publicDnsForSelection();
     appliedPublicDns = publicDns;
     // 节点地址解析：订阅自带的 DNS 优先（与 FlClash 一致），结果验证后持久化，
@@ -1047,6 +1104,7 @@ export async function createKernelRuntime({ stateDir, initialTunnel, env = proce
       exitProbeHost,
       egressMode,
       localNetwork,
+      tunInterface: egress?.name ?? "",
       publicDns,
       proxyServerDns: Array.isArray(nodes.proxyServerDns) && nodes.proxyServerDns.length ? nodes.proxyServerDns : undefined,
       extraRules: [
@@ -1080,6 +1138,27 @@ export async function createKernelRuntime({ stateDir, initialTunnel, env = proce
     if (!response.ok || value?.ok === false) throw Object.assign(new Error(value?.reason ?? `宿主返回 ${response.status}`), { code: value?.code, status: response.status });
     if (value.guard && (action !== 'heartbeat' || heartbeatVersion === heartbeatGeneration)) hostGuard = value.guard;
     return value;
+  }
+  /** 一次廉价的宿主可用性探测；只读 /health，不排队任何变更动作。 */
+  async function hostResponding(timeoutMs = HOST_PROBE_TIMEOUT_MS) {
+    try {
+      const response = await (fetchImpl ?? loopbackFetch)(`${hostUrl}/health`, { headers: { 'X-EnvGuardCC-Host-Token': hostToken }, signal: AbortSignal.timeout(timeoutMs) });
+      return response.ok;
+    } catch { return false; }
+  }
+  /**
+   * 布防/撤防前的快速失败：宿主吊死时 /health 也答不出来（实测事故里心跳先超时）。
+   * 不先探测就会把每次布防拖满 90 秒，期间健康巡检（含内核重建）全被挡住。
+   */
+  async function requireGuardHost() {
+    if (!hostMode) throw Object.assign(new Error('系统阻断需要特权宿主，请先授权安装。'), { code: 'HOST_MISSING' });
+    if (Date.now() < nextGuardActionAt) throw Object.assign(new Error('特权宿主尚未恢复，系统阻断操作在退避等待中。'), { code: 'GUARD_BACKOFF' });
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      if (await hostResponding(attempt === 0 ? HOST_PROBE_TIMEOUT_MS : HOST_PROBE_TIMEOUT_MS + 1500)) return;
+      if (attempt === 0) await new Promise(resolve => setTimeout(resolve, 400));
+    }
+    nextGuardActionAt = Date.now() + GUARD_UNREACHABLE_BACKOFF_MS;
+    throw Object.assign(new Error('特权宿主无响应，系统阻断操作已快速失败；宿主恢复后自动重试。'), { code: 'HOST_UNREACHABLE' });
   }
   function beginHeartbeat() {
     if (!hostMode || hostHeartbeat) return;
@@ -1137,6 +1216,8 @@ export async function createKernelRuntime({ stateDir, initialTunnel, env = proce
   let failClosedTargetsAt = 0;
   const FAIL_CLOSED_TARGETS_TTL_MS = 5 * 60 * 1000;
   let failClosedToken = null;
+  // 宿主失联后短暂退避下一次大脚本动作，避免每轮巡检都重发一次布防/撤防。
+  let nextGuardActionAt = 0;
   const failClosedEnabled = () => platform === 'win32' && hostMode && hostCapabilities.includes("claude-direct-guard") && env.CHECKCC_CLAUDE_FAILCLOSED !== "0";
   function requireWindowsGuard() {
     if (platform === 'win32' && env.CHECKCC_CLAUDE_FAILCLOSED !== '0' && !failClosedEnabled()) throw new Error('Windows 系统接管需要新版特权宿主提供桌面直连阻断，请开启环境防护并授权更新助手。');
@@ -1172,9 +1253,10 @@ export async function createKernelRuntime({ stateDir, initialTunnel, env = proce
     failClosedArming = true;
     failClosed.desired = "armed";
     try {
+      await requireGuardHost();
       const targets = await recoveryStep('保护目标识别', () => failClosedTargetsResolve());
       failClosedToken ??= randomBytes(8).toString("hex");
-      const result = await recoveryStep('系统布防', () => hostAction("claude-guard", { op: "arm", token: failClosedToken, ...targets }, null, 90000));
+      const result = await recoveryStep('系统布防', () => hostAction("claude-guard", { op: "arm", token: failClosedToken, ...targets }, null, GUARD_ACTION_TIMEOUT_MS));
       const guard = result.claudeGuard ?? {};
       if (guard.armed !== true || (targets.domains.length && guard.hostsBlocked !== true) || ((targets.programs.length || targets.packages.length) && guard.directProtected !== true)) throw new Error('系统阻断未确认，拒绝重建内核。');
       failClosed = { ...guard, supported: true, desired: "armed", error: null };
@@ -1195,6 +1277,7 @@ export async function createKernelRuntime({ stateDir, initialTunnel, env = proce
     if (!failClosedEnabled()) return false;
     const desired = keepDirect ? 'protected' : 'released';
     try {
+      await requireGuardHost();
       if (keepDirect && failClosed.desired === 'protected' && failClosed.armed === false) {
         // A kernel-only network lock did not arm the system guard. Re-read the
         // effective rules; do not rewrite/delete rules already in the target state.
@@ -1207,7 +1290,7 @@ export async function createKernelRuntime({ stateDir, initialTunnel, env = proce
           return true;
         }
       }
-      const result = await recoveryStep('系统撤防', () => hostAction("claude-guard", { op: "release", keepDirect }, null, 90000));
+      const result = await recoveryStep('系统撤防', () => hostAction("claude-guard", { op: "release", keepDirect }, null, keepDirect ? GUARD_ACTION_TIMEOUT_MS : GUARD_FULL_RELEASE_TIMEOUT_MS));
       const guard = result.claudeGuard ?? {};
       if (guard.armed !== false || (keepDirect && (failClosedTargets?.programs.length || failClosedTargets?.packages.length) && guard.directProtected !== true)) throw new Error('系统阻断状态未确认。');
       failClosed = { ...guard, supported: true, desired, error: null };

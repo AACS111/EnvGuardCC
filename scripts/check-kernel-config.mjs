@@ -2,8 +2,11 @@
 // 只用 RFC 5737 保留地址，不依赖真实订阅、网络或内核二进制。
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
+import { BlockList, isIP } from 'node:net';
+import { CHINA_CIDRS } from './net-core/china-routes.mjs';
 import { publicDnsForCountry, ANYCAST_DOH } from './net-core/public-dns.mjs';
-import { buildKernelConfig, buildProbeConfig, strictKernelConfig, assertStrictKernelConfig, assertKernelConfig, CLAUDE_DOMAINS, DEFAULT_GROUP, DEFAULT_AUTO_GROUP, CLAUDE_GUARD_GROUP } from './net-core/config.mjs';
+import { buildKernelConfig, buildProbeConfig, strictKernelConfig, assertStrictKernelConfig, assertKernelConfig, serializeKernelConfig, CLAUDE_DOMAINS, CN_DIRECT_DOMAINS, DEFAULT_GROUP, DEFAULT_AUTO_GROUP, CLAUDE_GUARD_GROUP } from './net-core/config.mjs';
 
 const proxies = [
   { name: 'node-a', type: 'ss', server: '203.0.113.10', port: 443, cipher: 'aes-128-gcm', password: 'test' },
@@ -81,6 +84,67 @@ test('规则模式：Claude 置顶、固定出口、strict-route、fake-ip 与�
   // 做 TLS 握手的节点必须带指纹；纯 ss 不参与 TLS，不强行补。
   assert.equal(config.proxies.find((node) => node.name === 'node-b')['client-fingerprint'], 'chrome');
   assert.doesNotThrow(() => assertKernelConfig(config, { egressMode: 'rule' }));
+});
+
+test('默认分流只使用通用局域网和国内规则，STUN 拦截适用于所有进程', () => {
+  const config = build({ ipv6: true });
+  const localDomains = ['localhost', 'lan', 'local', 'home.arpa'];
+  const directDomains = [...localDomains, ...CN_DIRECT_DOMAINS];
+  assert.deepEqual(config.rules.filter(rule => /^DOMAIN-SUFFIX,.*,DIRECT$/.test(rule)),
+    directDomains.map(domain => `DOMAIN-SUFFIX,${domain},DIRECT`));
+  assert.ok(!config.rules.some(rule => rule.startsWith('PROCESS-NAME,')));
+  assert.ok(config.rules.includes('AND,((NETWORK,udp),(DST-PORT,3478)),REJECT'));
+  assert.deepEqual(config.dns['fake-ip-filter'], [...localDomains.map(domain => `+.${domain}`), '+.msftconnecttest.com', '+.msftncsi.com']);
+  assert.equal(config.dns['nameserver-policy']['+.oray.com'], undefined);
+  assert.deepEqual(config.dns['nameserver-policy']['+.cn'], config.dns['direct-nameserver']);
+  const rules = new Set(config.rules);
+  for (const cidr of CHINA_CIDRS) {
+    assert.ok(rules.has(`${cidr.includes(':') ? 'IP-CIDR6' : 'IP-CIDR'},${cidr},DIRECT`), cidr);
+  }
+  assert.ok(Buffer.byteLength(serializeKernelConfig(config)) < 4 * 1024 * 1024);
+  for (const egressMode of ['global', 'direct']) {
+    const other = build({ egressMode, ipv6: true });
+    assert.ok(!other.rules.includes('DOMAIN-SUFFIX,cn,DIRECT'));
+    assert.ok(!other.rules.includes(`IP-CIDR,${CHINA_CIDRS.find(cidr => !cidr.includes(':'))},DIRECT`));
+    assert.equal(other.dns['nameserver-policy']['+.cn'], undefined);
+  }
+  const strict = strictKernelConfig(build({ secret: 'x'.repeat(40) }));
+  assert.deepEqual(strict.dns['nameserver-policy'], {});
+  assert.deepEqual(strict.dns['fake-ip-filter'], []);
+});
+
+test('离线中国网段与上游快照一致，且全部可解析', () => {
+  const hash = createHash('sha256').update(CHINA_CIDRS.join('\n') + '\n').digest('hex');
+  assert.equal(hash, 'd308cc97fd9222c5b66a5e71790f4f508a59b0a7a574dc04778dcf21ea49e6e6');
+  assert.equal(new Set(CHINA_CIDRS).size, CHINA_CIDRS.length);
+  const networks = new BlockList();
+  for (const cidr of CHINA_CIDRS) {
+    const [address, prefix] = cidr.split('/');
+    networks.addSubnet(address, Number(prefix), isIP(address) === 4 ? 'ipv4' : 'ipv6');
+  }
+});
+
+test('额外规则介于 Claude、STUN、内网保护和默认国内分流之间', () => {
+  const extraRules = ['DOMAIN-SUFFIX,baidu.com,AUTO-PROXY', 'IP-CIDR,1.0.1.0/24,AUTO-PROXY', 'DOMAIN-SUFFIX,baidu.com,DIRECT'];
+  const config = build({ extraRules, localNetwork: { directDomains: ['corp.example'], routeExcludeAddresses: ['1.0.1.0/24'] } });
+  const relevant = new Set([
+    'DOMAIN-SUFFIX,claude.ai,CLAUDE-GUARD', 'AND,((NETWORK,udp),(DST-PORT,3478)),REJECT',
+    'DOMAIN-SUFFIX,corp.example,DIRECT', 'IP-CIDR,1.0.1.0/24,DIRECT', ...extraRules, 'DOMAIN-SUFFIX,cn,DIRECT',
+  ]);
+  assert.deepEqual(config.rules.filter(rule => relevant.has(rule)), [...relevant]);
+  for (const catchAll of ['MATCH,DIRECT', 'FINAL,DIRECT', ' match ,DIRECT']) {
+    assert.throws(() => build({ extraRules: [catchAll] }), /MATCH|FINAL/);
+  }
+});
+
+test('国内及节点 DNS 子域策略不覆盖固定出口 DNS', () => {
+  const config = build({ domains: ['qq.com', ...CLAUDE_DOMAINS], proxies: [{ ...proxies[0], server: 'gateway.claude.ai' }] });
+  for (const host of ['weixin.qq.com', 'gateway.claude.ai']) {
+    const policy = Object.entries(config.dns['nameserver-policy'])
+      .filter(([pattern]) => host === pattern.slice(2) || host.endsWith(`.${pattern.slice(2)}`))
+      .sort(([a], [b]) => b.length - a.length)[0]?.[1];
+    assert.deepEqual(policy, config.dns.nameserver);
+  }
 });
 
 test('direct 模式不生成兜底组，最后一条为 MATCH,DIRECT', () => {
@@ -165,7 +229,7 @@ test('公司网卡离线：公司 DNS 仅限内网域名，公网直连与 Claud
       assert.ok(config.dns['direct-nameserver'].length > 0);
       assert.ok(config.dns['direct-nameserver'].every(server => server.endsWith('#DIRECT') && !server.includes('192.0.2.53')));
       assert.equal(config.dns['direct-nameserver-follow-policy'], true);
-      assert.equal(config.dns['nameserver-policy']['+.baidu.com'], undefined);
+      assert.deepEqual(config.dns['nameserver-policy']['+.baidu.com'], baseline.dns['nameserver-policy']['+.baidu.com']);
       if (egressMode === 'rule') assert.ok(config.rules.includes('DOMAIN-SUFFIX,baidu.com,DIRECT'));
       if (egressMode === 'direct') assert.equal(config.rules.at(-1), 'MATCH,DIRECT');
       assert.deepEqual(config.dns.nameserver, baseline.dns.nameserver);
@@ -185,4 +249,19 @@ test('公网直连 DNS 允许显式覆盖，内网 DNS 策略仍独立保留', (
   });
   assert.deepEqual(config.dns['direct-nameserver'], directDns);
   assert.deepEqual(config.dns['nameserver-policy']['+.corp.example'], ['192.0.2.53#ENVGUARD-LOCAL-DNS']);
+});
+
+// 系统里残留「指向已断开网卡的默认路由」时，内核 auto-detect-interface 会拿到空接口；
+// 运行时探测到真正 Up 的出口网卡后要显式写进 tun.interface-name。
+test('显式出口网卡：写入 tun.interface-name，未提供时保持自动探测', () => {
+  assert.equal(build().tun['interface-name'], undefined);
+  assert.equal(build().tun['auto-detect-interface'], true);
+  assert.equal(build({ tunInterface: 'WLAN' }).tun['interface-name'], 'WLAN');
+  assert.equal(build({ tunInterface: '  WLAN  ' }).tun['interface-name'], 'WLAN');
+  assert.equal(build({ tunInterface: '' }).tun['interface-name'], undefined);
+  assert.equal(build({ tunInterface: '   ' }).tun['interface-name'], undefined);
+  assertKernelConfig(build({ tunInterface: 'WLAN' }), { egressMode: 'rule' });
+  const strict = strictKernelConfig(build({ tunInterface: 'WLAN', secret: 'x'.repeat(40) }));
+  assert.equal(strict.tun['interface-name'], 'WLAN');
+  assert.equal(strict.tun['strict-route'], true);
 });

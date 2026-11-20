@@ -44,6 +44,7 @@ export function connectionRecord(value, at = Date.now(), saved = false) {
   const chains = Array.isArray(value.chains) ? value.chains.filter(item => typeof item === 'string').slice(0, 16).map(item => label(item, 128)).filter(Boolean) : [];
   const route = connectionRoute({ chains });
   const start = timestamp(saved ? value.startedAt : value.start);
+  const exitIp = (saved || value.kind === 'request') && typeof value.exitIp === 'string' && isIP(value.exitIp) ? value.exitIp : null;
   return {
     id: value.id, kind: value.kind === 'request' ? 'request' : 'connection', host, ip: typeof ip === 'string' && isIP(ip) ? ip : null,
     port: Number.isInteger(port) && port > 0 && port <= 65535 ? port : null,
@@ -52,6 +53,7 @@ export function connectionRecord(value, at = Date.now(), saved = false) {
     startedAt: start && Date.parse(start) <= at ? start : new Date(at).toISOString(),
     endedAt: saved ? timestamp(value.endedAt) : null,
     isClaude: value.kind === 'request' || isClaudeHost(host), route, viaExit: route === 'unknown' ? null : route === 'proxied',
+    ...(exitIp || value.kind === 'request' ? { exitIp } : {}),
     ...(value.kind === 'request' ? {
       method: /^(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)$/.test(value.method) ? value.method : 'OTHER',
       endpoint: requestEndpoint(value.endpoint),
@@ -62,13 +64,50 @@ export function connectionRecord(value, at = Date.now(), saved = false) {
   };
 }
 
-export async function createConnectionLog({ stateDir, readConnections, now = Date.now, logger = () => {},
+export async function createConnectionLog({ stateDir, readConnections, requestExit = () => null, connectionExit = () => null, now = Date.now, logger = () => {},
   scheduler = { every: setInterval, clear: clearInterval }, intervalMs = 1000,
   retentionMs = CONNECTION_RETENTION_MS, maxEntries = CONNECTION_MAX_ENTRIES, maxBytes = CONNECTION_MAX_BYTES,
   storageDelayMs = 0,
 } = {}) {
   const file = path.join(stateDir, 'net-core-connections.json');
   const settingsFile = path.join(stateDir, 'net-core-connection-settings.json');
+  const requestStatsFile = path.join(stateDir, 'net-core-request-counts.json');
+  const requestCounts = new Map();
+  let statsLoaded = false;
+  let statsUnavailable = false;
+  const parseRequestBuckets = raw => {
+    const data = JSON.parse(raw);
+    if (!Array.isArray(data?.buckets)) throw new Error('Invalid request statistics');
+    return data.buckets;
+  };
+  function rememberRequest(record, count = 1) {
+    const at = typeof record.at === 'number' ? record.at : Date.parse(record.startedAt);
+    if (!Number.isFinite(at) || at < now() - CONNECTION_RETENTION_MS || at > now() || !Number.isSafeInteger(count) || count < 1) return;
+    const exitIp = typeof record.exitIp === 'string' && isIP(record.exitIp) ? record.exitIp : null;
+    const key = `${at}|${exitIp ?? ''}`;
+    const previous = requestCounts.get(key)?.count ?? 0;
+    requestCounts.set(key, { at, exitIp, count: Math.min(Number.MAX_SAFE_INTEGER, previous + count) });
+  }
+  function pruneRequestCounts() {
+    const cutoff = now() - CONNECTION_RETENTION_MS;
+    for (const [key, bucket] of requestCounts) if (bucket.at < cutoff || bucket.at > now()) requestCounts.delete(key);
+  }
+  async function recoverRequestCounts() {
+    if (!statsUnavailable) return true;
+    try {
+      const buckets = parseRequestBuckets(await readFile(requestStatsFile, 'utf8'));
+      const pending = [...requestCounts.values()];
+      requestCounts.clear();
+      for (const bucket of [...buckets, ...pending]) rememberRequest(bucket, bucket.count);
+      statsLoaded = true;
+      statsUnavailable = false;
+      return true;
+    } catch (error) {
+      if (error.code !== 'ENOENT') return false;
+      statsUnavailable = false;
+      return true;
+    }
+  }
   let scope = 'all', sampledAt = null;
   try { const settings = JSON.parse(await readFile(settingsFile, 'utf8')); if (settings.scope === 'claude') scope = 'claude'; } catch { /* 首次运行或配置损坏时使用默认范围。 */ }
   const active = new Map();
@@ -114,6 +153,18 @@ export async function createConnectionLog({ stateDir, readConnections, now = Dat
   async function writeHistory() {
     // 上次的临时文件仍被占用时，等下次重试再清理，避免连续生成大文件。
     await removeTemporary();
+    // 轻量请求计数独立于 5MB/2万条的传输明细，普通 TLS 连接不能挤掉角标。
+    pruneRequestCounts();
+    if (await recoverRequestCounts() && (requestCounts.size || statsLoaded)) {
+      await mkdir(stateDir, { recursive: true });
+      temporary = `${requestStatsFile}.${randomUUID()}.tmp`;
+      try {
+        await writeFile(temporary, JSON.stringify({ version: 1, buckets: [...requestCounts.values()] }), { mode: 0o600, flag: 'wx' });
+        await rename(temporary, requestStatsFile);
+        statsLoaded = true;
+        temporary = null;
+      } finally { await removeTemporary().catch(() => {}); }
+    }
     if (!ended.length) { await rm(file, { force: true }); return; }
     await mkdir(stateDir, { recursive: true });
     temporary = `${file}.${randomUUID()}.tmp`;
@@ -175,9 +226,9 @@ export async function createConnectionLog({ stateDir, readConnections, now = Dat
   }
   // 上次异常退出可能留下整份快照临时文件；启动时清掉，避免状态目录持续膨胀。
   try {
-    const prefixName = path.basename(file) + ".";
+    const prefixNames = [path.basename(file) + ".", path.basename(requestStatsFile) + "."];
     for (const name of await readdir(stateDir)) {
-      if (name.startsWith(prefixName) && name.endsWith(".tmp")) await rm(path.join(stateDir, name), { force: true });
+      if (prefixNames.some(prefix => name.startsWith(prefix)) && name.endsWith(".tmp")) await rm(path.join(stateDir, name), { force: true });
     }
   } catch { /* 状态目录不存在时忽略。 */ }
   let loadedHistory = false;
@@ -196,6 +247,16 @@ export async function createConnectionLog({ stateDir, readConnections, now = Dat
       logger('[connection-log] 传输记录读取失败；不影响网络连接。');
     }
   }
+  // 统计文件存在时以它为准；仅迁移已有逐条出口证据的旧版本请求，不猜测历史归属。
+  try {
+    const buckets = parseRequestBuckets(await readFile(requestStatsFile, 'utf8'));
+    for (const bucket of buckets) rememberRequest(bucket, bucket.count);
+    statsLoaded = true;
+  } catch (error) {
+    // 仅首次缺失才允许迁移；临时不可读时保留原文件，避免用已裁剪明细覆盖完整计数。
+    statsUnavailable = error.code !== 'ENOENT';
+  }
+  if (!statsLoaded && !statsUnavailable) for (const record of ended) if (record.kind === 'request' && record.isClaude) rememberRequest(record);
   if (loadedHistory) {
     prune();
     // 同时移除旧版本中不在白名单内的字段。
@@ -215,20 +276,20 @@ export async function createConnectionLog({ stateDir, readConnections, now = Dat
       if (!record || (scope === 'claude' && !record.isClaude)) continue;
       seen.add(record.id);
       const current = active.get(record.id);
-      if (current) {
-        record.startedAt = current.record.startedAt;
-        record.upload = Math.max(current.record.upload, record.upload);
-        record.download = Math.max(current.record.download, record.download);
-      } else {
-        // 同一 ID 再次出现（采样短暂缺失）合并回原连接。
-        const old = historical.get(record.id);
-        if (old) {
-          record.startedAt = old.startedAt;
-          record.upload = Math.max(old.upload, record.upload);
-          record.download = Math.max(old.download, record.download);
+      const old = current?.record ?? historical.get(record.id);
+      if (old) {
+        record.startedAt = old.startedAt;
+        record.upload = Math.max(old.upload, record.upload);
+        record.download = Math.max(old.download, record.download);
+        if (old.exitIp) record.exitIp = old.exitIp;
+        if (!current) {
+          // 同一 ID 再次出现（采样短暂缺失）合并回原连接。
           resumed.add(record.id);
           changed = true;
         }
+      } else if (record.isClaude && record.route === 'proxied') {
+        const exitIp = connectionExit(record, at);
+        if (typeof exitIp === 'string' && isIP(exitIp)) record.exitIp = exitIp;
       }
       active.set(record.id, { record, misses: 0, missingAt: null });
     }
@@ -305,12 +366,14 @@ export async function createConnectionLog({ stateDir, readConnections, now = Dat
       await flushHistory(true);
     });
   }
-  function queryRecords({ host = '', claude = false, viaExit = null, kind = 'all', at = null, route = 'all', state = 'all' } = {}) {
-    const all = [...ended, ...[...active.values()].map(item => item.record)].sort((a, b) => sortAt(b) - sortAt(a) || Date.parse(b.startedAt) - Date.parse(a.startedAt) || a.id.localeCompare(b.id));
+  const transferRecords = () => [...ended, ...[...active.values()].map(item => item.record)];
+  function queryRecords({ host = '', claude = false, viaExit = null, kind = 'all', at = null, route = 'all', state = 'all', exitIp = null } = {}) {
+    const all = transferRecords().sort((a, b) => sortAt(b) - sortAt(a) || Date.parse(b.startedAt) - Date.parse(a.startedAt) || a.id.localeCompare(b.id));
     const needle = String(host).slice(0, 253).toLowerCase();
     const point = at === null ? null : Date.parse(at);
     if (point !== null && !Number.isFinite(point)) throw new Error('回放时间无效。');
     const filtered = all.filter(record => {
+      if (exitIp !== null && (record.exitIp ?? 'unknown') !== exitIp) return false;
       const activeAt = point === null ? !record.endedAt : Date.parse(record.startedAt) <= point && (!record.endedAt || Date.parse(record.endedAt) > point);
       return (!needle || record.host.includes(needle) || record.ip?.toLowerCase().includes(needle)) && (!claude || record.isClaude) && (typeof viaExit !== 'boolean' || record.viaExit === viaExit) && (kind === 'all' || record.kind === kind) && (route === 'all' || record.route === route) && (state === 'all' || (state === 'active' ? activeAt : Boolean(record.endedAt) && !activeAt)) && (point === null || activeAt);
     });
@@ -326,19 +389,35 @@ export async function createConnectionLog({ stateDir, readConnections, now = Dat
       const { all, filtered, point } = queryRecords(query);
       const skip = Math.max(0, Math.trunc(Number(query.offset)) || 0), take = Math.max(1, Math.min(100, Math.trunc(Number(query.limit)) || 50));
       return structuredClone({ available, storageError, retentionHours: retentionMs / 3600000,
-        ...liveSnapshot(), at: point === null ? null : new Date(point).toISOString(),
+        ...liveSnapshot(), at: point === null ? null : new Date(point).toISOString(), exitIp: query.exitIp ?? null,
         stats: { active: active.size, ended: ended.length, total: all.length }, total: filtered.length, offset: skip, limit: take,
         items: filtered.slice(skip, skip + take), recent: all.slice(0, 3),
         detailId: query.detailId ?? null, selected: query.detailId ? all.find(record => record.id === query.detailId) ?? null : null,
       });
     });
   }
+  function claudeCountsByExit() {
+    return serialize(async () => {
+      if (prune()) await persist();
+      const byExit = {};
+      let unassigned = 0;
+      for (const record of transferRecords()) {
+        if (!record.isClaude) continue;
+        if (record.exitIp) byExit[record.exitIp] = (byExit[record.exitIp] ?? 0) + 1;
+        else unassigned++;
+      }
+      return { byExit, unassigned };
+    });
+  }
   function beginRequest(info) {
     return serialize(async () => {
       const id = randomUUID();
-      const record = connectionRecord({ id, kind: 'request', method: info.method, endpoint: info.endpoint, metadata: { host: info.host, destinationPort: info.port }, start: new Date(now()).toISOString() }, now());
+      const exitIp = await Promise.resolve().then(() => requestExit(info)).catch(() => null);
+      const record = connectionRecord({ id, kind: 'request', exitIp, method: info.method, endpoint: info.endpoint, metadata: { host: info.host, destinationPort: info.port }, start: new Date(now()).toISOString() }, now());
       active.set(id, { record, misses: 0, missingAt: null });
-      if (prune()) await persist();
+      rememberRequest(record);
+      prune();
+      await persist();
       return id;
     });
   }
@@ -346,7 +425,7 @@ export async function createConnectionLog({ stateDir, readConnections, now = Dat
     return serialize(async () => {
       const item = active.get(id);
       if (!item || item.record.kind !== 'request') return;
-      const record = connectionRecord({ ...item.record, ...result, id, kind: 'request', startedAt: item.record.startedAt, endedAt: new Date(now()).toISOString(), elapsedMs: Math.max(0, now() - Date.parse(item.record.startedAt)) }, now(), true);
+      const record = connectionRecord({ ...item.record, ...result, exitIp: item.record.exitIp, id, kind: 'request', startedAt: item.record.startedAt, endedAt: new Date(now()).toISOString(), elapsedMs: Math.max(0, now() - Date.parse(item.record.startedAt)) }, now(), true);
       active.delete(id);
       ended.push(record);
       prune();
@@ -386,7 +465,7 @@ export async function createConnectionLog({ stateDir, readConnections, now = Dat
       const { filtered } = queryRecords(query);
       if (format === 'json') return JSON.stringify({ version: 1, exportedAt: new Date(now()).toISOString(), retentionHours: retentionMs / 3600000, scope, at: query.at ?? null, records: filtered }, null, 2);
       if (format !== 'csv') throw new Error('导出格式无效。');
-      const fields = ['id', 'kind', 'host', 'ip', 'port', 'chains', 'rule', 'rulePayload', 'upload', 'download', 'startedAt', 'endedAt', 'isClaude', 'viaExit', 'method', 'endpoint', 'status', 'elapsedMs', 'error'];
+      const fields = ['id', 'kind', 'host', 'ip', 'port', 'chains', 'rule', 'rulePayload', 'upload', 'download', 'startedAt', 'endedAt', 'isClaude', 'viaExit', 'method', 'endpoint', 'status', 'elapsedMs', 'error', 'exitIp'];
       const cell = value => {
         let text = Array.isArray(value) ? value.join(' → ') : String(value ?? '');
         if (/^\s*[=+\-@]/.test(text)) text = "'" + text;
@@ -402,6 +481,9 @@ export async function createConnectionLog({ stateDir, readConnections, now = Dat
       resetSamplingFailures();
       active.clear();
       ended = [];
+      requestCounts.clear();
+      statsLoaded = true;
+      statsUnavailable = false;
       await persist(true);
       return { cleared: true };
     });
@@ -422,10 +504,23 @@ export async function createConnectionLog({ stateDir, readConnections, now = Dat
       return { connections, requests };
     });
   }
+  function requestCountsByExit() {
+    return serialize(async () => {
+      if (!await recoverRequestCounts()) return null;
+      pruneRequestCounts();
+      const byExit = Object.create(null);
+      let unassigned = 0;
+      for (const record of requestCounts.values()) {
+        if (record.exitIp) byExit[record.exitIp] = (byExit[record.exitIp] ?? 0) + record.count;
+        else unassigned += record.count;
+      }
+      return { byExit: { ...byExit }, unassigned };
+    });
+  }
   // 显式落盘：用于退出前或需要立即读取磁盘快照的调用方。
   function flush() {
     if (flushTimer !== null) { cancelStorageRetry(flushTimer); flushTimer = null; }
     return serialize(() => flushHistory(true));
   }
-  return { start, stop, tick, sample, list, flush, countsByWindows, clear, snapshot, beginRequest, updateRequest, finishRequest, setScope, settings: () => ({ scope }), export: exportRecords };
+  return { start, stop, tick, sample, list, claudeCountsByExit, flush, countsByWindows, requestCountsByExit, clear, snapshot, beginRequest, updateRequest, finishRequest, setScope, settings: () => ({ scope }), export: exportRecords };
 }

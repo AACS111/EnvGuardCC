@@ -121,6 +121,7 @@ export type ConnectionRecord = {
   chains: string[]; rule: string; rulePayload: string; upload: number; download: number;
   startedAt: string; endedAt: string | null; isClaude: boolean;
   route: "proxied" | "direct" | "blocked" | "unknown"; viaExit: boolean | null;
+  exitIp?: string | null;
   method?: string; endpoint?: string; status?: number | null; elapsedMs?: number | null; error?: string | null;
 };
 export type ConnectionLogSnapshot = { available: boolean; sampledAt: string | null; active: ConnectionRecord[]; activeTotal: number; scope: "all" | "claude" };
@@ -129,15 +130,15 @@ export type ConnectionsResult = {
   stats: { active: number; ended: number; total: number }; total: number; offset: number; limit: number;
   items: ConnectionRecord[]; recent: ConnectionRecord[];
   sampledAt?: string | null; active?: ConnectionRecord[]; activeTotal?: number; scope?: "all" | "claude";
-  detailId?: string | null; selected?: ConnectionRecord | null; at?: string | null;
+  detailId?: string | null; selected?: ConnectionRecord | null; at?: string | null; exitIp?: string | null;
 };
 export type ConnectionRouteFilter = "all" | "proxied" | "direct" | "blocked" | "unknown";
 export type ConnectionStateFilter = "all" | "active" | "ended";
-export type ConnectionsQuery = { host?: string; claude?: boolean; viaExit?: boolean | null; offset?: number; limit?: number; kind?: "all" | "connection" | "request"; at?: string | null; detailId?: string; route?: ConnectionRouteFilter; state?: ConnectionStateFilter };
+export type ConnectionsQuery = { host?: string; claude?: boolean; viaExit?: boolean | null; offset?: number; limit?: number; kind?: "all" | "connection" | "request"; at?: string | null; detailId?: string; route?: ConnectionRouteFilter; state?: ConnectionStateFilter; exitIp?: string | null };
 
 function connectionParams(query: ConnectionsQuery) {
   const params = new URLSearchParams();
-  for (const key of ['host', 'kind', 'at', 'detailId', 'route', 'state'] as const) if (query[key]) params.set(key, query[key]!);
+  for (const key of ['host', 'kind', 'at', 'detailId', 'route', 'state', 'exitIp'] as const) if (query[key]) params.set(key, query[key]!);
   if (query.claude) params.set("claude", "true");
   if (typeof query.viaExit === "boolean") params.set("viaExit", String(query.viaExit));
   params.set("offset", String(query.offset ?? 0));
@@ -474,7 +475,7 @@ export async function checkGateway(locale: LocaleCode, signalId?: string): Promi
 }
 
 // 内核状态只读：GET 不触发网络探测，页面轮询用它。
-export type ExitHistory = { windowHours: number; samples: number; changes: number; stable: boolean; current: string | null; ips: string[]; entries?: { ip: string; at: string; countryCode?: string | null; connections?: number; requests?: number }[]; firstAt: string | null; lastAt: string | null };
+export type ExitHistory = { windowHours: number; samples: number; changes: number; stable: boolean; current: string | null; ips: string[]; requestCounts?: Record<string, number>; unassignedRequests?: number; claudeTransferCounts?: { byExit: Record<string, number>; unassigned: number }; entries?: { ip: string; at: string; countryCode?: string | null; connections?: number; requests?: number }[]; firstAt: string | null; lastAt: string | null };
 
 export async function readNetCore(): Promise<{ netCore: NetCoreReport | null; exitHistory: ExitHistory | null }> {
   const response = await fetch(`${gatewayUrl}/__checkcc/net-core`, {

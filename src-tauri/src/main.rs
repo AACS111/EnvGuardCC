@@ -26,17 +26,33 @@ use tokio::sync::oneshot;
 
 fn origin() -> &'static str {
     static ORIGIN: OnceLock<String> = OnceLock::new();
-    ORIGIN.get_or_init(|| {
-        let port = if std::env::var("CHECKCC_DESKTOP_SMOKE").as_deref() == Ok("1") {
-            std::env::var("CHECKCC_DESKTOP_SMOKE_PORT")
+    ORIGIN.get_or_init(|| format!("http://127.0.0.1:{}", site_port()))
+}
+
+/// 页面端口。默认 3030；生产构建下 3030 被占（常见于上次残留的后台进程）时
+/// 自动换到 3031–3049 中第一个可用端口，避免应用直接起不来。
+/// 开发版必须固定 3030（Next dev server 在那里），冒烟测试也保持原行为。
+fn site_port() -> u16 {
+    static PORT: OnceLock<u16> = OnceLock::new();
+    *PORT.get_or_init(|| {
+        let explicit = |key: &str| {
+            std::env::var(key)
                 .ok()
-                .and_then(|p| p.parse::<u16>().ok())
-                .filter(|p| *p > 0)
-                .unwrap_or(3030)
-        } else {
-            3030
+                .and_then(|value| value.parse::<u16>().ok())
+                .filter(|port| *port >= 1024)
         };
-        format!("http://127.0.0.1:{port}")
+        if std::env::var("CHECKCC_DESKTOP_SMOKE").as_deref() == Ok("1") {
+            return explicit("CHECKCC_DESKTOP_SMOKE_PORT").unwrap_or(3030);
+        }
+        if let Some(port) = explicit("CHECKCC_DESKTOP_SITE_PORT") {
+            return port;
+        }
+        if cfg!(debug_assertions) {
+            return 3030;
+        }
+        (3030..=3049)
+            .find(|port| std::net::TcpListener::bind(("127.0.0.1", *port)).is_ok())
+            .unwrap_or(3030)
     })
 }
 type Reply = oneshot::Sender<Result<Value, String>>;
@@ -188,6 +204,9 @@ async fn desktop_call(
     if backend.stopping.load(Ordering::SeqCst) {
         return Err("应用正在恢复配置，请稍候。".into());
     }
+    if operation == "exportNodeSetupScript" {
+        return export_node_setup_script(&window).await;
+    }
     if !matches!(
         operation.as_str(),
         "getSettings" | "updateSettings" | "resetClaude"
@@ -197,6 +216,33 @@ async fn desktop_call(
     backend
         .request(&operation, patch.unwrap_or(Value::Null))
         .await
+}
+
+async fn export_node_setup_script(window: &WebviewWindow) -> Result<Value, String> {
+    const NAME: &str = "install-node.sh";
+    const SCRIPT: &[u8] = include_bytes!("../../public/install-node.sh");
+    let (send, receive) = oneshot::channel();
+    let mut picker = window
+        .dialog()
+        .file()
+        .set_parent(window)
+        .set_file_name(NAME)
+        .add_filter("Shell script", &["sh"]);
+    if let Ok(directory) = window.path().download_dir() {
+        picker = picker.set_directory(directory);
+    }
+    picker.save_file(move |choice| {
+        let _ = send.send(choice);
+    });
+    let Some(choice) = receive.await.map_err(|_| "无法打开保存窗口。".to_string())? else {
+        return Ok(json!({ "saved": false }));
+    };
+    let destination = choice.into_path().map_err(|error| error.to_string())?;
+    tauri::async_runtime::spawn_blocking(move || std::fs::write(&destination, SCRIPT))
+        .await
+        .map_err(|error| error.to_string())?
+        .map_err(|error| error.to_string())?;
+    Ok(json!({ "saved": true }))
 }
 
 #[tauri::command]
@@ -323,7 +369,8 @@ fn bridge(ports: &Value) -> String {
         if (!window.envGuardDesktop) Object.defineProperty(window, 'envGuardDesktop', {{ value: Object.freeze({{
           getSettings: () => call('getSettings'),
           updateSettings: patch => call('updateSettings', patch),
-          resetClaude: () => call('resetClaude')
+          resetClaude: () => call('resetClaude'),
+          exportNodeSetupScript: () => call('exportNodeSetupScript')
         }}), writable: false, configurable: false }});
         window.dispatchEvent(new Event('envguardcc:desktop-ready'));
       }}
@@ -619,7 +666,8 @@ fn startup_error(app: &tauri::AppHandle, backend: Arc<Backend>, error: String) {
         let app_exit = app.clone();
         app.dialog()
             .message(format!(
-                "{error}\n请确认应用端口 3030 未被占用。原始备份已保留。\n\n日志：{}",
+                "{error}\n请确认应用端口 {} 未被占用。原始备份已保留。\n\n日志：{}",
+                site_port(),
                 backend.log_hint()
             ))
             .title("EnvGuardCC 启动失败")

@@ -11,6 +11,7 @@
 
 import { isIP } from "node:net";
 import { ANYCAST_DOH } from "./public-dns.mjs";
+import { CHINA_CIDRS } from "./china-routes.mjs";
 
 export const CLAUDE_DOMAINS = [
   "anthropic.com",
@@ -66,8 +67,7 @@ export function ingressSummary(proxies, { hosts = {} } = {}) {
   return { total: Array.isArray(proxies) ? proxies.length : 0, entries: groups.length, shared: groups.length === 1 && groups[0].count > 1, groups };
 }
 
-// 内置的国内域名直连清单：不依赖 GeoSite/GeoIP 数据文件，离线也能工作。
-// 未收录的国内站点会走节点（更慢但不会泄漏），可通过 extraRules 或 Geo 数据增强。
+// 国内域名优先直连；未收录域名再按离线中国 IP 数据判断，均不需要首次下载 Geo 库。
 export const CN_DIRECT_DOMAINS = [
   "cn", "gov.cn", "edu.cn", "baidu.com", "bdimg.com", "bdstatic.com", "qq.com", "qpic.cn", "gtimg.cn", "tencent.com",
   "weixin.qq.com", "wechat.com", "alicdn.com", "aliyun.com", "alipay.com", "taobao.com", "tmall.com", "alibaba.com",
@@ -80,12 +80,14 @@ export const CN_DIRECT_DOMAINS = [
   "qcloud.com", "myqcloud.com", "aliyuncs.com", "jdcloud.com", "volces.com", "bytecdn.cn",
 ];
 
+const PUBLIC_DIRECT_DNS = ["223.5.5.5#DIRECT", "1.1.1.1#DIRECT"];
 
 // 私网保留原网卡/VPN 路由，避免 TUN 劫持公司 DNS 与内网服务。
 const PRIVATE_CIDRS = ["127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16"];
 // 对外暴露默认排除项：界面用它标注「已由默认私网规则覆盖」的冗余地址。
 export const DEFAULT_ROUTE_EXCLUSIONS = PRIVATE_CIDRS;
 const PRIVATE_RULES = PRIVATE_CIDRS.map((cidr) => `IP-CIDR,${cidr},DIRECT`);
+const PRIVATE_IPV6_RULES = ["::1/128", "fc00::/7", "fe80::/10"].map(cidr => `IP-CIDR6,${cidr},DIRECT`);
 // 内网域名必须同时处理 DNS、Fake-IP 与出站；仅加 DIRECT 仍会被公共 DNS 解析失败。
 const INTERNAL_DOMAINS = ["localhost", "lan", "local", "home.arpa"];
 
@@ -173,6 +175,9 @@ export function buildKernelConfig({
   blockClaude = false,
   guardInitiallyBlocked = false,
   ipv6 = false,
+  // 显式绑定 TUN 出口网卡。留空时保持内核 auto-detect-interface；
+  // 传入有效网卡名可避免系统残留默认路由把自动探测带偏（见 egress-interface.mjs）。
+  tunInterface = "",
 } = {}) {
   const nodes = (proxies ?? []).map(assertProxy).map((node) => {
     // 只给真做 TLS 握手的节点补指纹；用户显式写的值优先。
@@ -182,8 +187,13 @@ export function buildKernelConfig({
     return { ...node, "client-fingerprint": clientFingerprint };
   });
   if (!nodes.length) throw new Error("没有可用的出口节点；未配置节点时不得启动内核。");
+  if (!Array.isArray(extraRules) || extraRules.some(rule => typeof rule !== "string" || !rule.trim())) throw new Error("extraRules 必须是非空规则字符串数组。");
+  const explicitRules = extraRules.map(rule => rule.trim());
+  if (explicitRules.some(rule => /^(MATCH|FINAL)\s*,/i.test(rule))) throw new Error("extraRules 不得包含 MATCH/FINAL；兜底由出站模式决定。");
+  const publicDirectDns = Array.isArray(dns["direct-nameserver"]) ? dns["direct-nameserver"] : PUBLIC_DIRECT_DNS;
   const pinned = normalizeDomains(domains);
   if (!pinned.length) throw new Error("Claude 域名列表为空，置顶路由没有意义。");
+  const isPinnedDomain = host => pinned.some(domain => host === domain || host.endsWith(`.${domain}`));
   if (!localNetwork || typeof localNetwork !== "object" || Array.isArray(localNetwork)) throw new Error("localNetwork 必须是对象。");
   const { directDomains = [], dnsServers = ["system"], directInterface = "", dnsInterface = directInterface, strictRoute = true, routeExcludeAddresses = [] } = localNetwork;
   if (typeof directInterface !== "string" || (directInterface && !directInterface.trim())) throw new Error("directInterface 必须是有效网卡名称字符串。");
@@ -264,10 +274,11 @@ export function buildKernelConfig({
   const stunRules = blockStun && egressMode !== "direct" ? STUN_PORTS.map((port) => `AND,((NETWORK,udp),(DST-PORT,${port})),REJECT`) : [];
   if (!EGRESS_MODES.includes(egressMode)) throw new Error(`未知出站模式：${egressMode}`);
   // 出站模式：rule=海外走节点；global=全部走节点；direct=除固定 Claude 出口外全部直连。
-  // 规则模式：局域网 + 国内域名直连，其余（海外）统一走节点。
-  // 不依赖 Geo 数据，避免首次启动卡在下 GeoSite.dat。
+  // 规则模式先按域名，再按 IPv4/IPv6 判断国内流量；离线快照避免首次启动下载。
   const modeRules = egressMode === "rule"
-    ? [...PRIVATE_RULES, ...CN_DIRECT_DOMAINS.map((domain) => "DOMAIN-SUFFIX," + domain + ",DIRECT")]
+    ? [...PRIVATE_RULES, ...(ipv6 ? PRIVATE_IPV6_RULES : []),
+      ...CN_DIRECT_DOMAINS.map(domain => `DOMAIN-SUFFIX,${domain},DIRECT`),
+      ...CHINA_CIDRS.filter(cidr => ipv6 || !cidr.includes(":")).map(cidr => `${cidr.includes(":") ? "IP-CIDR6" : "IP-CIDR"},${cidr},DIRECT`)]
     : [];
   // 显式 finalRule 仍可覆盖模式默认值（测试与特殊部署用）。
   // 兜底不直接绑 Claude 专用组：rt 类流量需要故障转移，否则单节点掉线即全断。
@@ -282,9 +293,10 @@ export function buildKernelConfig({
   const customDomains = new Set(normalizeDomains(directDomains));
   const internalRules = internalDomains.map((domain) => `DOMAIN-SUFFIX,${domain},${customDomains.has(domain) ? localTarget : "DIRECT"}`);
   // 显式 HTTP/SOCKS 代理也需按配置的 IP 直连；TUN 路由排除本身不处理这类连接。
-  const customIpRules = customExcludedRoutes.filter((cidr) => localTarget !== "DIRECT" || !modeRules.includes(`IP-CIDR,${cidr},DIRECT`)).map((cidr) => `IP-CIDR,${cidr},${localTarget}`);
+  const customIpRules = customExcludedRoutes.map(cidr => `IP-CIDR,${cidr},${localTarget}`);
   // mihomo 按首条匹配执行：UDP 拒绝必须先于同域名的通用代理规则。
-  const rules = [...quicRules, ...claudeBlockRules, ...pinnedRules, ...probeRules, ...stunRules, ...internalRules, ...customIpRules, ...modeRules, ...extraRules.map(String), modeFinal];
+  // 显式规则优先于国内默认分流；Claude、STUN 与用户内网策略仍然优先。
+  const rules = [...new Set([...quicRules, ...claudeBlockRules, ...pinnedRules, ...probeRules, ...stunRules, ...internalRules, ...customIpRules, ...explicitRules, ...modeRules, modeFinal])];
 
   return {
     mode: "rule",
@@ -324,6 +336,7 @@ export function buildKernelConfig({
       "route-exclude-address": excludedRoutes,
       "dns-hijack": ["any:53"],
       "mtu": 9000,
+      ...(typeof tunInterface === "string" && tunInterface.trim() ? { "interface-name": tunInterface.trim() } : {}),
       ...(ipv6 ? { "inet6-address": ["fdfe:dcba:9876::1/126"] } : {}),
     },
     dns: {
@@ -339,13 +352,16 @@ export function buildKernelConfig({
       // respect-rules 会让 DNS 查询也走节点，而解析「代理服务器域名 / DoH 引导域名」又必须先有 DNS ——
       // 不把这两类域名钉死在直连解析上就会互相等待（实测：全部节点超时、/dns/query 超时）。
       "nameserver-policy": Object.fromEntries([
+        // 国内域名使用公网直连 DNS；更具体的节点、内网与 Claude 策略优先。
+        ...(egressMode === "rule" ? CN_DIRECT_DOMAINS.filter(domain => !isPinnedDomain(domain)).map(domain => [`+.${domain}`, [...publicDirectDns]]) : []),
         ...internalDomains.map((domain) => [`+.${domain}`, [...localDnsServers]]),
-        ...[...nodeServerHosts].map((host) => [`+.${host}`, [nodeDomainResolver]]),
-        ...[...dohHosts].map((host) => [`+.${host}`, [`${directBootstrapServer}#DIRECT`]]),
+        ...[...nodeServerHosts].filter(host => !isPinnedDomain(host)).map(host => [`+.${host}`, [nodeDomainResolver]]),
+        ...[...dohHosts].filter(host => !isPinnedDomain(host)).map(host => [`+.${host}`, [`${directBootstrapServer}#DIRECT`]]),
+        ...pinned.map(domain => [`+.${domain}`, [...new Set(publicDns)].map(server => `${server.split('#')[0]}#${groupName}`)]),
       ]),
       // 公网直连使用独立解析器与自动检测的出口网卡，不依赖公司 DNS / VPN 是否在线。
       // 公司 DNS 仅由上面的内网域名策略引用；不得放入全局直连解析或作为其兜底。
-      "direct-nameserver": ["223.5.5.5#DIRECT", "1.1.1.1#DIRECT"],
+      "direct-nameserver": [...publicDirectDns],
       "direct-nameserver-follow-policy": true,
       "respect-rules": true,
       "use-hosts": true,

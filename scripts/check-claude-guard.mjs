@@ -11,10 +11,37 @@ import {
   CLAUDE_GUARD_GROUP_PREFIX, claudeGuardSpecs, claudeGuardArmScript, claudeGuardReleaseScript, claudeGuardCountsScript,
   createClaudeGuard, discoverClaudeTargets, guardGroupName, hostsBlockText, hostsBlocked, mergeClaudeGuardTargets, stripHostsBlock,
   CLAUDE_GUARD_DOMAINS, CLAUDE_DIRECT_BLOCK_ADDRESSES, claudeDirectSpecs, PACKAGE_SID_SCRIPT, enableFirewallScript,
+  describeGuardFailure,
 } from "../scripts/net-core/claude-guard.mjs";
 
 const token = "testtoken01";
 const ruleCount = script => (script.match(/New-NetFirewallRule -PolicyStore/g) ?? []).length;
+
+test('守卫命令失败必须给可读原因，不能回退成整条 PowerShell 命令', () => {
+  const scriptText = "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; $ProgressPreference = 'SilentlyContinue'; try { Get-NetFirewallRule -Group 'EnvGuardCC-Claude-Guard-x' }";
+  // 超时被 kill：stderr 为空，message 是整条命令行。
+  const killed = Object.assign(new Error(`Command failed: C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe -NoProfile -NonInteractive -Command ${scriptText}`), { killed: true, signal: 'SIGTERM' });
+  const timeout = describeGuardFailure(killed, { timeoutMs: 45000 });
+  assert.match(timeout, /超时/);
+  assert.match(timeout, /45/);
+  assert.doesNotMatch(timeout, /Command failed|OutputEncoding|Get-NetFirewallRule/);
+
+  // PowerShell 真实报错：只保留末尾关键行。
+  const thrown = Object.assign(new Error(`Command failed: powershell.exe -Command ${scriptText}`), {
+    stderr: "\r\nAt line:1 char:1\r\n+ if ($directCount -lt 6) { throw '常驻桌面阻断未确认，拒绝撤防。' }\r\n+ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\r\n常驻桌面阻断未确认，拒绝撤防。\r\n",
+  });
+  const detail = describeGuardFailure(thrown);
+  assert.match(detail, /常驻桌面阻断未确认/);
+  assert.doesNotMatch(detail, /Command failed|OutputEncoding/);
+
+  // 防火墙关闭走专门的提示，不显示异常原文。
+  assert.match(describeGuardFailure({ stderr: "throw '[FIREWALL_DISABLED] ...'" }), /Windows 防火墙未开启/);
+
+  // 连 stderr 都没有：说明是签名异常/ENOENT，也不能泄露命令文本。
+  const bare = describeGuardFailure(Object.assign(new Error(`Command failed: powershell.exe -Command ${scriptText}`), { code: 'ENOENT' }));
+  assert.match(bare, /错误码 ENOENT/);
+  assert.doesNotMatch(bare, /Command failed|OutputEncoding/);
+});
 
 test('撤防规则核验失败时保留 hosts 阻断并记录失败阶段', async () => {
   let content = '', rejectRelease = false;

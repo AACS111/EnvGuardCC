@@ -48,7 +48,7 @@ for (const selector of ['.check-workspace', '.workspace-sidebar', '.workspace-co
   if (!exportedCss.includes(selector)) throw new Error('工作台样式未进入构建产物，已拒绝打包：' + selector);
 }
 const sources = {};
-for (const file of ['src/app/globals.css', 'src/components/detector/workspace.css', 'src/detection/local-helper.ts', 'src/components/detector/Detector.tsx', 'src/components/detector/ProtectionWorkspace.tsx', 'src/components/detector/RepairDialog.tsx']) sources[file] = createHash('sha256').update(await readFile(path.join(buildRoot, file))).digest('hex');
+for (const file of ['src/app/globals.css', 'src/components/detector/workspace.css', 'src/detection/local-helper.ts', 'src/components/detector/Detector.tsx', 'src/components/detector/ProtectionWorkspace.tsx', 'src/components/detector/RepairDialog.tsx', 'src/components/detector/NetCorePanel.tsx', 'src/detection/net-core-view.mjs']) sources[file] = createHash('sha256').update(await readFile(path.join(buildRoot, file))).digest('hex');
 await writeFile(path.join(exportRoot, 'checkcc-build.json'), JSON.stringify({ builtAt: new Date().toISOString(), sources }, null, 2));
 await run([path.join(root, 'scripts/build-desktop.mjs')], { ...process.env, CHECKCC_EXPORT_DIR: exportRoot });
 } finally {

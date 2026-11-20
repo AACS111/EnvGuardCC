@@ -32,7 +32,7 @@ scripts/net-core/kernel-manifest.json 版本与各平台产物清单
 `buildKernelConfig()` 生成，`assertKernelConfig()` 校验。任何一条不满足都拒绝启动：
 
 1. 生成模板中 `tun.enable = true` 且默认 `tun.strict-route = true`；运行时按用户接管意愿设置 enable。不能据此证明内核退出后持续阻断。
-2. `ipv6 = false` —— 关闭内核双栈功能；物理网卡 IPv6 旁路仍需实机验证。
+2. `ipv6` 与 `dns.ipv6` 必须一致；启用时必须由双栈 TUN 自动路由接管，物理网卡旁路仍需实机验证。
 3. `dns.enhanced-mode = fake-ip` 且 `respect-rules = true` —— 解析本身也走隧道。
 4. Claude 域名规则（`anthropic.com` / `claude.ai` / `claude.com` / `claudeusercontent.com` /
    `challenges.cloudflare.com`）的 QUIC 拒绝规则排最前，其后是通用域名代理规则；两者均优先于订阅和内网规则。
@@ -44,6 +44,23 @@ scripts/net-core/kernel-manifest.json 版本与各平台产物清单
 
 `pnpm test:netcore` 覆盖以上全部约束；运行时 `writeConfig()` 也会在写盘前调用
 `assertKernelConfig()`，所以不满足的配置在内核启动前就会被拒绝，而不是等到节点掉线才暴露成断网。
+
+## 国内外流量分流
+
+参考 [FlClash 的规则合并](https://github.com/chen08209/FlClash/blob/be84736605527034689c95bf27828ff27d912c5e/lib/common/task.dart#L338-L382)（新增规则置于原规则前）和 [Geo 数据配置](https://github.com/chen08209/FlClash/blob/be84736605527034689c95bf27828ff27d912c5e/lib/models/clash_config.dart#L33-L42)。本项目采用相同的 MetaCubeX 中国 IP 数据源，以离线展开规则代替启动时下载 Geo 库，特权宿主仍拒绝外部文件和 provider。
+
+规则按首条匹配执行。依次是 Claude 的 QUIC 拒绝、区域封禁和固定出口，其次是出口探测、STUN 拦截、用户内网直连、显式 `extraRules`、默认局域网和国内域名及 IP 分流，最后执行模式兜底。额外规则不能插入 `MATCH`/`FINAL`，相同规则自动去重。
+
+| 模式 | 普通流量 | Claude |
+|---|---|---|
+| rule | 现有国内域名清单（含 `.cn`）或离线中国 IPv4/IPv6 网段直连，其余走 `AUTO-PROXY` | 保持置顶守卫及固定出口 |
+| global | 走 `AUTO-PROXY`，用户声明的内网例外仍保留 | 保持置顶守卫及固定出口 |
+| direct | 直连 | 保持置顶守卫及固定出口 |
+| 严格会话 | 全部固定到 `CLAUDE-PIN` | 固定出口，区域封禁继续生效 |
+
+规则模式中，国内清单域名使用公网直连 DNS，公司 DNS 只处理用户声明的内网域名。Claude 域名有更具体的 DNS 策略，继续固定到专用出口。STUN 拦截在规则模式和全局模式下适用于所有进程。
+
+国内域名清单之外的域名按解析出的 IP 分流。CDN 和地区数据可能存在误差，可通过显式规则修正。IP 数据是随版本更新的快照，来源、哈希和许可见 [内核第三方说明](../third_party/mihomo/README.md)。
 
 ## 兜底与节点故障转移（对齐 FlClash）
 
@@ -83,6 +100,19 @@ scripts/net-core/kernel-manifest.json 版本与各平台产物清单
 启用 TUN 前还会执行网络交接：只读检查代理客户端与端口冲突，不自动关闭其他代理或 VPN；macOS 同时检查系统 VPN、默认隧道路由和残留系统代理。未能释放时拒绝接管并显示原因。完整支持列表及平台限制见[交接说明](NETWORK-SAFETY-IMPLEMENTATION.md)。独立本机代理模式不会主动退出其他工具。
 
 > 生产环境必须传 `verifyTunnel: true`。默认 `false` 仅为让模拟内核的单元测试不受影响。
+
+## 出口网卡：不再完全依赖 auto-detect-interface
+
+mihomo 的 `tun.auto-detect-interface` 用系统“最佳接口”查询决定物理出口。Windows 上如果残留一条指向已断开网卡的默认路由（拔网线、休眠唤醒后常见），查询会返回那张没有链路的网卡，内核拿到空接口名（日志 `Auto detect interface ... get empty name` / `<invalid>`），所有节点拨号变成 `i/o timeout`，而同一节点的 UDP 链路仍正常，表现为“TCP 443 挂了、Hysteria2 还能用”。
+
+因此 `writeConfig` 会在生成配置前探测**真正 Up 的默认出口网卡**（`scripts/net-core/egress-interface.mjs`）：
+
+- 按默认路由优先级（InterfaceMetric）取第一张 `Status=Up` 且 `MediaConnectionState=Connected` 的物理网卡，排除内核自己的 TUN 与已知代理虚拟网卡（`Meta`、`utun*`、`tun*`、`cfw-tap` 等）；
+- 探测结果写进 `tun.interface-name`，内核不再在每次连接时重新猜出口；
+- 结果按网络指纹缓存（默认 30 秒），网卡集合变化时立即失效重探；探测失败时省略该字段，保持 `auto-detect-interface` 原行为；
+- 平台覆盖 Windows / macOS / Linux：macOS 检查 `status: active`，Linux 检查 `operstate=up`。
+
+内网豁免网卡（`directInterface` / `dnsInterface`）语义不变：即使离线也保留绑定，等公司网络恢复后继续使用；它只影响 `internalDomains` 的解析与直连，不参与公网出口选择。
 
 ## 固定出口探测：复用主内核，不再起临时内核
 
@@ -468,15 +498,15 @@ $env:CHECKCC_NET_CORE_TUN="1"; pnpm dev
 
 | 模式 | 行为 | 典型用途 |
 |---|---|---|
-| `rule`（默认） | 局域网 + 内置国内域名直连，**其余海外流量走 `AUTO-PROXY` 故障转移组** | 日常使用：既上网又优化环境 |
+| `rule`（默认） | 局域网、国内域名和中国 IPv4/IPv6 直连，**其余流量走 `AUTO-PROXY` 故障转移组** | 日常使用：既上网又优化环境 |
 | `global` | 内网豁免之外的非 Claude 流量走 `AUTO-PROXY` | 需要更大代理范围 |
 | `direct`（界面：其他直连） | Claude 仍走固定组，其他流量直连 | 保留固定出口并缩小代理范围 |
 
 - Claude 家族域名在**所有模式**下都置顶走专用组，并拒绝其 QUIC（UDP/443）。
 - 非 Claude 流量在 rule/global 模式下由 `AUTO-PROXY` 兜底：单节点掉线时自动转移到下一个可用节点，
   不再出现「一个节点挂了、国外整体没网」。direct 模式不生成该组，兜底为 `MATCH,DIRECT`。
-- 规则模式**不依赖 GeoIP/GeoSite 数据文件**：使用内置国内域名清单（`CN_DIRECT_DOMAINS`），
-  因此离线可用、启动不会被"下载 GeoSite.dat"卡住。未收录的国内站点会走节点（更慢但不会泄漏）。
+- 规则模式使用内置国内域名清单（`CN_DIRECT_DOMAINS`）和随包中国 IP 快照，
+  离线可用、启动不会被下载 Geo 库卡住；未收录域名按解析后的目的 IP 补充分流。
 - 切换模式会重建配置并热加载，保持内核、TUN 与固定出口选择；失败时恢复原模式，模式持久化在 `<state>/net-core-mode.json`。
 - 路径示意图按内核当前连接显示“代理出口”和“直连”；代理出口合并展示 Claude 与其他国内外代理连接，计数按实际代理链汇总。数量来自真实代理链，实线与主机标签来自新鲜的连接采样，淡光点是路径示意装饰；不按“全局”配置制造流量，也不把直连等同于国内流量。短连接可能在两次采样之间结束，图中不提供累计流量或目的地国家统计。
 - 内核提供本机代理端口（默认 `127.0.0.1:39080`），可直接作为系统代理使用；TUN 模式下则自动接管。
@@ -547,6 +577,10 @@ networksetup -setv6automatic "Wi-Fi"
 ```
 
 ## 传输记录
+
+出口稳定性的「查看记录」与传输记录的「仅 Claude」使用同一批留存数据，包含活动和已结束的内核连接以及应用 HTTP 网关请求。角标按出口 IP 分组，点击标签即可打开对应的明细和导出。同一 IP 多次出现时合并为一个标签。超过 48 小时或因记录上限淘汰的明细也从角标中移除。
+
+内核连接按建立时的出口证据和实际固定代理链记录出口 IP，网关请求按开始时的实际发送路径与出口证据记录。切换出口后，已有记录保留原先的归属。缺少出口证据的历史记录计入「出口未知」，可在同一列表中查看。
 
 网络页的「传输记录」展示经过本机内核的连接元数据。卡片显示活动数、保留期内总数和最近 3 条连接；打开后可按主机/IP、仅 Claude、是否走代理出口筛选，分页查看并展开详情，也可一键清空。
 

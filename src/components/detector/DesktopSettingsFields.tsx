@@ -5,7 +5,7 @@ import { observeDesktopSettings } from '@/detection/desktop-connection';
 
 type Settings = { openAtLogin: boolean; autoStartProtection: boolean; canOpenAtLogin: boolean; loginStatus: string | null };
 type ResetResult = { cancelled?: boolean; complete?: boolean; cleared?: string[]; message?: string; error?: string };
-type Bridge = { getSettings: () => Promise<Settings>; updateSettings: (patch: Partial<Pick<Settings, 'openAtLogin' | 'autoStartProtection'>>) => Promise<Settings>; resetClaude: () => Promise<ResetResult> };
+type Bridge = { getSettings: () => Promise<Settings>; updateSettings: (patch: Partial<Pick<Settings, 'openAtLogin' | 'autoStartProtection'>>) => Promise<Settings>; resetClaude: () => Promise<ResetResult>; exportNodeSetupScript?: () => Promise<{ saved: boolean }> };
 declare global { interface Window { envGuardDesktop?: Bridge } }
 
 export function DesktopSettingsFields({ locale, protectionEnabled = false }: { locale: LocaleCode; protectionEnabled?: boolean }) {

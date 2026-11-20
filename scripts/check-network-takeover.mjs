@@ -109,6 +109,21 @@ test("命令超时被 kill 时改写成可读超时，而不是裸 Command faile
   assert.equal(describeCommandFailure("powershell.exe", denied), denied);
 });
 
+test("Windows 枚举先按名字过滤再取路径，不对全量进程逐个读 .Path", async () => {
+  const scripts = [];
+  const takeover = createNetworkTakeover({ platform: "win32", exec: async (file, args) => {
+    scripts.push(args[args.length - 1]);
+    return JSON.stringify([{ Id: 10, Path: String.raw`C:\Apps\FlClash.exe`, Window: true }]);
+  } });
+  await assert.rejects(takeover.prepare(), /FlClash.*已保留现有网络/);
+  assert.equal(scripts.length, 1);
+  assert.match(scripts[0], /\$_\.ProcessName -match/);
+  assert.match(scripts[0], /flclash/);
+  assert.match(scripts[0], /clash-verge/);
+  assert.match(scripts[0], /mihomo/);
+  assert.match(scripts[0], /clash-meta/);
+});
+
 test("解析 Windows 进程扫描结果，托盘运行的客户端直接提示手动退出", async () => {
   let scans = 0;
   const rows = () => { scans++; return JSON.stringify([{ Id: 10, Path: String.raw`C:\Apps\FlClash.exe`, Window: false }]); };

@@ -71,9 +71,14 @@ function loopback(hostname) {
   return hostname === "localhost" || hostname === "::1" || hostname === "[::1]" || /^127\./.test(hostname);
 }
 
-export function proxyInfo(url) {
-  const proxy = loopback(url.hostname) ? null : selectedProxy();
+export function proxyInfo(url, proxyOverride) {
+  const proxy = proxyOverride === undefined ? (loopback(url.hostname) ? null : selectedProxy()) : proxyOverride;
   return proxy ? { mode: "http-connect", source: proxy.source, address: proxy.url.origin } : { mode: "direct", source: "direct", address: null };
+}
+
+export function requestTransport(url, select = selectedProxy) {
+  const proxy = loopback(url.hostname) ? null : select();
+  return { proxy, info: proxyInfo(url, proxy) };
 }
 
 // CONNECT 始终把目标域名交给代理；HTTPS 仍校验目标证书，不降级 TLS。

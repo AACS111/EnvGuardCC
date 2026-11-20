@@ -32,6 +32,7 @@ test("real forwarding, profile reload, CORS, diagnostics isolation and secret re
   try {
     assert.equal((await get("/__checkcc/status", {})).status, 403);
     assert.equal((await get("/__checkcc/status", {...ui, Origin:"https://evil.example"})).status, 403);
+    assert.equal((await get("/__checkcc/ip-assessment")).status, 404);
     const browserProbe = await get("/__checkcc/browser-probe", { ...ui, "Accept-Language": "ko-KR,ko;q=0.9", Authorization: "private-key", Cookie: "private-cookie" });
     assert.equal(browserProbe.status, 200);
     const browserSample = await browserProbe.json();
@@ -657,6 +658,34 @@ test('传输记录接口只允许本机 UI，支持分页/筛选与显式清空�
     const empty = await (await fetch(emptyUrl + '/__checkcc/net-core/connections', { headers: ui })).json();
     assert.equal(empty.ok, true); assert.equal(empty.available, false); assert.deepEqual(empty.items, []);
   } finally { await close(emptyServer); }
+});
+
+test('出口历史与按 IP 筛选的 Claude 传输明细使用同一计数', async () => {
+  const { createConnectionLog } = await import('./net-core/connection-log.mjs');
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'checkcc-request-counts-'));
+  const ip = '203.0.113.10';
+  const log = await createConnectionLog({ stateDir: directory, requestExit: () => ip });
+  const gateway = createGateway({ stateDir: directory, netCore: { report: async () => ({ state: 'running' }), connectionLog: log }, collect: async () => ({ exit: { primary: { ip, countryCode: 'US' } } }) });
+  const url = await listen(gateway);
+  try {
+    const id = await log.beginRequest({ method: 'POST', endpoint: '/v1/messages', host: 'api.anthropic.com', port: 443 });
+    await log.finishRequest(id, { status: 200 });
+    await log.sample([{ id: 'legacy', metadata: { host: 'claude.ai' }, chains: ['node', 'CLAUDE-PIN'] }]);
+    for (const endpoint of ['/__checkcc/diagnostics?signal=country', '/__checkcc/net-core']) {
+      const response = await fetch(url + endpoint, { headers: ui });
+      const result = await response.json();
+      assert.deepEqual(result.exitHistory.requestCounts, { [ip]: 1 });
+      assert.equal(result.exitHistory.unassignedRequests, 0);
+      assert.deepEqual(result.exitHistory.claudeTransferCounts, { byExit: { [ip]: 1 }, unassigned: 1 });
+    }
+    const route = `${url}/__checkcc/net-core/connections?claude=true&exitIp=`;
+    for (const exitIp of [ip, 'unknown']) {
+      const data = await (await fetch(route + exitIp, { headers: ui })).json();
+      assert.equal(data.exitIp, exitIp);
+      assert.equal(data.total, 1);
+    }
+    assert.equal((await fetch(route + 'invalid', { headers: ui })).status, 400);
+  } finally { await close(gateway); await log.stop(); await rm(directory, { recursive: true, force: true }); }
 });
 
 test('真实 HTTP 网关保存请求状态/耗时与计数字节，导出与回放不泄露 query/正文，记录范围可保存', async () => {

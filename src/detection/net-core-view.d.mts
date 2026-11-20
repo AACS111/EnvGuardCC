@@ -13,6 +13,7 @@ export type NodeSelectionChoice = {
 };
 
 export function nodeLatencyTone(delay: number | null | undefined): NetCoreTone;
+export function exitHistoryTags(history: import('./gateway-check').ExitHistory | null | undefined): Array<{ ip: string; at: string | null; countryCode?: string | null; transferCount: number }>;
 export function nodeMeasurementScope(report: unknown): string;
 export function nodeSelectionState(options?: {
   nodes?: string[];

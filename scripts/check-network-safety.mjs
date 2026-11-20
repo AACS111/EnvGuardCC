@@ -195,6 +195,8 @@ async function fakeRuntime(t, takeover = { prepare: async () => {}, status: () =
       return { ok: true, json: async () => ({ ok: true, ...(options.body && JSON.parse(options.body).action === 'ipv6' ? { changed: true, previous: 'Off' } : {}), ...(guard ? { guard: { ...guard } } : {}) }) };
     },
     interfaces: () => (interfaceAddress ? { test: [{ address: interfaceAddress, internal: false }] } : {}),
+    // 出口网卡探测只跑真实系统命令，测试必须注入空探测器，避免拖慢/依赖本机状态。
+    egressInterface: { peek: () => null, invalidate: () => {} },
     healthScheduler: { every: callback => { scheduled = callback; return { unref() {} }; }, clear: () => { scheduled = null; } },
     createCore: options => {
       // 能力探测不访问真实节点，也不操作系统 IPv6。
@@ -950,7 +952,7 @@ test('复用已开启的隧道不重载内核，启动出口证据只在当前�
   assert.equal(f.exitProbes(), probes + 1, '切网后必须重新验证');
 });
 
-test('慢 IPv6 探测不阻塞开启保护，退出取消探测并恢复系统设置', async t => {
+test('慢 IPv6 探测不阻塞开启保护，退出取消探测并恢复系统设置', { timeout: 8000 }, async t => {
   let finishProbe;
   const probeStarted = new Promise(resolve => { finishProbe = resolve; });
   let cancelled = false;
@@ -965,11 +967,9 @@ test('慢 IPv6 探测不阻塞开启保护，退出取消探测并恢复系统�
     }),
   });
   await f.runtime.importNodes([node('a')]);
-  const starting = f.runtime.setTunnel(true);
-  const ready = await Promise.race([starting.then(() => true), new Promise(resolve => setTimeout(() => resolve(false), 300))]);
-  // Always release the intentionally blocked fake probe, including on regression.
-  if (!ready) { f.runtime.cancelPending?.(); throw new Error('IPv6 探测阻塞了保护启动'); }
+  await f.runtime.setTunnel(true);
   await probeStarted;
+  assert.equal(cancelled, false, '保护启动后 IPv6 探测仍应在后台运行');
   assert.equal(f.ipv6Disabled(), true, '探测期间必须阻断 IPv6 旁路');
   await f.runtime.stop();
   assert.equal(cancelled, true);

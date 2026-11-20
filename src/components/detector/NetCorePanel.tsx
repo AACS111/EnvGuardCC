@@ -3,7 +3,7 @@
 import { useCallback, useId, useRef, useState } from "react";
 import type { LocaleCode } from "@/i18n/messages";
 import type { ExitHistory, NetCoreExit, NetCoreReport } from "@/detection/gateway-check";
-import { netCoreView, nodeLatencyTone, nodeSelectionState, visibleViolations } from "@/detection/net-core-view.mjs";
+import { netCoreView, nodeLatencyTone, nodeSelectionState, visibleViolations, exitHistoryTags } from "@/detection/net-core-view.mjs";
 import { claudeRegionSupport } from "@/detection/claude-regions.mjs";
 import { describeExit } from "@/detection/exit-quality.mjs";
 import { countryDisplayName } from "@/detection/exit-geo";
@@ -77,23 +77,10 @@ export function NetCorePanel({
   const ipv6Issue = Boolean(ipv6 && !ipv6.protected && ipv6.system !== 'disabled');
   const view = netCoreView(report, { locale, exitHistory });
   const { items: violations, hidden } = visibleViolations(view, 20);
-  // 出口历史：每个 IP 标注该期间结束的 Claude 请求；点击回放到该时间点。
-  const exitEntries = exitHistory?.entries ?? [];
-  // 同一出口 IP 可能出现多次；合并为一个 tag，请求数相加，时间取最近一次。
-  const exitTags = (() => {
-    const merged = new Map<string, { ip: string; at: string; countryCode?: string | null; requests: number }>();
-    for (const entry of exitEntries) {
-      const current = merged.get(entry.ip);
-      if (!current) merged.set(entry.ip, { ip: entry.ip, at: entry.at, countryCode: entry.countryCode, requests: entry.requests ?? 0 });
-      else {
-        current.requests += entry.requests ?? 0;
-        if (entry.countryCode) current.countryCode = entry.countryCode;
-        if (Date.parse(entry.at) >= Date.parse(current.at)) current.at = entry.at;
-      }
-    }
-    return [...merged.values()];
-  })();
-  const claudeRequests = exitTags.reduce((sum, entry) => sum + entry.requests, 0);
+  // 同一 IP 只显示一次，角标读取已记录请求的 48 小时聚合，不能累加重复变化点。
+  const exitTags = exitHistoryTags(exitHistory);
+  const unknownExitCount = exitHistory?.claudeTransferCounts?.unassigned ?? 0;
+  const claudeTransfers = exitTags.reduce((sum, entry) => sum + entry.transferCount, unknownExitCount);
   // 代理范围会影响新连接的路由；确认后热加载，已有连接可能沿用原路径。
   const [pendingMode, setPendingMode] = useState<Mode | null>(null);
   // 出口历史需要主动打开传输记录；用状态保存句柄，避免在渲染期读取 ref。
@@ -302,27 +289,30 @@ export function NetCorePanel({
             <h3>{text("出口稳定性", "Exit stability")}<span className="netcore-state-pill" data-tone={view.exitStability.stable ? "ok" : "warn"}>{view.exitStability.stable ? text("稳定", "Stable") : text("存在漂移", "Drifting")}</span></h3>
           </div>
           <p className="netcore-detail">{text(
-            `近 ${view.exitStability.windowHours} 小时出口 IP 变化 ${view.exitStability.changes} 次${claudeRequests > 0 ? `，Claude 请求 ${claudeRequests} 次` : ""}，当前 ${view.exitStability.current ?? exitIp ?? "—"}。`,
-            `Exit IP changed ${view.exitStability.changes} time(s)${claudeRequests > 0 ? ` and ${claudeRequests} Claude request(s) were sent` : ""} in the last ${view.exitStability.windowHours}h; current ${view.exitStability.current ?? exitIp ?? "—"}.`,
+            `近 ${view.exitStability.windowHours} 小时出口 IP 变化 ${view.exitStability.changes} 次${claudeTransfers > 0 ? `，Claude 传输记录 ${claudeTransfers.toLocaleString(locale)} 条` : ""}，当前 ${view.exitStability.current ?? exitIp ?? "—"}。`,
+            `Exit IP changed ${view.exitStability.changes} time(s)${claudeTransfers > 0 ? ` with ${claudeTransfers.toLocaleString(locale)} Claude transfer records` : ""} in the last ${view.exitStability.windowHours}h; current ${view.exitStability.current ?? exitIp ?? "—"}.`,
           )}{!view.exitStability.stable && text(" 频繁变化可能让 Claude 重新验证登录，也可能只是节点故障转移。", " Frequent changes may trigger a login re-check, or may just be node failover.")}</p>
-          {(exitTags.length > 0 || (exitHistory?.ips?.length ?? 0) > 0) && <details className="netcore-history">
+          {(exitTags.length > 0 || unknownExitCount > 0) && <details className="netcore-history">
             <summary>{text("查看记录", "View history")}</summary>
-            <ul>{exitTags.length > 0 ? exitTags.map((entry) => {
-              const requests = entry.requests ?? 0;
+            <ul>{exitTags.map((entry) => {
+              const countLabel = entry.transferCount ? entry.transferCount.toLocaleString(locale) : null;
               const support = claudeRegionSupport(entry.countryCode);
               const regionTone = support === "supported" ? "ok" : support === "unsupported" ? "danger" : "muted";
               const regionNote = support === "supported" ? text("Claude 支持地区", "Claude supported region") : support === "unsupported" ? text("Claude 不支持地区", "Claude unsupported region") : null;
-              // 0 次不占版面：只有真实发生过 Claude 请求的出口才显示次数徽标。
-              const requestNote = requests > 0 ? text(`Claude 请求 ${requests} 次`, `${requests} Claude request(s)`) : null;
-              return <li key={`${entry.ip}-${entry.at}`} data-claude={requests > 0 ? "true" : "false"}>
-                <button type="button" className="netcore-history__pill" data-tone={regionTone} onClick={() => transferLogHandle?.openAt(entry.at)} title={[entry.countryCode ? entry.countryCode : text("地区未知", "Region unknown"), regionNote, requestNote].filter(Boolean).join(" · ")}>
+              const countNote = countLabel ? text(`近 48 小时 ${countLabel} 条 Claude 传输记录`, `${countLabel} Claude transfer records in the last 48 hours`) : null;
+              const current = entry.ip === exitHistory?.current;
+              return <li key={entry.ip}>
+                {countLabel && <span className="netcore-history__requests" aria-hidden="true">{countLabel}</span>}
+                <button type="button" className="netcore-history__pill" data-tone={regionTone} aria-current={current ? "true" : undefined} onClick={() => transferLogHandle?.openExit(entry.ip)} aria-label={[entry.ip, current && text("当前出口", "Current exit"), countNote].filter(Boolean).join(" · ")} title={[entry.countryCode ? entry.countryCode : text("地区未知", "Region unknown"), regionNote, countNote].filter(Boolean).join(" · ")}>
                   <span className="netcore-history__address">{entry.ip}</span>
-                  {requests > 0 && <span className="netcore-history__requests">{requests}</span>}
-                  {entry.ip === exitHistory!.current && <span className="netcore-history__current">{text("当前", "current")}</span>}
+                  {current && <span className="netcore-history__current">{text("当前", "current")}</span>}
                 </button>
               </li>;
-            }) : exitHistory!.ips.map((ip) => <li key={ip}>{ip}{ip === exitHistory!.current ? text(" · 当前", " · current") : ""}</li>)}</ul>
-            {exitTags.length > 0 && <p className="netcore-history__hint">{text("点击任一出口，回看该时段的传输记录。", "Select an exit to replay transfer records from that period.")}</p>}
+            })}{unknownExitCount > 0 && <li>
+              <span className="netcore-history__requests" aria-hidden="true">{unknownExitCount.toLocaleString(locale)}</span>
+              <button type="button" className="netcore-history__pill" data-tone="muted" onClick={() => transferLogHandle?.openExit('unknown')} aria-label={text(`出口未知 · 近 48 小时 ${unknownExitCount.toLocaleString(locale)} 条 Claude 传输记录`, `Unknown exit · ${unknownExitCount.toLocaleString(locale)} Claude transfer records in the last 48 hours`)}>{text("出口未知", "Unknown exit")}</button>
+            </li>}</ul>
+            <p className="netcore-history__hint">{text("点击出口查看近 48 小时的 Claude 传输记录。", "Select an exit to view its Claude transfer records from the last 48 hours.")}</p>
           </details>}
         </section>}
 

@@ -444,6 +444,25 @@ export function trafficFlowSamples(report, { now = Date.now() } = {}) {
   };
 }
 
+export function exitHistoryTags(history) {
+  const merged = new Map();
+  const entries = history?.entries?.length ? history.entries : (history?.ips ?? []).map(ip => ({ ip, at: history.lastAt }));
+  for (const entry of entries) {
+    const current = merged.get(entry.ip);
+    if (!current) merged.set(entry.ip, { ...entry });
+    else {
+      if (entry.countryCode) current.countryCode = entry.countryCode;
+      if (Date.parse(entry.at) >= Date.parse(current.at)) current.at = entry.at;
+    }
+  }
+  const byExit = history?.claudeTransferCounts?.byExit ?? {};
+  for (const ip of Object.keys(byExit)) if (!merged.has(ip)) merged.set(ip, { ip, at: null });
+  return [...merged.values()].map(entry => {
+    const count = byExit[entry.ip];
+    return { ...entry, transferCount: Number.isSafeInteger(count) && count > 0 ? count : 0 };
+  });
+}
+
 export function activeFlowConnections(report, { now = Date.now() } = {}) {
   const snapshot = report?.connectionLog;
   const age = now - Date.parse(snapshot?.sampledAt ?? "");

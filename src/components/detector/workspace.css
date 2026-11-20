@@ -357,12 +357,14 @@
 .netcore-history { color: var(--repair-muted); font-size: var(--workspace-label); }
 .netcore-history summary { cursor: pointer; font-weight: 600; }
 .netcore-history ul { display: flex; flex-wrap: wrap; gap: 4px 14px; margin: 6px 0 0; padding-left: 16px; font-variant-numeric: tabular-nums; }
-.netcore-history__pill { display: inline-flex; align-items: center; gap: 6px; padding: 2px 8px; border: 1px solid currentColor; border-radius: 999px; background: rgba(113, 110, 104, 0.08); color: var(--repair-muted); font: inherit; cursor: pointer; }
+.netcore-history li { display: inline-grid; justify-items: end; align-content: end; max-width: 100%; }
+.netcore-history__pill { position: relative; display: inline-flex; align-items: center; max-width: 100%; gap: 6px; padding: 2px 8px; border: 1px solid currentColor; border-radius: 999px; background: rgba(113, 110, 104, 0.08); color: var(--repair-muted); font: inherit; cursor: pointer; }
+.netcore-history__address { min-width: 0; overflow-wrap: anywhere; }
 .netcore-history__pill[data-tone="ok"] { color: #1f7a4d; background: rgba(31, 122, 77, 0.08); }
 .netcore-history__pill[data-tone="danger"] { color: #b42318; background: rgba(180, 35, 24, 0.08); }
 .netcore-history__pill[data-tone="muted"] { color: var(--repair-muted); }
 .netcore-history__pill:hover .netcore-history__address { text-decoration: underline; }
-.netcore-history__requests { padding: 0 5px; border-radius: 999px; background: rgba(0, 0, 0, 0.06); font-size: 10px; line-height: 1.6; font-variant-numeric: tabular-nums; }
+.netcore-history__requests { min-width: 1.5em; padding: 0 4px; border: 1px solid var(--workspace-control-border); border-radius: var(--workspace-control-radius); background: var(--repair-surface); color: var(--workspace-flow-claude); font-size: var(--workspace-label); font-weight: 600; line-height: 1.25; text-align: center; font-variant-numeric: tabular-nums; pointer-events: none; }
 .netcore-history__current { opacity: 0.75; }
 .netcore-history__hint { margin: 6px 0 0; color: var(--repair-muted); font-size: var(--workspace-label); }
 .netcore-pill { display: inline-flex; align-items: center; gap: 6px; padding: 2px 10px; border-radius: 999px; background: var(--workspace-track); color: var(--repair-muted); font-size: var(--workspace-label); font-weight: 600; }
@@ -628,6 +630,8 @@
 .workspace-summary-card h3 svg { color: var(--repair-accent); }
 .workspace-summary-value { margin: 9px 0 4px; font-size: 18px; font-weight: 600; overflow-wrap: anywhere; }
 .workspace-summary-card > p { margin: 4px 0; font-size: 11px; }
+.workspace-summary-card > .workspace-summary-node { font-size: var(--workspace-label); overflow-wrap: anywhere; }
+.workspace-summary-node .netcore-node__latency { display: inline-block; }
 .workspace-browser-card .repair-description { display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; margin-top: 9px; color: var(--repair-muted); font-size: 11px; }
 .workspace-browser-card .repair-description strong { display: block; margin-bottom: 4px; color: var(--repair-text); font-size: 14px; font-weight: 600; }
 .workspace-browser-actions { display: flex; gap: 5px; flex-wrap: wrap; margin-top: 10px; }
@@ -862,3 +866,40 @@
 .workspace-flow__photon { fill: var(--repair-accent); color: var(--repair-accent); filter: drop-shadow(0 0 3px currentColor); pointer-events: none; }
 .workspace-flow__photon--direct { fill: var(--score-measured); color: var(--score-measured); }
 @media (prefers-reduced-motion: reduce) { .workspace-flow__photon { display: none; } }
+
+/* VPS 推荐：官网标称与匿名历史测试分区呈现。 */
+.check-workspace .vps-dialog { width: min(1360px, calc(100vw - 32px)); }
+.check-workspace .vps-dialog .repair-dialog__header h2 { font-size: var(--workspace-title); }
+.vps-dialog .repair-dialog__body { background: var(--workspace-sidebar-surface); }
+.vps-toolbar { display: flex; align-items: center; gap: 8px 12px; flex-wrap: wrap; margin-top: 12px; }
+.vps-muted { color: var(--repair-muted); font-size: var(--workspace-label); line-height: 1.5; }
+.vps-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+.vps-card { display: flex; flex-direction: column; gap: 12px; min-width: 0; padding: 16px; border: 1px solid var(--repair-border); border-radius: var(--workspace-radius); background: var(--repair-surface); }
+.vps-card__head { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; }
+.vps-card__head h3 { margin: 0; font-size: var(--workspace-display); font-weight: 600; }
+.vps-domain { color: var(--repair-muted); font-size: var(--workspace-label); }
+.vps-card__summary { margin: 0; color: var(--repair-muted); font-size: var(--workspace-label); line-height: 1.6; }
+.vps-tag { flex-shrink: 0; padding: 4px 8px; border-radius: var(--workspace-control-radius); background: var(--repair-selected); color: var(--repair-text); font-size: var(--workspace-label); font-weight: 600; }
+.vps-tag--measured { padding: 0; background: transparent; color: var(--repair-muted); font-weight: 400; }
+.vps-block { padding: 12px; border-radius: var(--workspace-control-radius); background: var(--workspace-sidebar-surface); }
+.vps-block h4 { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; margin: 0 0 8px; color: var(--repair-accent); font-size: var(--workspace-label); font-weight: 600; }
+.vps-block ul { margin: 8px 0; padding-left: 16px; font-size: var(--workspace-label); }
+.vps-block li { margin: 4px 0; }
+.vps-block strong { font-size: var(--workspace-body); }
+.vps-price { color: var(--repair-muted); font-size: var(--workspace-label); }
+.vps-block--measured { border: 1px solid var(--repair-border); background: var(--repair-surface); }
+.vps-metrics { display: grid; gap: 8px; margin: 0; font-size: var(--workspace-label); }
+.vps-metrics > div { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+.vps-metrics dt { color: var(--repair-muted); }
+.vps-metrics dd { min-width: 0; margin: 0; font-weight: 600; text-align: right; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
+.vps-note { margin: 0; color: var(--repair-muted); font-size: var(--workspace-label); line-height: 1.5; }
+.vps-card__foot { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; margin-top: auto; padding-top: 4px; }
+.vps-setup { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; margin-top: 16px; padding: 12px 16px; border: 1px solid var(--repair-border); border-radius: var(--workspace-radius); background: var(--repair-surface); }
+.vps-setup > div { flex: 1 1 480px; min-width: 0; }
+.vps-setup h3 { margin: 0 0 4px; font-size: var(--workspace-subheading); }
+.vps-setup p { margin: 0 0 8px; color: var(--repair-muted); }
+.vps-setup code { display: inline-block; padding: 4px 8px; border-radius: var(--workspace-control-radius); background: var(--repair-selected); overflow-wrap: anywhere; }
+.vps-setup .vps-export-notice { flex-basis: 100%; margin: 0; overflow-wrap: anywhere; }
+.vps-setup .vps-export-notice[role="alert"] { color: var(--repair-danger); }
+.vps-disclaimer { margin: 12px 0 0; padding-top: 12px; border-top: 1px solid var(--repair-border); color: var(--repair-muted); font-size: var(--workspace-label); line-height: 1.6; }
+@media (max-width: 980px) { .vps-grid { grid-template-columns: 1fr; } }

@@ -1601,12 +1601,12 @@ test('路径图螃蟹随保护与网关状态往返，不受旧连接采样影�
   assert.equal((render(true).match(/class="workspace-flow__mascot"/g) ?? []).length, 1);
 });
 
-test('出口历史标注 Claude 地区与请求数', () => {
+test('出口角标按 IP 显示 48 小时 Claude 传输记录，概览包含未知出口', () => {
   const { NetCorePanel } = require(path.join(root, 'src/components/detector/NetCorePanel.tsx'));
   const report = { enabled: true, state: 'running', nodes: ['US-NODE'], selected: 'US-NODE', mode: 'rule', tunEnabled: true, tunCaptured: true, routing: { state: 'verified', claude: 0, pinned: 0, direct: 0, total: 0, violations: [] } };
   const now = new Date().toISOString();
   const later = new Date(Date.parse(now) + 60000).toISOString();
-  const exitHistory = { windowHours: 48, samples: 3, changes: 2, stable: false, current: '198.51.100.20', ips: ['198.51.100.20', '203.0.113.10'], entries: [
+  const exitHistory = { windowHours: 48, samples: 3, changes: 2, stable: false, current: '198.51.100.20', ips: ['198.51.100.20', '203.0.113.10'], requestCounts: { '198.51.100.20': 5 }, claudeTransferCounts: { byExit: { '198.51.100.20': 7, '2001:db8::20': 3 }, unassigned: 2 }, entries: [
     { ip: '203.0.113.10', at: now, countryCode: 'CN', requests: 0, connections: 3 },
     { ip: '198.51.100.20', at: now, countryCode: 'US', requests: 4, connections: 6 },
     { ip: '198.51.100.20', at: later, countryCode: 'US', requests: 3, connections: 3 },
@@ -1614,18 +1614,31 @@ test('出口历史标注 Claude 地区与请求数', () => {
   const html = renderToStaticMarkup(React.createElement(NetCorePanel, { locale: 'zh', report, onRefresh() {}, onRestart() {}, onSelectNode() {}, onMeasure() {}, onModeChange() {}, exitHistory }));
   assert.match(html, /data-tone="ok"/);
   assert.match(html, /data-tone="danger"/);
-  assert.match(html, /netcore-history__requests">7</);
+  assert.match(html, /netcore-history__requests"[^>]*>7</);
   assert.match(html, /netcore-history__pill" data-tone="danger"/);
   assert.match(html, /netcore-history__pill" data-tone="ok"/);
-  // 去重：同一 IP 只渲染一次，请求数合并为 4+3。
+  // 同一 IP 多次切换只显示一个标签；明细有归属的 IP 也出现在分组中。
   assert.equal((html.match(/netcore-history__address">198.51.100.20</g) ?? []).length, 1);
-  assert.match(html, /netcore-history__requests">7</);
+  assert.match(html, /netcore-history__requests"[^>]*>7</);
   // 0 次不显示次数徽标。
-  assert.doesNotMatch(html, /netcore-history__requests">0</);
-  assert.match(html, /Claude 请求 7 次/);
-  // 全部为 0 时顶部概览也不说“Claude 请求 0 次”。
-  const zero = { ...exitHistory, entries: exitHistory.entries.map(entry => ({ ...entry, requests: 0 })) };
+  assert.doesNotMatch(html, /netcore-history__requests"[^>]*>0</);
+  assert.match(html, /Claude 传输记录 12 条/);
+  assert.match(html, /出口未知 · 近 48 小时 2 条 Claude 传输记录/);
+  assert.match(html, /2001:db8::20 · 近 48 小时 3 条 Claude 传输记录/);
+  const zero = { ...exitHistory, claudeTransferCounts: { byExit: {}, unassigned: 0 } };
   const zeroHtml = renderToStaticMarkup(React.createElement(NetCorePanel, { locale: 'zh', report, onRefresh() {}, onRestart() {}, onSelectNode() {}, onMeasure() {}, onModeChange() {}, exitHistory: zero }));
-  assert.doesNotMatch(zeroHtml, /Claude 请求/);
+  assert.doesNotMatch(zeroHtml, /Claude 传输记录 0 条|出口未知/);
+  assert.doesNotMatch(zeroHtml, /netcore-history__requests/);
   assert.match(zeroHtml, /出口 IP 变化 2 次，当前 198\.51\.100\.20/);
+});
+
+test('出口传输列表显示当前筛选，等待新结果期间隐藏旧总数', () => {
+  const { TransferLogDialog } = require(path.join(root, 'src/components/detector/TransferLog.tsx'));
+  const props = { locale: 'zh', data: { available: true, total: 7, items: [], exitIp: '2001:db8::20', stats: { total: 7 } }, selected: null, host: '', claude: true, offset: 0, exitIp: '2001:db8::20' };
+  const html = renderToStaticMarkup(React.createElement(TransferLogDialog, props));
+  assert.match(html, /出口 IP 2001:db8::20/);
+  assert.match(html, /共 7 条/);
+  const loading = renderToStaticMarkup(React.createElement(TransferLogDialog, { ...props, loading: true }));
+  assert.match(loading, /正在读取传输记录/);
+  assert.doesNotMatch(loading, /共 7 条/);
 });

@@ -22,7 +22,35 @@ import { FIREWALL_RULE_CHECK } from './firewall-rule-check.mjs';
 
 const run = promisify(execFile);
 const powershell = windowsSystemExecutable("WindowsPowerShell\\v1.0\\powershell.exe");
-const windowsOptions = { windowsHide: true, timeout: 45000, maxBuffer: 64 * 1024 };
+// 单次 PowerShell 的上限：正常 6–15 秒，资源紧张时到过 33 秒，45 秒是余量而不是常态。
+// 允许用环境变量覆盖，便于在慢机器上放宽而不是把每次布防都拖到宿主动作超时。
+export const GUARD_POWERSHELL_TIMEOUT_MS = (() => {
+  const value = Number(process.env.CHECKCC_GUARD_PS_TIMEOUT_MS);
+  return Number.isFinite(value) && value >= 10000 && value <= 180000 ? Math.trunc(value) : 45000;
+})();
+const windowsOptions = { windowsHide: true, timeout: GUARD_POWERSHELL_TIMEOUT_MS, maxBuffer: 64 * 1024 };
+
+/** 只保留 stderr 末尾几行：PowerShell 的多行异常前几行通常是调用栈，关键信息在最后。 */
+function tailLines(text, lines = 6, width = 300) {
+  const tail = String(text ?? '').split(/\r?\n/).map(line => line.trim()).filter(Boolean).slice(-lines).join(' / ');
+  return tail.length > width ? `${tail.slice(0, width)}…` : tail;
+}
+
+/**
+ * 把 execFile 的失败翻译成用户能读的一句话。
+ * 关键约束：绝不回退到 error.message —— 它是 `Command failed: <整条 PowerShell 命令>`，
+ * 直接把几百行脚本糊到界面上，真正的原因反而丢了。
+ */
+export function describeGuardFailure(error, { timeoutMs = GUARD_POWERSHELL_TIMEOUT_MS } = {}) {
+  const stderr = String(error?.stderr ?? '').trim();
+  if (stderr.includes('[FIREWALL_DISABLED]')) return 'Windows 防火墙未开启（或服务无响应），需要确认开启后才能阻止 Claude 直连。';
+  if (error?.killed || error?.signal === 'SIGTERM') return `防火墙核验超时（${Math.round(timeoutMs / 1000)} 秒未完成），系统可能资源不足；请稍后重试。`;
+  if (stderr) return `防火墙核验失败：${tailLines(stderr)}`;
+  // 内部/注入错误（没有 stderr，message 不是命令行转储）要保留原话。
+  const message = String(error?.message ?? '').trim();
+  if (message && !/^Command failed:/i.test(message) && message.length <= 600) return `防火墙核验失败：${tailLines(message, 2)}`;
+  return `防火墙核验命令未返回结果（${error?.code ? `错误码 ${error.code}` : '签名异常'}）；请重新授权助手后重试。`;
+}
 const jsonScript = (body) => `[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; $ProgressPreference = 'SilentlyContinue'; $guardFilterMs = 0; $guardFilterRules = 0; $guardServiceMs = 0; $guardProfileMs = 0; $guardRuleReadMs = 0; $guardSidMs = 0; $guardBodyWatch = [Diagnostics.Stopwatch]::StartNew(); try { ${body} } finally { [Console]::Error.WriteLine(('[guard-timing] body-ms={0} filter-ms={1} filter-rules={2} service-ms={3} profile-ms={4} rule-read-ms={5} sid-ms={6}' -f $guardBodyWatch.ElapsedMilliseconds, $guardFilterMs, $guardFilterRules, $guardServiceMs, $guardProfileMs, $guardRuleReadMs, $guardSidMs)) }`;
 const timedRuleRead = script => `$guardReadWatch = [Diagnostics.Stopwatch]::StartNew(); try { ${script} } finally { $script:guardRuleReadMs = [long]$script:guardRuleReadMs + $guardReadWatch.ElapsedMilliseconds }`;
 
@@ -381,9 +409,7 @@ export function createClaudeGuard({ platform = process.platform, stateDir, exec 
       return parse(stdout);
     } catch (error) {
       logTiming(error.stderr);
-      const detail = String(error.stderr || error.message);
-      if (detail.includes('[FIREWALL_DISABLED]')) throw new Error('Windows 防火墙未开启，需要确认开启后才能阻止 Claude 直连。', { cause: error });
-      throw error;
+      throw new Error(describeGuardFailure(error, { timeoutMs: windowsOptions.timeout }), { cause: error });
     }
   }
 
