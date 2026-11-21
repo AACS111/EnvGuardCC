@@ -23,7 +23,7 @@
 
 在一个界面中检查浏览器与 Claude 客户端的环境信号、管理网络出口、应用可回滚的环境防护，并查看保护前后的实测变化。
 
-[English](README.en.md) · [下载安装](#下载安装) · [快速开始](#快速开始) · [App 界面与操作](#app-界面与操作) · [源码运行](#源码运行) · [问题反馈](https://github.com/AACS111/EnvGuardCC/issues)
+[English](README.en.md) · [下载安装](#下载安装) · [快速开始](#快速开始) · [App 界面与操作](#app-界面与操作) · [源码运行](#源码运行) · [交流与支持](#交流与支持) · [问题反馈](https://github.com/AACS111/EnvGuardCC/issues)
 
 ![EnvGuardCC 当前概览界面](docs/images/envguardcc-overview.jpg)
 
@@ -43,14 +43,14 @@
 
 ## 下载安装
 
-当前版本：**0.2.5**。下载其他版本或查看发布说明，请前往 [GitHub Releases](https://github.com/AACS111/EnvGuardCC/releases)。
+当前版本 **0.2.6**。请查看 [0.2.6 发布说明](docs/releases/v0.2.6.md)或浏览 [全部版本](https://github.com/AACS111/EnvGuardCC/releases)。
 
 | 平台                  | 安装包                                                                                                    | 其他形式                                                                                              |
 | --------------------- | --------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
-| Windows x64           | [EXE 安装器](https://github.com/AACS111/EnvGuardCC/releases/download/v0.2.5/EnvGuardCC-Setup-0.2.5.exe)   | [便携 ZIP](https://github.com/AACS111/EnvGuardCC/releases/download/v0.2.5/EnvGuardCC-Windows-x64.zip) |
-| macOS · Apple Silicon | [DMG 安装镜像](https://github.com/AACS111/EnvGuardCC/releases/download/v0.2.5/EnvGuardCC-0.2.5-arm64.dmg) | [应用 ZIP](https://github.com/AACS111/EnvGuardCC/releases/download/v0.2.5/EnvGuardCC-macOS-arm64.zip) |
+| Windows x64           | [EXE 安装器](https://github.com/AACS111/EnvGuardCC/releases/download/v0.2.6/EnvGuardCC-Setup-0.2.6.exe)   | [便携 ZIP](https://github.com/AACS111/EnvGuardCC/releases/download/v0.2.6/EnvGuardCC-Windows-x64.zip) |
+| macOS · Apple Silicon | [DMG 安装镜像](https://github.com/AACS111/EnvGuardCC/releases/download/v0.2.6/EnvGuardCC-0.2.6-arm64.dmg) | [应用 ZIP](https://github.com/AACS111/EnvGuardCC/releases/download/v0.2.6/EnvGuardCC-macOS-arm64.zip) |
 
-[SHA-256 校验值](https://github.com/AACS111/EnvGuardCC/releases/download/v0.2.5/SHA256SUMS.txt)
+[SHA-256 校验值](https://github.com/AACS111/EnvGuardCC/releases/download/v0.2.6/SHA256SUMS.txt)
 
 - **Windows**：运行安装器，或完整解压便携包后运行 `EnvGuardCC.exe`，保留同目录文件。需要系统 WebView2；安装器会在缺失时联网安装，便携版需自行准备。安装包尚未进行代码签名。
 - **macOS**：打开 DMG，将应用拖入 Applications，再从“应用程序”启动。当前采用 ad-hoc 签名，尚未进行 Developer ID 签名和公证；首次打开可能需要在“系统设置 → 隐私与安全性”中允许。
@@ -266,7 +266,33 @@ pnpm desktop:installer
 | [网络兼容性](docs/NETWORK-COMPATIBILITY.md)               | 网络场景与兼容性说明。               |
 | [时区服务](docs/timezone-service.md)                      | macOS 时区辅助服务、授权及恢复。     |
 | [环境操作](docs/environment-actions.md)                   | 环境检测与操作说明。                 |
-| [0.2.5 发布说明](docs/releases/v0.2.5.md)                 | 当前发布版本的变更记录。             |
+| [0.2.6 发布说明](docs/releases/v0.2.6.md)                 | 当前发布版本的变更记录。             |
+
+## 交流与支持
+
+<table>
+  <tr>
+    <th>微信交流</th>
+    <th>微信打赏</th>
+  </tr>
+  <tr>
+    <td align="center">
+      <a href="docs/images/wechat-contact.jpg"><img src="docs/images/wechat-contact.jpg" width="240" alt="作者微信好友二维码"></a><br>
+      扫码添加作者微信，交流使用体验和建议。
+    </td>
+    <td align="center">
+      <a href="docs/images/wechat-payment.jpg"><img src="docs/images/wechat-payment.jpg" width="240" alt="支持 EnvGuardCC 的微信收款码"></a><br>
+      用微信扫码打赏，支持项目的开发与维护。
+    </td>
+  </tr>
+</table>
+
+## Contributors
+
+<a href="https://github.com/AACS111"><img src="https://avatars.githubusercontent.com/u/103710223?s=96&amp;v=4" width="48" height="48" alt="@AACS111"></a>
+<a href="https://github.com/scoltzero"><img src="https://avatars.githubusercontent.com/u/27351714?s=96&amp;v=4" width="48" height="48" alt="@scoltzero"></a>
+
+[查看完整贡献者列表](https://github.com/AACS111/EnvGuardCC/graphs/contributors)
 
 ## 技术栈与许可证
 
