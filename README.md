@@ -13,7 +13,7 @@
 
 **EnvGuardCC**主要解决的是第1点和第2点的问题，可以根据IP去适配本机环境；启动后会保证Claude只能用选择的节点IP去请求网络，避免Claude偷偷在后台使用别的网络发请求造成受影响。
 
-`下一个版本会对网络波动造成内核重启的问题做很大的优化，并且还会添加上我自己在使用的静态住宅ip供应商供给大家选择，这样就不用大家去还去寻找踩坑了`。
+
 
 
  ----------------------------！！！！！！！！！！！！！！！！！------------------------------------------------ 
@@ -40,9 +40,12 @@
 
 在一个界面中检查浏览器与 Claude 客户端的环境信号、管理网络出口、应用可回滚的环境防护，并查看保护前后的实测变化。
 
-[English](README.en.md) · [下载安装](#下载安装) · [快速开始](#快速开始) · [App 界面与操作](#app-界面与操作) · [源码运行](#源码运行) · [交流与支持](#交流与支持) · [问题反馈](https://github.com/AACS111/EnvGuardCC/issues)
+[English](README.en.md) · [下载安装](#下载安装) · [快速开始](#快速开始) · [App 界面与操作](#app-界面与操作) · [源码运行](#源码运行) · [交流与支持](#交流与支持)· [问题反馈](https://github.com/AACS111/EnvGuardCC/issues)
+- 开启保护前
+  <img width="2167" height="1426" alt="image" src="https://github.com/user-attachments/assets/f1b68cc6-4470-449f-9e3a-c88b49249e01" />
 
-![EnvGuardCC 当前概览界面](docs/images/envguardcc-overview.jpg)
+- 开启保护前
+  <img width="2149" height="1499" alt="image" src="https://github.com/user-attachments/assets/03d2779f-8d3d-4e33-a8f7-ea194cc7d262" />
 
 > 检测得分用于环境自查，不等于账号封禁概率，也不保证登录、订阅或账号状态。本项目不提供 Claude 账号、订阅或代理节点。
 
