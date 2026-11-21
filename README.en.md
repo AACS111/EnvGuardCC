@@ -2,20 +2,20 @@
 
 A Claude runtime environment inspection and protection workspace with browser and client diagnostics, protection settings, and before-and-after comparisons.
 
-[中文](README.md) · [GitHub](https://github.com/AACS111/EnvGuardCC) · [Issues](https://github.com/AACS111/EnvGuardCC/issues)
+[中文](README.md) · [GitHub](https://github.com/AACS111/EnvGuardCC) · [Contact and support](#contact-and-support) · [Issues](https://github.com/AACS111/EnvGuardCC/issues)
 
 ## Download
 
-- [Apple Silicon Mac DMG](https://github.com/AACS111/EnvGuardCC/releases/download/v0.2.4/EnvGuardCC-0.2.4-arm64.dmg)
-- [Apple Silicon Mac ZIP](https://github.com/AACS111/EnvGuardCC/releases/download/v0.2.4/EnvGuardCC-macOS-arm64.zip)
-- [Windows x64 installer (.exe)](https://github.com/AACS111/EnvGuardCC/releases/download/v0.2.4/EnvGuardCC-Setup-0.2.4.exe)
-- [Windows x64 portable package (.zip)](https://github.com/AACS111/EnvGuardCC/releases/download/v0.2.4/EnvGuardCC-Windows-x64.zip)
-- [SHA-256 checksums](https://github.com/AACS111/EnvGuardCC/releases/download/v0.2.4/SHA256SUMS.txt) · [All releases](https://github.com/AACS111/EnvGuardCC/releases)
+- [Apple Silicon Mac DMG](https://github.com/AACS111/EnvGuardCC/releases/download/v0.2.6/EnvGuardCC-0.2.6-arm64.dmg)
+- [Apple Silicon Mac ZIP](https://github.com/AACS111/EnvGuardCC/releases/download/v0.2.6/EnvGuardCC-macOS-arm64.zip)
+- [Windows x64 installer (.exe)](https://github.com/AACS111/EnvGuardCC/releases/download/v0.2.6/EnvGuardCC-Setup-0.2.6.exe)
+- [Windows x64 portable package (.zip)](https://github.com/AACS111/EnvGuardCC/releases/download/v0.2.6/EnvGuardCC-Windows-x64.zip)
+- [SHA-256 checksums](https://github.com/AACS111/EnvGuardCC/releases/download/v0.2.6/SHA256SUMS.txt) · [All releases](https://github.com/AACS111/EnvGuardCC/releases)
 
 Run the installer directly, or extract the entire portable package and launch EnvGuardCC.exe with its accompanying files. Both packages include Node.js. Windows also needs system WebView2; the installer downloads it when missing, while portable users must install it first. The installer is not code-signed.
 
 
-> Version 0.2.4 uses Tauri 2 with the system WebView and bundled Node.js for smaller desktop packages.
+> Version 0.2.6 uses Tauri 2 with the system WebView and bundled Node.js for smaller desktop packages.
 
 ## Screenshots
 
@@ -152,4 +152,30 @@ Tauri 2 desktop development requires Rust stable, Windows C++ Build Tools and Wi
 
 Publish a higher `v<version>` stable GitHub Release with the matching platform packages to make it discoverable. Drafts and prereleases are excluded. The app distinguishes missing packages, unsupported platforms and failed checks, and does not automatically install or restart. Quit normally and wait for configuration restoration before installing an update. Forks can set the backend environment variable `CHECKCC_UPDATE_REPOSITORY=owner/repository` to use their own public releases with the existing asset names.
 
-See the [0.2.4 release notes](docs/releases/v0.2.4.md).
+See the [0.2.6 release notes](docs/releases/v0.2.6.md).
+
+## Contact and Support
+
+<table>
+  <tr>
+    <th>WeChat contact</th>
+    <th>WeChat Pay</th>
+  </tr>
+  <tr>
+    <td align="center">
+      <a href="docs/images/wechat-contact.jpg"><img src="docs/images/wechat-contact.jpg" width="240" alt="Maintainer's WeChat contact QR code"></a><br>
+      Add the maintainer on WeChat to talk about EnvGuardCC or share feedback.
+    </td>
+    <td align="center">
+      <a href="docs/images/wechat-payment.jpg"><img src="docs/images/wechat-payment.jpg" width="240" alt="WeChat Pay QR code for supporting EnvGuardCC"></a><br>
+      Scan with WeChat Pay to support development and maintenance.
+    </td>
+  </tr>
+</table>
+
+## Contributors
+
+<a href="https://github.com/AACS111"><img src="https://avatars.githubusercontent.com/u/103710223?s=96&amp;v=4" width="48" height="48" alt="@AACS111"></a>
+<a href="https://github.com/scoltzero"><img src="https://avatars.githubusercontent.com/u/27351714?s=96&amp;v=4" width="48" height="48" alt="@scoltzero"></a>
+
+[View all contributors](https://github.com/AACS111/EnvGuardCC/graphs/contributors)
