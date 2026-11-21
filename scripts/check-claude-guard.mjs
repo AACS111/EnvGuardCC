@@ -170,6 +170,40 @@ test('目标合并保留默认域名，不能把 hosts 防护字段丢掉', asyn
   assert.deepEqual(merged.domains, CLAUDE_GUARD_DOMAINS);
 });
 
+test('迁移旧布防时先确认常驻规则与 hosts，应用退出才移除两者', async t => {
+  const stateDir = await mkdtemp(path.join(tmpdir(), 'egcc-persistent-guard-'));
+  const { rm, readFile } = await import('node:fs/promises');
+  t.after(() => rm(stateDir, { recursive: true, force: true }));
+  const group = guardGroupName(token);
+  await writeFile(path.join(stateDir, 'claude-guard.json'), JSON.stringify({ token, desired: 'armed' }));
+  let hosts = '127.0.0.1 localhost\r\n';
+  const commands = [];
+  const guard = createClaudeGuard({ platform: 'win32', stateDir, hostsPath: 'hosts',
+    readText: async () => hosts, writeText: async (_file, content) => { hosts = content; },
+    exec: async (_file, args) => {
+      const script = args.at(-1);
+      commands.push(script);
+      if (commands.length === 1) {
+        assert.equal(hostsBlocked(hosts), false, '常驻规则不再写 hosts，浏览器由运行期按隧道状态切换');
+        assert.ok(script.indexOf('常驻桌面阻断未确认') < script.indexOf(`Remove-NetFirewallRule -Group '${group}'`));
+        return { stdout: JSON.stringify({ count: 0, directCount: 1 }) };
+      }
+      return { stdout: '{"count":0}' };
+    },
+  });
+  await guard.load();
+  const protectedState = await guard.protect({ token: 'newtoken1234', programs: ['C:/Claude.exe'] });
+  assert.equal(protectedState.directProtected, true);
+  assert.equal(protectedState.hostsBlocked, false);
+  assert.equal(guard.snapshot().persistent, true);
+  assert.equal(JSON.parse(await readFile(path.join(stateDir, 'claude-guard.json'), 'utf8')).token, token);
+  assert.equal(commands.length, 1, '迁移和建立常驻规则共用一次 PowerShell');
+  await guard.release();
+  assert.ok(commands.some(script => script.includes(`Remove-NetFirewallRule -Group '${group}-Direct'`)));
+  assert.equal(hostsBlocked(hosts), false);
+  assert.equal(guard.snapshot().persistent, false);
+});
+
 test('常驻与临时规则一次布防，逐条回读；任一条缺失仍拒绝成功', async () => {
   const calls = [];
   let missing = 0;
@@ -525,4 +559,26 @@ test("hosts 写不进去时必须报错，不能只布一半还报成功", async
     writeText: async () => { throw new Error("EPERM"); },
   });
   await assert.rejects(guard.arm({ token, programs: ["C:/Claude.exe"], domains: ["claude.ai"] }), /hosts：EPERM/);
+});
+
+test("隧道接管前单独阻断 hosts，接管后恢复原文并删除备份", async t => {
+  const stateDir = await mkdtemp(path.join(tmpdir(), "checkcc-hosts-backup-"));
+  const fs = await import("node:fs/promises");
+  t.after(() => fs.rm(stateDir, { recursive: true, force: true }));
+  const hostsFile = path.join(stateDir, "hosts");
+  const original = "# 用户自定义\r\n127.0.0.1 local.test\r\n";
+  await fs.writeFile(hostsFile, original);
+  const exec = async () => ({ stdout: JSON.stringify({ count: 0, directCount: 1 }) });
+  const guard = createClaudeGuard({ platform: "win32", stateDir, exec, hostsPath: hostsFile });
+  const protectedState = await guard.protect({ token, programs: ["C:/Claude.exe"], domains: ["claude.ai"] });
+  assert.equal(protectedState.hostsBlocked, false);
+  assert.equal(await fs.readFile(hostsFile, "utf8"), original, "建立常驻规则不得改动 hosts");
+  assert.equal(await guard.setHostsBlocked(true), true, "阻断后返回当前处于阻断");
+  const blocked = await fs.readFile(hostsFile, "utf8");
+  assert.ok(hostsBlocked(blocked));
+  assert.match(blocked, /local\.test/);
+  assert.equal(await fs.readFile(`${hostsFile}.envguardcc-backup`, "utf8"), original);
+  assert.equal(await guard.setHostsBlocked(false), false, "清除后返回当前未阻断");
+  assert.equal(await fs.readFile(hostsFile, "utf8"), original);
+  await assert.rejects(fs.readFile(`${hostsFile}.envguardcc-backup`, "utf8"), /ENOENT/);
 });

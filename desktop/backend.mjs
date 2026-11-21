@@ -148,7 +148,9 @@ try {
   await new Promise((resolve, reject) => { gateway.once('error', reject); gateway.listen(devURL ? 3010 : 0, '127.0.0.1', resolve); });
   process.env.CHECKCC_GATEWAY_URL = `http://127.0.0.1:${gateway.address().port}`;
   const { startRepairHelper } = await import('../scripts/local-repair.mjs');
-  helper = await startRepairHelper(devURL ? 3001 : 0, { netCore: kernel });
+  // 启动即会开保护时先抑制 hosts：否则 recover/未保护阻断会写一次，1～2 秒后再清。
+  kernel.setHostsSuppressed?.(settings.autoStartProtection === true);
+  helper = await startRepairHelper(devURL ? 3001 : 0, { netCore: kernel, autoStartProtection: settings.autoStartProtection });
   if (!helper.server) { helper = null; throw new Error('本机助手端口已被占用，请先退出旧服务。'); }
   const ports = { helper: helper.server.address().port, gateway: gateway.address().port };
   if (!devURL) {

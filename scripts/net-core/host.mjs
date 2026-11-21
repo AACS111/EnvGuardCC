@@ -250,11 +250,13 @@ export function createKernelHost({ token, binary, stateDir, apiPort = 39090, hos
       if (action === "claude-guard") {
         const result = await serialize(async () => {
           if (value.op === 'arm') return claudeGuard.arm({ token: value.token, packages: value.packages, programs: value.programs, addresses: value.addresses, domains: value.domains });
+          if (value.op === 'protect') return claudeGuard.protect({ token: value.token, packages: value.packages, programs: value.programs, domains: value.domains });
+          if (value.op === 'hosts') return { blocked: await claudeGuard.setHostsBlocked(value.blocked === true) };
           if (value.op === 'release') return claudeGuard.release({ keepDirect: value.keepDirect === true });
           if (value.op === 'status') return claudeGuard.status();
           if (value.op === 'enable-firewall') return claudeGuard.enableFirewall(value.confirmed);
           throw new Error('未知的 fail-closed 动作。');
-        }, `claude-guard:${['arm', 'release', 'status', 'enable-firewall'].includes(value.op) ? value.op : 'unknown'}`);
+        }, `claude-guard:${['arm', 'protect', 'hosts', 'release', 'status', 'enable-firewall'].includes(value.op) ? value.op : 'unknown'}`);
         send(response, 200, { ok: true, claudeGuard: result });
         return;
       }
@@ -321,7 +323,8 @@ export function createKernelHost({ token, binary, stateDir, apiPort = 39090, hos
               leaseAt = Date.now();
             }
           }
-          if (Date.now() - lastClaudeInspection >= 10000) {
+          const currentClaudeGuard = claudeGuard.snapshot();
+          if (!currentClaudeGuard.persistent && (currentClaudeGuard.desired !== 'released' || currentClaudeGuard.error) && Date.now() - lastClaudeInspection >= 10000) {
             const startedAt = performance.now();
             try { await claudeGuard.reconcile(); }
             finally {

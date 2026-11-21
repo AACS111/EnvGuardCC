@@ -12,10 +12,10 @@
 // macOS 走严格模式的 PF anchor（firewall.mjs），本模块返回 supported=false，不冒充已实现。
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { mkdir, readFile, rename, writeFile, access } from "node:fs/promises";
+import { mkdir, readFile, rename, rm, writeFile, access } from "node:fs/promises";
 import path from "node:path";
 import { homedir } from "node:os";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { windowsSystemExecutable } from "../windows-timezone.mjs";
 import { windowsClaudeTargets } from '../windows-claude-targets.mjs';
 import { FIREWALL_RULE_CHECK } from './firewall-rule-check.mjs';
@@ -369,9 +369,34 @@ export function defaultHostsPath(env = process.env, platform = process.platform)
 export function createClaudeGuard({ platform = process.platform, stateDir, exec = run, logger = () => {}, hostsPath = defaultHostsPath(), readText = readFile, writeText = writeFile } = {}) {
   const supported = platform === "win32";
   const file = stateDir ? path.join(stateDir, "claude-guard.json") : null;
+  // 只有默认文件系统读写时才启用「临时文件 + rename」与原文备份；
+  // 测试注入的 readText/writeText 没有真实文件边界，沿用原路径。
+  const filesystemBacked = writeText === writeFile && readText === readFile;
+  const hostsBackupPath = hostsPath ? `${hostsPath}.envguardcc-backup` : null;
+  const writeHosts = async (content) => {
+    if (!filesystemBacked) { await writeText(hostsPath, content, "utf8"); return; }
+    const temporary = `${hostsPath}.${randomBytes(4).toString("hex")}.tmp`;
+    try {
+      await writeFile(temporary, content, "utf8");
+      await rename(temporary, hostsPath);
+    } catch (error) {
+      await rm(temporary, { force: true }).catch(() => {});
+      throw error;
+    }
+  };
+  // 首次布防前保存用户原文：撤离时恢复自定义条目，而不是把它们连同标记段一起丢掉。
+  const backupHosts = async (original) => {
+    if (!filesystemBacked || !hostsBackupPath) return;
+    const exists = await access(hostsBackupPath).then(() => true, () => false);
+    if (!exists) await writeFile(hostsBackupPath, original, "utf8");
+  };
+  const readHostsBackup = async () => {
+    if (!filesystemBacked || !hostsBackupPath) return null;
+    return readFile(hostsBackupPath, "utf8").catch(error => error.code === "ENOENT" ? null : Promise.reject(error));
+  };
   let state = { token: null, desired: "released", selectors: null, at: null };
   let cached = { supported, armed: null, directProtected: null, desired: 'released', count: 0, hostsBlocked: null, error: null };
-  const snapshot = () => ({ ...cached });
+  const snapshot = () => ({ ...cached, persistent: state.persistent === true });
   async function measured(phase, action) {
     const started = Date.now();
     let outcome = 'ok';
@@ -418,7 +443,9 @@ export function createClaudeGuard({ platform = process.platform, stateDir, exec 
     const current = await readText(hostsPath, "utf8").catch(error => { if (error.code === "ENOENT") return ""; throw error; });
     const cleaned = stripHostsBlock(current);
     const next = (cleaned.trimEnd() ? cleaned.trimEnd() + "\r\n" : "") + hostsBlockText(domains, useToken);
-    await writeText(hostsPath, next, "utf8");
+    if (next === current) return true;
+    await backupHosts(cleaned);
+    await writeHosts(next);
     if (!hostsBlocked(await readText(hostsPath, "utf8"))) throw new Error("hosts 段未写入。");
     return true;
   }
@@ -427,7 +454,11 @@ export function createClaudeGuard({ platform = process.platform, stateDir, exec 
     if (!hostsPath) return false;
     const current = await readText(hostsPath, "utf8").catch(error => { if (error.code === "ENOENT") return ""; throw error; });
     if (!hostsBlocked(current)) return false;
-    await writeText(hostsPath, stripHostsBlock(current), "utf8");
+    // 优先恢复布防前保存的原文；没有备份（旧版本写入的）才退回只删标记段。
+    const backup = await readHostsBackup();
+    const next = stripHostsBlock(backup ?? current);
+    await writeHosts(next);
+    if (hostsBackupPath) await rm(hostsBackupPath, { force: true }).catch(() => {});
     if (hostsBlocked(await readText(hostsPath, "utf8"))) throw new Error("hosts 段未清除。");
     return true;
   }
@@ -471,7 +502,7 @@ export function createClaudeGuard({ platform = process.platform, stateDir, exec 
     const hasRules = packages.length || programs.length || addresses.length;
     const specs = hasRules ? claudeGuardSpecs({ token: useToken, packages, programs, addresses }) : [];
     if (!specs.length && !(domains?.length)) throw new Error("fail-closed 缺少阻断目标：需要程序/包/地址或域名之一。");
-    await save({ token: useToken, desired: "armed", selectors: { packages, programs, addresses, domains }, at: new Date().toISOString() });
+    await save({ token: useToken, desired: "armed", persistent: false, selectors: { packages, programs, addresses, domains }, at: new Date().toISOString() });
     const directSpecs = claudeDirectSpecs({ token: useToken, packages, programs });
     const errors = [];
     let count = 0;
@@ -507,12 +538,41 @@ export function createClaudeGuard({ platform = process.platform, stateDir, exec 
     return (cached = { supported, desired: 'armed', armed: true, directProtected: directSpecs.length > 0, count, hostsBlocked: hosts, error: null });
   }
 
-  async function release({ keepDirect = false } = {}) {
+  async function protect({ token = state.token, packages = [], programs = [], domains = CLAUDE_GUARD_DOMAINS } = {}) {
+    if (!supported) throw new Error('当前平台没有实现 Windows 常驻阻断。');
+    const useToken = state.token ?? (TOKEN.test(String(token ?? '')) ? token : `g${Date.now().toString(36)}`);
+    const blockedDomains = domains.length ? domains : CLAUDE_GUARD_DOMAINS;
+    await save({ token: useToken, selectors: { packages, programs, domains: blockedDomains }, desired: 'protected', persistent: true, at: new Date().toISOString() });
+    // 常驻的只有防火墙规则。hosts 必须随「隧道是否已接管」切换：
+    // hosts 优先级高于内核 DNS，隧道接管后仍挂 hosts 会把域名钉到 0.0.0.0，
+    // 浏览器/客户端直接报 ERR_ADDRESS_INVALID。启动时先清掉可能残留的阻断段。
+    await releaseHosts().catch(() => {});
+    const result = await release({ keepDirect: true, keepHosts: true });
+    return { ...result, hostsBlocked: false };
+  }
+
+  /** 隧道未接管时的浏览器直连兜底；接管后必须清掉，否则域名无法解析。 */
+  async function setHostsBlocked(blocked) {
+    if (!supported || !hostsPath) return false;
+    // 返回值语义固定为「当前是否处于 hosts 阻断」，不表示本次是否发生过清理。
+    if (blocked) {
+      const domains = state.selectors?.domains?.length ? state.selectors.domains : CLAUDE_GUARD_DOMAINS;
+      const ok = await armHosts(domains, state.token ?? 'default');
+      cached = { ...cached, desired: state.desired, hostsBlocked: ok };
+      return ok;
+    }
+    if (!hostsBlocked(await readText(hostsPath, 'utf8').catch(() => ''))) return false;
+    const cleared = await releaseHosts();
+    cached = { ...cached, desired: state.desired, hostsBlocked: false, hostsCleared: cleared };
+    return false;
+  }
+
+  async function release({ keepDirect = false, keepHosts = false } = {}) {
     if (!supported) return { armed: false, count: 0 };
     // 允许隧道时只移除临时全阻断，桌面直连规则一直存在，覆盖无法预知的内核崩溃。
     const directSpecs = state.token ? claudeDirectSpecs({ ...state.selectors, token: state.token }) : [];
     const directGroup = state.token ? `${guardGroupName(state.token)}-Direct` : null;
-    await save({ desired: keepDirect ? 'protected' : 'released', at: new Date().toISOString() });
+    if (!keepHosts) await save({ desired: keepDirect ? 'protected' : 'released', persistent: false, at: new Date().toISOString() });
     const errors = [];
     let count = 0;
     let hosts = false;
@@ -534,24 +594,25 @@ export function createClaudeGuard({ platform = process.platform, stateDir, exec 
       } catch (error) { errors.push(`规则：${error.message}`); }
     }
     // 核验/删除失败时保留浏览器的 hosts 保护；不可在核验完成前提前清理。
-    if (!errors.length) {
+    if (!errors.length && !keepHosts) {
       try { hosts = await measured('release hosts', releaseHosts); }
       catch (error) { errors.push(`hosts：${error.message}`); }
     }
     if (errors.length) throw new Error(`fail-closed 撤防未完成：${errors.join("；")}`);
-    logger("[claude-guard] 已撤防。");
-    return (cached = { supported, desired: state.desired, armed: false, directProtected: keepDirect && directSpecs.length > 0, count, hostsBlocked: false, hostsCleared: hosts, error: null });
+    logger(keepHosts ? '[claude-guard] 常驻直连阻断已就绪。' : '[claude-guard] 已撤防。');
+    return (cached = { supported, desired: state.desired, armed: false, directProtected: keepDirect && directSpecs.length > 0, count, hostsBlocked: keepHosts, hostsCleared: hosts, error: null });
   }
 
   /** 宿主启动/后台核验：按落盘意图收敛；心跳只能读缓存，不得覆盖意图。 */
   async function reconcile(selectors = null, { desired = null } = {}) {
     if (!supported) return { armed: false, count: 0 };
     await load();
-    if (['armed', 'protected', 'released'].includes(desired)) await save({ desired });
+    if (['armed', 'protected', 'released'].includes(desired)) await save({ desired, persistent: false });
     if (state.desired === 'protected') {
       const current = await status();
       const hasDirect = claudeDirectSpecs({ ...state.selectors, token: state.token }).length > 0;
-      if ((!hasDirect || current.directProtected) && current.count === 0 && current.hostsBlocked === false) return current;
+      if (!current.error && (!hasDirect || current.directProtected) && current.count === 0 && current.hostsBlocked === (state.persistent === true)) return current;
+      if (state.persistent) return protect(state.selectors);
       return release({ keepDirect: true });
     }
     if (state.desired !== "armed") {
@@ -571,7 +632,7 @@ export function createClaudeGuard({ platform = process.platform, stateDir, exec 
     catch (error) { cached = { ...cached, desired: state.desired, armed: null, directProtected: null, error: error.message }; throw error; }
   };
   // 宿主串行执行变更；慢速 PowerShell 运行期间 /health 仍可立即读取缓存。
-  return { supported, arm: tracked(arm), release: tracked(release), status, snapshot, reconcile: tracked(reconcile), load,
+  return { supported, arm: tracked(arm), protect: tracked(protect), release: tracked(release), setHostsBlocked: tracked(setHostsBlocked), status, snapshot, reconcile: tracked(reconcile), load,
     enableFirewall: async confirmed => {
       if (!supported) throw new Error('仅 Windows 支持此操作。');
       if (await expect(enableFirewallScript(confirmed)) !== 3) throw new Error('Windows 防火墙开启后核验失败。');

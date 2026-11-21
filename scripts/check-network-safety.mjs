@@ -18,6 +18,7 @@ import { stageHostBundle } from "./net-core/host-bundle.mjs";
 import { createNetCore } from "./net-core.mjs";
 import { pickPortBlock } from './net-core/ports.mjs';
 import { ProtectionSession } from "./protection-session.mjs";
+import { createProtectionService } from "./protection-service.mjs";
 import { createClaudeProxySettings } from './claude-proxy-settings.mjs';
 
 const node = name => ({ name, type: "ss", server: "203.0.113.10", port: 443, cipher: "aes-128-gcm", password: "test" });
@@ -125,7 +126,7 @@ test("来源 DNS 独立持久化，旧顶层 DNS 只迁移到原 active", async 
   assert.deepEqual(migrated.sources[1].proxyServerDns, ["192.0.2.53"]);
 });
 
-async function fakeRuntime(t, takeover = { prepare: async () => {}, status: () => ({ phase: "idle", closed: [] }) }, { host = false, ipv6Supported = false, nodeExits = {}, nodeDelays = {}, measureDelay, claudeProxy = null, ipv6Fetch = async () => '2001:db8::1', stateDir, guard = null, platform = 'linux', failClosedAction = null, hostProbe = null, observeExitProbe = null, envOverrides = {}, initialTunnel, heartbeatScheduler, observeHostAction, verifyStartupTunnel = false, connections = [], closeConnection, discoverTargets = async () => ({ programs: ['C:/Claude.exe'], packages: [] }) } = {}) {
+async function fakeRuntime(t, takeover = { prepare: async () => {}, status: () => ({ phase: "idle", closed: [] }) }, { host = false, ipv6Supported = false, nodeExits = {}, nodeDelays = {}, measureDelay, claudeProxy = null, ipv6Fetch = async () => '2001:db8::1', stateDir, guard = null, platform = 'linux', failClosedAction = null, hostProbe = null, hostInstaller, observeExitProbe = null, envOverrides = {}, initialTunnel, heartbeatScheduler, observeHostAction, verifyStartupTunnel = false, connections = [], closeConnection, discoverTargets = async () => ({ programs: ['C:/Claude.exe'], packages: [] }) } = {}) {
   const dir = stateDir ?? await directory(t);
   if (hostProbe) await writeFile(path.join(dir, 'host-token'), 'test-token');
   const apiPort = await pickPortBlock(2, { start: 40181 });
@@ -156,6 +157,7 @@ async function fakeRuntime(t, takeover = { prepare: async () => {}, status: () =
     takeover,
     claudeProxy,
     discoverTargets,
+    hostInstaller,
     exitFetch: async (_url, options) => {
       exitProbes++;
       await observeExitProbe?.(options);
@@ -187,8 +189,16 @@ async function fakeRuntime(t, takeover = { prepare: async () => {}, status: () =
         hostActions.push(action);
         await observeHostAction?.(action);
         if (action.action === 'claude-guard') {
+          // hosts 是独立文件操作，不参与防火墙失败注入。
+          if (action.op === 'hosts') {
+            claudeGuardSnapshot = { ...claudeGuardSnapshot, hostsBlocked: action.blocked === true };
+            return { ok: true, json: async () => ({ ok: true, claudeGuard: { blocked: action.blocked === true } }) };
+          }
           const overridden = await failClosedAction?.(action);
-          if (action.op !== 'status' || overridden) claudeGuardSnapshot = overridden ?? { supported: true, desired: action.op === 'arm' ? 'armed' : (action.keepDirect === true ? 'protected' : 'released'), armed: action.op === 'arm', directProtected: action.op === 'arm' || action.keepDirect === true, count: action.op === 'arm' ? 2 : 0, hostsBlocked: action.op === 'arm' };
+          if (action.op !== 'status' || overridden) {
+            const protectedDirect = action.op === 'protect' || action.keepDirect === true;
+            claudeGuardSnapshot = overridden ?? { supported: true, desired: action.op === 'arm' ? 'armed' : (protectedDirect ? 'protected' : 'released'), armed: action.op === 'arm', directProtected: action.op === 'arm' || protectedDirect, count: action.op === 'arm' ? 2 : 0, hostsBlocked: ['arm', 'protect'].includes(action.op) };
+          }
           return { ok: true, json: async () => ({ ok: true, claudeGuard: claudeGuardSnapshot }) };
         }
       }
@@ -272,7 +282,7 @@ test('界面只在真实布防期间报告建立中，完成或失败后清除�
   const waiting = new Promise(resolve => { entered = resolve; });
   const gate = new Promise(resolve => { release = resolve; });
   const f = await fakeRuntime(t, undefined, { host: true, platform: 'win32', failClosedAction: async action => {
-    if (action.op !== 'arm') return;
+    if (action.op !== 'protect') return;
     if (mode === 'hold') { entered(); await gate; }
     if (mode === 'fail') throw new Error('firewall verification failed');
   } });
@@ -285,23 +295,121 @@ test('界面只在真实布防期间报告建立中，完成或失败后清除�
   assert.equal(pending.failClosed.hostGuard.arming, true);
   assert.equal(netCoreView(pending).label, '建立中');
   assert.equal((await f.runtime.report()).failClosed.hostGuard.arming, false);
+  await f.runtime.stop();
   mode = 'fail';
-  await assert.rejects(f.runtime.restart(), /firewall verification failed/);
+  await assert.rejects(f.runtime.setUnprotectedGuard(true), /firewall verification failed/);
   const failed = await f.runtime.report();
   assert.equal(failed.failClosed.hostGuard.arming, false);
   assert.match(netCoreView(failed).conclusion.detail, /firewall verification failed/);
 });
 
-test('保护冷启动只布防一次，验证隧道与出口后才撤防', async t => {
+test('Windows 应用生命周期只建立一次常驻规则，退出才清理', async t => {
   const dir = await directory(t);
   await saveNodes(dir, { sources: [{ id: 'src_test', name: 'Test', mode: 'manual', proxies: [node('a')], selected: 'a' }], activeId: 'src_test' });
   const f = await fakeRuntime(t, undefined, { host: true, platform: 'win32', stateDir: dir, initialTunnel: false });
+  await f.runtime.setUnprotectedGuard(true);
+  await f.runtime.start();
+  assert.equal(f.guard(), 'REJECT');
+  const config = yaml(await readFile(path.join(dir, 'net-core', 'config.yaml'), 'utf8'));
+  assert.equal(config.dns['use-system-hosts'], false, 'EGCC 代理解析不能读回系统 hosts 的 Claude 屏蔽');
+  assert.equal(config.dns['use-hosts'], true, '保留 EGCC 自己的节点映射');
   await f.runtime.setTunnel(true, { ensureHost: true, protectClaude: true });
-  assert.equal(f.launches(), 1);
-  assert.equal(f.hostActions.filter(action => action.action === 'claude-guard' && action.op === 'arm').length, 1);
-  assert.equal(f.hostActions.filter(action => action.action === 'claude-guard' && action.op === 'release').length, 1);
   assert.ok(f.exitProbes() > 0);
   assert.equal((await f.runtime.verifyConnection()).tunCaptured, true);
+  await f.runtime.setUnprotectedGuard(true);
+  await f.runtime.setTunnel(false);
+  assert.equal(f.guard(), 'REJECT');
+  await f.runtime.setTunnel(true, { ensureHost: true, protectClaude: true });
+  assert.equal(f.guard(), 'CLAUDE-PIN');
+  await f.runtime.stop();
+  assert.deepEqual(f.hostActions.filter(action => action.action === 'claude-guard' && action.op !== 'hosts').map(action => action.op), ['protect', 'release']);
+  assert.equal(f.hostActions.at(-2).action, 'stop');
+});
+
+test('Windows 关闭环境保护保留 TUN 和普通代理，仅阻断 Claude', async t => {
+  const f = await fakeRuntime(t, undefined, { host: true, platform: 'win32', initialTunnel: false });
+  await f.runtime.importNodes([node('a')]);
+  const service = createProtectionService({
+    stateDir: f.dir,
+    runtime: { policy: {}, load: async () => {}, restore: async () => ({ results: [] }), close: async () => ({ results: [] }) },
+    browserCloak: { sync: async () => ({ results: [], requestProbe: { state: 'verified' } }), close: async () => {} },
+    currentZone: async () => 'Korea Standard Time',
+    setZone: async () => {},
+    restoreTimezone: async () => {},
+    gatewayRequest: async () => ({ cloak: { enabled: false } }),
+    network: () => f.runtime,
+    platform: 'win32',
+  });
+  service.detect = async () => ({ ip: '203.0.113.9', language: 'ko', locale: 'ko-KR', windowsTimezone: 'Korea Standard Time' });
+  await service.start();
+  assert.equal(f.guard(), 'CLAUDE-PIN');
+  const launches = f.launches();
+  const reloads = f.reloads();
+  f.hostActions.length = 0;
+
+  const stopped = await service.stop();
+  assert.equal(stopped.enabled, false);
+  assert.equal(stopped.unprotectedBlock.active, true);
+  assert.equal(f.runtime.connectionState().tunEnabled, true, '关闭保护后应继续接管系统流量');
+  assert.equal((await f.runtime.verifyConnection()).tunCaptured, true);
+  assert.equal(f.launches(), launches);
+  assert.equal(f.reloads(), reloads);
+  assert.equal(f.guard(), 'REJECT');
+  assert.ok(f.hostActions.some(action => action.op === 'hosts' && action.blocked === true));
+
+  const detect = service.detect;
+  service.detect = async () => { throw new Error('test exit detection unavailable'); };
+  f.hostActions.length = 0;
+  await assert.rejects(service.start(), /test exit detection unavailable/);
+  assert.equal(f.runtime.connectionState().tunEnabled, true);
+  assert.equal(f.guard(), 'REJECT');
+  const hostsChanges = f.hostActions.filter(action => action.op === 'hosts').map(action => action.blocked);
+  assert.deepEqual(hostsChanges, [false, true], '重新开启失败后应恢复 hosts 拦截');
+
+  service.detect = detect;
+  f.hostActions.length = 0;
+  await service.start();
+  assert.equal(f.guard(), 'CLAUDE-PIN');
+  assert.ok(f.hostActions.some(action => action.op === 'hosts' && action.blocked === false));
+  await service.stop();
+  f.hostActions.length = 0;
+  await service.stop({ shutdown: true, kernelWillStop: true });
+  await f.runtime.stop();
+  assert.ok(f.hostActions.some(action => action.op === 'hosts' && action.blocked === false));
+});
+
+test('Windows 自动开启保护时保留启动阶段的 hosts 抑制', async t => {
+  const f = await fakeRuntime(t, undefined, { host: true, platform: 'win32', initialTunnel: false });
+  await f.runtime.importNodes([node('a')]);
+  f.runtime.setHostsSuppressed(true);
+  f.hostActions.length = 0;
+
+  await f.runtime.setUnprotectedGuard(true);
+  assert.equal(f.hostActions.some(action => action.op === 'hosts' && action.blocked === true), false);
+
+  await f.runtime.setUnprotectedGuard(true, { suppressHosts: false });
+  assert.ok(f.hostActions.some(action => action.op === 'hosts' && action.blocked === true));
+});
+
+test('Windows 启动补授权后保留普通代理，Claude 仍默认拒绝', async t => {
+  let installs = 0;
+  const f = await fakeRuntime(t, undefined, { platform: 'win32', initialTunnel: false,
+    hostProbe: async () => installs === 0 ? { ok: false, status: 401 } : {
+      ok: true, json: async () => ({ ok: true, hostProtocol: HOST_PROTOCOL, hostBuildVersion: HOST_BUILD_VERSION, capabilities: HOST_CAPABILITIES }),
+    },
+    hostInstaller: async () => { installs++; return {}; },
+  });
+  await f.runtime.importNodes([node('a')]);
+  await f.runtime.start();
+  await f.runtime.setUnprotectedGuard(true, { ensureHost: true });
+  await f.runtime.setUnprotectedGuard(true, { ensureHost: true });
+  const report = await f.runtime.report();
+  assert.equal(installs, 1);
+  assert.equal(report.state, 'running');
+  assert.equal(report.tunEnabled, false);
+  assert.equal(report.unprotectedGuard.active, true);
+  assert.equal(f.guard(), 'REJECT');
+  assert.deepEqual(f.hostActions.filter(action => action.action === 'claude-guard' && action.op !== 'hosts').map(action => action.op), ['protect']);
 });
 
 test('桌面启动忽略上次遗留 TUN 偏好，不改存档；手动启用仍完整验证', async t => {
@@ -312,7 +420,7 @@ test('桌面启动忽略上次遗留 TUN 偏好，不改存档；手动启用仍
   await f.runtime.importNodes([node('a')]);
   await f.runtime.start();
   assert.equal((await f.runtime.report()).tunEnabled, false);
-  assert.equal(f.hostActions.some(action => action.action === 'claude-guard' && action.op === 'arm'), false);
+  assert.equal(f.hostActions.some(action => action.action === 'claude-guard' && action.op !== 'hosts'), false);
   assert.equal(JSON.parse(await readFile(preference, 'utf8')).tunEnabled, true);
   const launches = f.launches();
   await f.runtime.setUnprotectedGuard(true);
@@ -321,44 +429,32 @@ test('桌面启动忽略上次遗留 TUN 偏好，不改存档；手动启用仍
   await f.runtime.setTunnel(true, { ensureHost: true, protectClaude: true });
   assert.equal(f.launches(), launches, '启用保护热加载现有代理，不重启内核');
   assert.equal((await f.runtime.verifyConnection()).tunCaptured, true);
-  assert.equal(f.hostActions.filter(action => action.action === 'claude-guard' && action.op === 'release').length, 1);
+  assert.equal(f.hostActions.some(action => action.action === 'claude-guard' && action.op !== 'hosts'), false);
 });
 
-test('仅内核网络锁恢复先核验系统状态，已保护时不重复撤防', async t => {
+test('固定出口掉线与恢复只切内核，运行中不调用宿主防火墙', async t => {
   const exits = { a: 'SG' };
   const f = await fakeRuntime(t, undefined, { host: true, platform: 'win32', nodeExits: exits });
   await f.runtime.importNodes([node('a')]); await f.runtime.setTunnel(true, { protectClaude: true }); await f.tick();
   t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+  f.hostActions.length = 0;
   exits.a = null; t.mock.timers.tick(30000); await f.tick();
   assert.equal((await f.runtime.report()).regionLock.locked, true);
   assert.equal((await f.runtime.report()).failClosed.hostGuard.desired, 'protected');
-  f.hostActions.length = 0;
+  assert.equal(f.hostActions.some(action => action.op === 'hosts'), false, '断网锁定时 TUN 仍在，不改写 hosts');
   exits.a = 'SG'; t.mock.timers.tick(2000); await f.tick();
   assert.equal((await f.runtime.report()).regionLock.locked, false);
-  assert.ok(f.hostActions.some(action => action.op === 'status'));
-  assert.equal(f.hostActions.some(action => action.op === 'release' || action.op === 'arm'), false);
+  assert.equal(f.hostActions.some(action => action.action === 'claude-guard' && action.op !== 'hosts'), false);
 });
 
-test('系统规则核验异常不能跳过修复，修复失败保留网络锁', async t => {
-  const exits = { a: 'SG' }; let denyRepair = false;
-  const f = await fakeRuntime(t, undefined, { host: true, platform: 'win32', nodeExits: exits,
-    failClosedAction: async action => {
-      if (action.op === 'status') return { armed: false, count: 0, hostsBlocked: false, directProtected: false };
-      if (denyRepair && action.op === 'release') throw new Error('direct guard repair failed');
-    },
-  });
-  await f.runtime.importNodes([node('a')]); await f.runtime.setTunnel(true, { protectClaude: true }); await f.tick();
-  t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
-  exits.a = null; t.mock.timers.tick(30000); await f.tick();
-  exits.a = 'SG'; denyRepair = true;
-  await assert.rejects(f.runtime.unlockRegion(), /repair failed/);
-  assert.equal((await f.runtime.report()).regionLock.locked, true);
-  assert.equal(f.guard(), 'REJECT', '系统核验失败时必须恢复内核中的真实阻断');
-  assert.equal((await f.runtime.report()).failClosed.hostGuard.armed, null);
-  denyRepair = false;
-  await f.runtime.unlockRegion();
-  assert.equal((await f.runtime.report()).regionLock.locked, false);
-  assert.equal((await f.runtime.report()).failClosed.hostGuard.directProtected, true);
+test('启动只接受已确认的常驻阻断，规则缺失时 Claude 保持拒绝', async t => {
+  const f = await fakeRuntime(t, undefined, { host: true, platform: 'win32', failClosedAction: async action => {
+    if (action.op === 'protect') return { supported: true, armed: false, count: 0, hostsBlocked: true, directProtected: false };
+  } });
+  await f.runtime.importNodes([node('a')]);
+  await assert.rejects(f.runtime.setTunnel(true, { protectClaude: true }), /常驻直连阻断未确认/);
+  assert.equal(f.guard(), 'REJECT');
+  assert.equal((await f.runtime.report()).tunEnabled, false);
 });
 
 test('宿主心跳与隧道错误分别记录，心跳恢复清除告警，不覆盖巡检原始原因', async t => {
@@ -366,7 +462,6 @@ test('宿主心跳与隧道错误分别记录，心跳恢复清除告警，不�
   const f = await fakeRuntime(t, undefined, { host: true, platform: 'win32',
     heartbeatScheduler: { every: callback => { heartbeat = callback; return { unref() {} }; }, clear: () => {} },
     observeHostAction: async action => { if (action.action === 'heartbeat' && failHeartbeat) throw new Error('local heartbeat timeout'); },
-    failClosedAction: async action => { if (action.op === 'arm' && failHeartbeat) await heartbeat(); },
   });
   await f.runtime.importNodes([node('a')]); await f.runtime.setTunnel(true, { protectClaude: true });
   failHeartbeat = true;
@@ -376,7 +471,7 @@ test('宿主心跳与隧道错误分别记录，心跳恢复清除告警，不�
   assert.equal((await f.runtime.report()).hostHeartbeatError, null);
   t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
   t.mock.timers.tick(5000); await f.tick();
-  assert.ok(f.hostActions.some(action => action.action === 'claude-guard' && action.op === 'arm'), '第二次连续失败才布防');
+  assert.deepEqual(f.hostActions.filter(action => action.action === 'claude-guard' && action.op !== 'hosts').map(action => action.op), ['protect']);
   // 心跳失败独立记录，不覆盖巡检原始原因。
   await heartbeat();
   const report = await f.runtime.report();
@@ -404,7 +499,7 @@ test('批量关闭 Claude 连接限制并发，慢连接不串行拖住整个阻
   assert.equal(maximum, 4);
 });
 
-test('旧连接清理共享两秒预算，取消后立即布防，网络恢复不重建内核', async t => {
+test('旧连接清理共享两秒预算，取消后保留常驻阻断，网络恢复不重建内核', async t => {
   let waiting = true, entered;
   const started = new Promise(resolve => { entered = resolve; });
   const releases = [], signals = [], ids = [], finished = new Set();
@@ -439,7 +534,8 @@ test('旧连接清理共享两秒预算，取消后立即布防，网络恢复�
     assert.ok(signals.every(signal => signal.aborted));
     assert.equal(ids.includes('ordinary'), false);
     assert.equal(f.guard(), 'REJECT');
-    assert.equal((await f.runtime.report()).failClosed.hostGuard.armed, true);
+    assert.equal((await f.runtime.report()).failClosed.hostGuard.directProtected, true);
+    assert.deepEqual(f.hostActions.filter(action => action.action === 'claude-guard' && action.op !== 'hosts').map(action => action.op), ['protect']);
     assert.ok(f.logs.some(line => line.includes('连接清理') && line.includes('2000ms')));
     const secondBatch = new Promise(resolve => { entered = resolve; });
     f.setTunnelActive(true); t.mock.timers.tick(2000);
@@ -484,13 +580,14 @@ test('断网暂停出口探测，已确认布防不重复识别客户端，联�
   assert.equal(f.exitProbes(), probes);
   assert.equal(discoveries, blockedDiscoveries);
   assert.equal(f.guard(), 'REJECT');
-  assert.equal((await f.runtime.report()).failClosed.hostGuard.armed, true);
+  assert.equal((await f.runtime.report()).failClosed.hostGuard.directProtected, true);
   f.online(); await f.tick();
   // The interface change installs a network lock; the next due check releases it.
   t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
   t.mock.timers.tick(2000); await f.tick();
   assert.equal(f.guard(), 'CLAUDE-PIN');
   assert.equal(f.launches(), launches);
+  assert.deepEqual(f.hostActions.filter(action => action.action === 'claude-guard' && action.op !== 'hosts').map(action => action.op), ['protect']);
 });
 
 test('隧道 DNS 未就绪不发远端出口请求；恢复必须获得新的出口证据', async t => {
@@ -572,7 +669,7 @@ test('出口请求期间隧道丢失但网卡 IP 不变，不能用旧接管证�
   assert.equal((await f.runtime.report()).regionLock.locked, true);
 });
 
-test('Windows 目标识别失败不拆旧隧道；重试刷新客户端路径', async t => {
+test('Windows 重建内核不重复识别客户端，新会话才刷新路径', async t => {
   let mode = 'ok';
   const f = await fakeRuntime(t, undefined, { host: true, platform: 'win32', discoverTargets: async () => {
     if (mode === 'error') throw new Error('discovery timeout');
@@ -580,15 +677,15 @@ test('Windows 目标识别失败不拆旧隧道；重试刷新客户端路径', 
   } });
   await f.runtime.importNodes([node('a')]);
   await f.runtime.setTunnel(true, { protectClaude: true });
-  for (mode of ['error']) {
-    f.hostActions.length = 0;
-    await assert.rejects(f.runtime.restart(), /discovery timeout|未找到 Claude/);
-    assert.equal(f.hostActions.some(action => action.action === 'stop'), false);
-  }
-  mode = 'updated';
+  mode = 'error';
   f.hostActions.length = 0;
   assert.equal(await f.runtime.restart(), true);
-  assert.ok(f.hostActions.some(action => action.op === 'arm' && action.programs.includes('C:/updated/Claude.exe')));
+  assert.equal(f.hostActions.some(action => action.action === 'claude-guard' && action.op !== 'hosts'), false);
+  await f.runtime.stop();
+  mode = 'updated';
+  f.hostActions.length = 0;
+  await f.runtime.setUnprotectedGuard(true);
+  assert.ok(f.hostActions.some(action => action.op === 'protect' && action.programs.includes('C:/updated/Claude.exe')));
 });
 
 test('明确未安装桌面客户端可启动和重启浏览器保护，不误报桌面规则失败', async t => {
@@ -597,7 +694,7 @@ test('明确未安装桌面客户端可启动和重启浏览器保护，不误�
   await f.runtime.setTunnel(true, { protectClaude: true });
   assert.equal(await f.runtime.restart(), true);
   assert.equal(f.hostActions.some(action => action.action === 'ipv6' && action.enabled === false), false, 'Windows 不应为 Claude 禁用整机 IPv6');
-  assert.ok(f.hostActions.some(action => action.op === 'arm' && action.domains.includes('claude.ai') && action.programs.length === 0));
+  assert.ok(f.hostActions.some(action => action.op === 'protect' && action.domains.includes('claude.ai') && action.programs.length === 0));
   const report = await f.runtime.report();
   assert.equal(report.failClosed.hostGuard.scope, 'browser');
   report.failClosed.hostGuard.directProtected = false;
@@ -608,29 +705,22 @@ test('明确未安装桌面客户端可启动和重启浏览器保护，不误�
   await f.runtime.stop();
 });
 
-test('Windows 重启先布防后停内核，失败期间保持阻断，成功只允许隧道', async t => {
+test('Windows 内核重建及重建失败不改动常驻规则，退出在停内核后清理', async t => {
   let deny = false;
   const f = await fakeRuntime(t, undefined, { host: true, platform: 'win32', failClosedAction: async action => {
-    if (deny && action.op === 'arm') throw new Error('firewall unavailable');
+    if (deny && action.op !== 'release') throw new Error('firewall unavailable');
   } });
   await f.runtime.importNodes([node('a')]);
   await f.runtime.setTunnel(true, { protectClaude: true });
   f.hostActions.length = 0;
   deny = true;
-  await assert.rejects(f.runtime.restart(), /firewall unavailable/);
-  assert.equal(f.hostActions.some(action => action.action === 'stop'), false, '布防失败不能拆掉旧隧道');
-  deny = false;
-  f.hostActions.length = 0;
   assert.equal(await f.runtime.restart(), true);
-  const armed = f.hostActions.findIndex(action => action.action === 'claude-guard' && action.op === 'arm');
-  const stopped = f.hostActions.findIndex(action => action.action === 'stop');
-  assert.ok(armed >= 0 && stopped > armed);
-  assert.ok(f.hostActions.filter(action => action.op === 'release').every(action => action.keepDirect === true));
+  assert.equal(f.hostActions.some(action => action.action === 'claude-guard' && action.op !== 'hosts'), false);
   f.hostActions.length = 0;
   f.fail();
   await assert.rejects(f.runtime.restart(), /launch failure/);
-  assert.equal(f.hostActions.some(action => action.op === 'release'), false);
-  assert.equal((await f.runtime.report()).failClosed.hostGuard.desired, 'armed');
+  assert.equal(f.hostActions.some(action => action.action === 'claude-guard' && action.op !== 'hosts'), false);
+  assert.equal((await f.runtime.report()).failClosed.hostGuard.desired, 'protected');
   await f.tick();
   assert.equal((await f.runtime.report()).failClosed.hostGuard.directProtected, true, '重建失败后自动恢复，无需手动开始');
   f.hostActions.length = 0;
@@ -648,8 +738,7 @@ test('Windows 内核意外退出且断网时保持系统阻断，网络恢复后
   f.disconnect(); f.offline();
   f.hostActions.length = 0;
   await f.tick();
-  assert.ok(f.hostActions.some(action => action.op === 'arm'));
-  assert.equal(f.hostActions.some(action => action.op === 'release'), false);
+  assert.equal(f.hostActions.some(action => action.action === 'claude-guard' && action.op !== 'hosts'), false);
   f.online();
   await f.tick();
   assert.equal((await f.runtime.report()).failClosed.hostGuard.directProtected, true);
@@ -1223,18 +1312,18 @@ test("Windows 内网 CIDR 加载与隧道 DNS 超时分开，完成验证前保�
   assert.equal(saved.restarted, true);
   assert.equal(saved.verificationPending, true);
   assert.equal(f.launches(), before + 1);
-  assert.equal((await f.runtime.report()).failClosed.hostGuard.armed, true);
+  assert.equal((await f.runtime.report()).failClosed.hostGuard.directProtected, true);
   assert.equal(f.runtime.connectionState().tunCaptured, null);
   await f.tick();
   assert.equal(f.launches(), before + 1);
-  assert.equal((await f.runtime.report()).failClosed.hostGuard.armed, true);
+  assert.equal((await f.runtime.report()).failClosed.hostGuard.directProtected, true);
   assert.deepEqual((await f.runtime.network()).config, config);
   assert.equal((await f.runtime.network()).pendingRestart, false);
   t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
   nodeExits.a = null;
   f.setTunnelActive(true); t.mock.timers.tick(2000); await f.tick();
   assert.equal((await f.runtime.network()).verificationPending, true);
-  assert.equal((await f.runtime.report()).failClosed.hostGuard.armed, true);
+  assert.equal((await f.runtime.report()).failClosed.hostGuard.directProtected, true);
   nodeExits.a = 'SG'; t.mock.timers.tick(2000); await f.tick();
   assert.equal(f.launches(), before + 1);
   assert.equal(f.runtime.connectionState().tunCaptured, true);
@@ -1272,7 +1361,7 @@ test("内网声明提交前保留旧文件，提交失败后的宿主停止超�
   await rm(temporary, { recursive: true });
   assert.deepEqual((await f.runtime.network()).config, previous);
   assert.equal((await f.runtime.network()).pendingRestart, true);
-  assert.equal((await f.runtime.report()).failClosed.hostGuard.armed, true);
+  assert.equal((await f.runtime.report()).failClosed.hostGuard.directProtected, true);
   t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
   failStop = true;
   await f.tick();
@@ -1297,7 +1386,7 @@ test("网络异常默认只阻断 Claude；严格断流需显式开启并落盘"
   assert.equal((await f.runtime.report()).networkFailurePolicy, "claude");
 });
 
-test('开启保护保留系统阻断至 TUN 验证完成，避免先撤防再布防', async t => {
+test('开启保护等待 TUN 验证，常驻规则全程保留', async t => {
   const f = await fakeRuntime(t, undefined, { host: true, platform: 'win32' });
   await f.runtime.importNodes([node('a')]);
   await f.runtime.setUnprotectedGuard(true);
@@ -1306,7 +1395,7 @@ test('开启保护保留系统阻断至 TUN 验证完成，避免先撤防再布
   assert.equal(f.hostActions.some(action => action.action === 'claude-guard' && action.op === 'release'), false);
   await f.runtime.setTunnel(true, { protectClaude: true });
   assert.equal((await f.runtime.report()).tunCaptured, true);
-  assert.equal(f.hostActions.filter(action => action.action === 'claude-guard' && action.op === 'release').length, 1);
+  assert.equal(f.hostActions.some(action => action.action === 'claude-guard' && action.op !== 'hosts'), false);
 
   await f.runtime.setUnprotectedGuard(true);
   await f.runtime.setUnprotectedGuard(false, { deferRelease: true });
@@ -1368,14 +1457,13 @@ test('Windows 单独开启 TUN 不放行 Claude，重复验证保护不重新布
 test('Windows 暂停内核时保持系统兜底，应用退出才撤防', async t => {
   const f = await fakeRuntime(t, undefined, { host: true, platform: 'win32' });
   await f.runtime.setUnprotectedGuard(true);
-  assert.equal((await f.runtime.report()).failClosed.hostGuard.armed, true);
+  assert.equal((await f.runtime.report()).failClosed.hostGuard.directProtected, true);
   await f.runtime.importNodes([node('a')]);
   await f.runtime.setTunnel(true, { protectClaude: true });
   f.hostActions.length = 0;
   await f.runtime.stop({ keepClaudeGuard: true });
-  assert.equal((await f.runtime.report()).failClosed.hostGuard.armed, true);
-  assert.equal(f.hostActions.filter(action => action.op === 'arm').length, 1);
-  assert.equal(f.hostActions.some(action => action.op === 'release'), false);
+  assert.equal((await f.runtime.report()).failClosed.hostGuard.directProtected, true);
+  assert.equal(f.hostActions.some(action => action.action === 'claude-guard' && action.op !== 'hosts'), false);
   await f.runtime.stop();
   assert.ok(f.hostActions.some(action => action.op === 'release' && action.keepDirect === false));
 });
@@ -1397,7 +1485,7 @@ test("Windows 未保护阻断不启动 TUN、不重载普通代理", async t => 
 });
 
 test("独立阻断失败不影响普通代理运行或切换节点", async t => {
-  const f = await fakeRuntime(t, undefined, { host: true, platform: 'win32', failClosedAction: async action => { if (action.op === 'arm') throw new Error('test firewall unavailable'); } });
+  const f = await fakeRuntime(t, undefined, { host: true, platform: 'win32', failClosedAction: async action => { if (action.op === 'protect') throw new Error('test firewall unavailable'); } });
   await f.runtime.importNodes([node("a")]);
   await assert.rejects(f.runtime.setUnprotectedGuard(true), /firewall unavailable/);
   await f.runtime.setTunnel(false);

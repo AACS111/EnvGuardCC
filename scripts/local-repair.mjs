@@ -244,6 +244,11 @@ async function handleRequest(req, res) {
       if (body.action === "observe") return send(200, protection.observe(body));
       if (body.action === "monitor") return send(200, await protection.monitor(body.enabled, body.intervalMs));
       if (body.action === 'startup') {
+        if (process.platform === 'win32') {
+          const blocked = await protection.ensureUnprotectedBlock({ ensureHost: true });
+          if (!body.enabled && !blocked.enabled && !blocked.desiredEnabled) return send(200, blocked);
+          if (body.enabled && blocked.unprotectedBlock?.error) throw new Error(blocked.unprotectedBlock.error);
+        }
         const current = protection.report();
         if (!body.enabled) {
           if (current.enabled || current.desiredEnabled) return send(200, await protection.stop(origin));
@@ -412,7 +417,7 @@ const server = http.createServer((req, res) => {
 server.requestTimeout = 120000;
 server.headersTimeout = 10000;
 server.on("error", (error) => { if (error.code !== "EADDRINUSE") console.error(`[repair] ${error.code}: ${error.message}`); });
-export async function startRepairHelper(listenPort = port, { netCore = null, readTimezone = readSystemTimezone } = {}) {
+export async function startRepairHelper(listenPort = port, { netCore = null, readTimezone = readSystemTimezone, autoStartProtection = false } = {}) {
   timezoneReader = readTimezone;
   networkRuntime = netCore;
   try {
@@ -423,7 +428,9 @@ export async function startRepairHelper(listenPort = port, { netCore = null, rea
     } catch (error) { if (error.code !== 'ENOENT') throw error; }
     await new Promise((resolve, reject) => { server.once("error", reject); server.listen(listenPort, "127.0.0.1", resolve); });
     await protection.recover();
-    if (process.platform === 'win32' && netCore) await protection.ensureUnprotectedBlock();
+    // 启动即会开启保护时先不写 hosts：隧道验证通过后本来也要清除，
+    // 提前写阻断只会让浏览器在启动几秒内报 ERR_ADDRESS_INVALID。
+    if (process.platform === 'win32' && netCore && autoStartProtection !== true) await protection.ensureUnprotectedBlock();
     await desktopLauncher.localeProfile.restore();
     initializing = false;
     return { server, url: `http://127.0.0.1:${server.address().port}`, closeRuntime };

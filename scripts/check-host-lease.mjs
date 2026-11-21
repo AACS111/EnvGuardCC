@@ -7,6 +7,21 @@ import path from 'node:path';
 import { createKernelHost, HOST_TOKEN_HEADER } from './net-core/host.mjs';
 import { createClaudeGuard } from './net-core/claude-guard.mjs';
 
+test('宿主只在启动恢复持久规则，租约循环不巡检常驻防火墙', async t => {
+  const directory = await mkdtemp(path.join(tmpdir(), 'egcc-host-persistent-'));
+  let inspections = 0;
+  const host = createKernelHost({ token: 'test-persistent-token-123456789', binary: 'unused', stateDir: directory,
+    port: 0, leaseTimeoutMs: 20, ports: { portOwner: async () => null },
+    claudeGuard: { load: async () => {}, reconcile: async () => { inspections++; },
+      snapshot: () => ({ persistent: true, desired: 'protected' }),
+    },
+  });
+  await host.listen();
+  t.after(async () => { await host.close(); await rm(directory, { recursive: true, force: true }); });
+  await new Promise(resolve => setTimeout(resolve, 100));
+  assert.equal(inspections, 1);
+});
+
 test('宿主记录守卫请求的排队和执行耗时，失败也保留计时且健康检查不排队', async t => {
   const directory = await mkdtemp(path.join(tmpdir(), 'egcc-host-timing-'));
   const logs = [];
