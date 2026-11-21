@@ -46,11 +46,11 @@ export function createProtectionService({ stateDir, runtime, browserCloak, curre
   // 保护关闭时的 Claude 阻断状态：开启失败要如实展示，不能静默放行。
   let unprotectedBlock = { active: false, error: null };
   let previousTunnel = null;
-  const applyUnprotectedBlock = async enabled => {
+  const applyUnprotectedBlock = async (enabled, options) => {
     const kernel = network();
     if (!kernel) { unprotectedBlock = { active: false, error: null }; return; }
     if (!kernel.setUnprotectedGuard) { unprotectedBlock = { active: false, error: "当前网络内核不支持未保护阻断，请更新 EnvGuardCC。" }; return; }
-    try { await kernel.setUnprotectedGuard(enabled); unprotectedBlock = { active: enabled, error: null }; }
+    try { await kernel.setUnprotectedGuard(enabled, options); unprotectedBlock = { active: enabled, error: null }; }
     catch (error) { unprotectedBlock = { active: false, error: error.message }; }
   };
   const assertNetwork = async () => {
@@ -58,6 +58,7 @@ export function createProtectionService({ stateDir, runtime, browserCloak, curre
     if (!kernel) return;
     const report = kernel.verifyConnection ? await kernel.verifyConnection() : await kernel.report();
     if (report.state !== "running" || report.tunEnabled !== true || report.tunCaptured !== true) throw new Error(report.reason || "隧道接管尚未验证，环境防护未生效。");
+    if (platform === 'win32' && report.claudeBlocked === true) throw new Error(report.regionLock?.reason || 'Claude 固定出口尚未验证，保持阻断。');
   };
   const browserErrors = report => [...report.results.filter(result => result.state !== "verified").map(result => result.detail), ...(report.requestProbe?.state !== "verified" ? [report.requestProbe?.detail || "浏览器实际请求尚未验证。"] : [])];
   const session = new ProtectionSession({
@@ -67,18 +68,16 @@ export function createProtectionService({ stateDir, runtime, browserCloak, curre
       const kernel = network();
       if (!kernel) return;
       previousTunnel ??= kernel.connectionState?.().tunEnabled === true;
-      // 先解除未保护阻断，否则保护自己的模拟测试会被 REJECT 规则挡住。
-      // Keep the system guard armed until setTunnel has verified takeover.
-      // Releasing and immediately rearming it adds two privileged round trips.
-      if (kernel.setUnprotectedGuard) await kernel.setUnprotectedGuard(false, { deferRelease: true });
+      // Windows 只在明确开启保护、隧道和所选出口验证后放行 Claude。
+      if (platform !== 'win32' && kernel.setUnprotectedGuard) await kernel.setUnprotectedGuard(false, { deferRelease: true });
       signal?.throwIfAborted();
       unprotectedBlock = { active: false, error: null };
-      await kernel.setTunnel(true, { ensureHost: true });
+      await kernel.setTunnel(true, platform === 'win32' ? { ensureHost: true, protectClaude: true } : { ensureHost: true });
       signal?.throwIfAborted();
       await assertNetwork();
     },
     beforeTest: assertNetwork,
-    afterStop: async ({ shutdown = false, kernelWillStop = false, baseline } = {}) => {
+    afterStop: async ({ shutdown = false, kernelWillStop = false, rollback = false, baseline } = {}) => {
       const kernel = network();
       if (!kernel) return;
       if (shutdown) {
@@ -91,10 +90,11 @@ export function createProtectionService({ stateDir, runtime, browserCloak, curre
         unprotectedBlock = { active: false, error: null };
         return;
       }
-      await applyUnprotectedBlock(true);
-      // 恢复接管前的网络，保留本机代理；阻断失败也不能强迫用户继续使用 TUN。
+      const windows = platform === 'win32';
+      await applyUnprotectedBlock(true, windows ? { blockHosts: true } : undefined);
+      // Windows 手动关闭环境保护时保留系统接管，让其他应用继续走代理。
       const restoreTunnel = baseline?.networkTunnel ?? previousTunnel;
-      if (restoreTunnel === false && !kernel.connectionState?.().strictEnabled) await kernel.setTunnel(false);
+      if ((!windows || rollback) && restoreTunnel === false && !kernel.connectionState?.().strictEnabled) await kernel.setTunnel(false);
       previousTunnel = null;
     },
     detect: async () => {
@@ -193,6 +193,6 @@ export function createProtectionService({ stateDir, runtime, browserCloak, curre
     return { ...report, connection, unprotectedBlock };
   };
   // 应用启动且自动保护关闭时，由本机助手调用：保护没开也要拦住 Claude。
-  session.ensureUnprotectedBlock = async () => { await applyUnprotectedBlock(true); return session.report(); };
+  session.ensureUnprotectedBlock = async options => { await applyUnprotectedBlock(true, options); return session.report(); };
   return session;
 }

@@ -5,7 +5,7 @@ import path from "node:path";
 import assert from "node:assert/strict";
 import http from "node:http";
 import net from "node:net";
-import { proxyRequest, resolveProxy, selectedProxy, systemProxyStatus } from "./gateway-proxy.mjs";
+import { proxyRequest, resolveProxy, selectedProxy, systemProxyStatus, requestTransport } from "./gateway-proxy.mjs";
 
 const listen = (server) => new Promise((resolve) => server.listen(0, "127.0.0.1", () => resolve(server.address().port)));
 const close = (server, sockets = []) => new Promise((resolve) => {
@@ -22,6 +22,31 @@ const request = (url, options, proxy) => new Promise((resolve, reject) => {
   }, proxy);
   req.on("error", reject);
   req.end(options.body);
+});
+
+test('请求记账后代理设置变化，实际发送仍使用同一次选择', async () => {
+  const sockets = [];
+  const proxy = http.createServer();
+  proxy.on('connect', (_request, socket) => {
+    sockets.push(socket);
+    socket.once('data', () => socket.end('HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok'));
+    socket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+  });
+  const port = await listen(proxy);
+  const previous = process.env.CHECKCC_PROXY;
+  try {
+    process.env.CHECKCC_PROXY = `http://127.0.0.1:${port}`;
+    const target = new URL('http://snapshot.example.invalid/v1/messages');
+    const transport = requestTransport(target);
+    process.env.CHECKCC_PROXY = 'http://127.0.0.1:1';
+    assert.equal(transport.info.address, `http://127.0.0.1:${port}`);
+    const result = await request(target.href, { method: 'POST', body: 'fixture' }, transport.proxy);
+    assert.equal(result.status, 200);
+    assert.equal(result.body, 'ok');
+  } finally {
+    if (previous === undefined) delete process.env.CHECKCC_PROXY; else process.env.CHECKCC_PROXY = previous;
+    await close(proxy, sockets);
+  }
 });
 
 test("Windows system proxy, explicit override and direct mode resolve without exposing credentials", () => {

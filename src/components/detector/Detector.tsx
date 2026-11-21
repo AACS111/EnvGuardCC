@@ -249,7 +249,12 @@ export function Detector({ locale = "zh" }: { locale?: LocaleCode }) {
       if (!current()) return;
       if (gateway.error) throw new Error(gateway.error);
       setBrowserScan(browser); setClaudeCheck(gateway); setOptimization(gateway.cloak); setPointResults({});
-      if (gateway.geo) setExitGeo(gateway.geo);
+      const gatewayGeo = gateway.geo;
+      if (gatewayGeo) {
+        setExitGeo(previous => previous?.ip && previous.ip === gatewayGeo.ip
+          ? { ...gatewayGeo, networkEvidence: gatewayGeo.networkEvidence ?? previous.networkEvidence }
+          : gatewayGeo);
+      }
       setCompletedSample({ id: crypto.randomUUID(), runId: options.runId });
     } catch (error) { if (current() && !options.background) setCheckError(error instanceof Error ? error.message : String(error)); throw error; }
     finally { if (version === scanVersion.current) { scanTask.current = null; scanLock.current = false; setRunning(false); } }
@@ -516,10 +521,10 @@ export function Detector({ locale = "zh" }: { locale?: LocaleCode }) {
       // 先补一轮验证测试，得分由 runId 下发后的采样流程回填。
       if (report?.enabled && report.phase !== "restart_required" && !report.runId) {
         if (!report.testing) await protectionRequest("test");
-        await protection.refresh();
+        await Promise.all([protection.refresh(), refreshExit()]);
         return;
       }
-      await runAll({ runId: report?.runId ?? undefined });
+      await Promise.all([runAll({ runId: report?.runId ?? undefined }), refreshExit()]);
     }
     catch (error) { setCheckError(error instanceof Error ? error.message : String(error)); }
     finally { setManualChecking(false); }

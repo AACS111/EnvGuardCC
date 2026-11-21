@@ -19,6 +19,9 @@ export async function startDesktopServices({ kernel, autoStartProtection, config
     if (autoStartProtection && kernel.enabled && !stopping()) {
       try { await kernel.start(); }
       catch (fallback) { logger('[net-core] 本机代理启动失败：' + fallback.message); }
+      // 保护没起来时必须补上未开启保护的阻断（含 hosts 兜底），不能静默放行 Claude。
+      try { kernel.setHostsSuppressed?.(false); await kernel.setUnprotectedGuard?.(true); }
+      catch (guard) { logger('[net-core] 未保护阻断建立失败：' + guard.message); }
     }
     throw error;
   }

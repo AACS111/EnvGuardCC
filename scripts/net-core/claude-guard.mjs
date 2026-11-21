@@ -12,18 +12,47 @@
 // macOS 走严格模式的 PF anchor（firewall.mjs），本模块返回 supported=false，不冒充已实现。
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { mkdir, readFile, rename, writeFile, access } from "node:fs/promises";
+import { mkdir, readFile, rename, rm, writeFile, access } from "node:fs/promises";
 import path from "node:path";
 import { homedir } from "node:os";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { windowsSystemExecutable } from "../windows-timezone.mjs";
 import { windowsClaudeTargets } from '../windows-claude-targets.mjs';
 import { FIREWALL_RULE_CHECK } from './firewall-rule-check.mjs';
 
 const run = promisify(execFile);
 const powershell = windowsSystemExecutable("WindowsPowerShell\\v1.0\\powershell.exe");
-const windowsOptions = { windowsHide: true, timeout: 45000, maxBuffer: 64 * 1024 };
-const jsonScript = (body) => `[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; $ProgressPreference = 'SilentlyContinue'; ${body}`;
+// 单次 PowerShell 的上限：正常 6–15 秒，资源紧张时到过 33 秒，45 秒是余量而不是常态。
+// 允许用环境变量覆盖，便于在慢机器上放宽而不是把每次布防都拖到宿主动作超时。
+export const GUARD_POWERSHELL_TIMEOUT_MS = (() => {
+  const value = Number(process.env.CHECKCC_GUARD_PS_TIMEOUT_MS);
+  return Number.isFinite(value) && value >= 10000 && value <= 180000 ? Math.trunc(value) : 45000;
+})();
+const windowsOptions = { windowsHide: true, timeout: GUARD_POWERSHELL_TIMEOUT_MS, maxBuffer: 64 * 1024 };
+
+/** 只保留 stderr 末尾几行：PowerShell 的多行异常前几行通常是调用栈，关键信息在最后。 */
+function tailLines(text, lines = 6, width = 300) {
+  const tail = String(text ?? '').split(/\r?\n/).map(line => line.trim()).filter(Boolean).slice(-lines).join(' / ');
+  return tail.length > width ? `${tail.slice(0, width)}…` : tail;
+}
+
+/**
+ * 把 execFile 的失败翻译成用户能读的一句话。
+ * 关键约束：绝不回退到 error.message —— 它是 `Command failed: <整条 PowerShell 命令>`，
+ * 直接把几百行脚本糊到界面上，真正的原因反而丢了。
+ */
+export function describeGuardFailure(error, { timeoutMs = GUARD_POWERSHELL_TIMEOUT_MS } = {}) {
+  const stderr = String(error?.stderr ?? '').trim();
+  if (stderr.includes('[FIREWALL_DISABLED]')) return 'Windows 防火墙未开启（或服务无响应），需要确认开启后才能阻止 Claude 直连。';
+  if (error?.killed || error?.signal === 'SIGTERM') return `防火墙核验超时（${Math.round(timeoutMs / 1000)} 秒未完成），系统可能资源不足；请稍后重试。`;
+  if (stderr) return `防火墙核验失败：${tailLines(stderr)}`;
+  // 内部/注入错误（没有 stderr，message 不是命令行转储）要保留原话。
+  const message = String(error?.message ?? '').trim();
+  if (message && !/^Command failed:/i.test(message) && message.length <= 600) return `防火墙核验失败：${tailLines(message, 2)}`;
+  return `防火墙核验命令未返回结果（${error?.code ? `错误码 ${error.code}` : '签名异常'}）；请重新授权助手后重试。`;
+}
+const jsonScript = (body) => `[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; $ProgressPreference = 'SilentlyContinue'; $guardFilterMs = 0; $guardFilterRules = 0; $guardServiceMs = 0; $guardProfileMs = 0; $guardRuleReadMs = 0; $guardSidMs = 0; $guardBodyWatch = [Diagnostics.Stopwatch]::StartNew(); try { ${body} } finally { [Console]::Error.WriteLine(('[guard-timing] body-ms={0} filter-ms={1} filter-rules={2} service-ms={3} profile-ms={4} rule-read-ms={5} sid-ms={6}' -f $guardBodyWatch.ElapsedMilliseconds, $guardFilterMs, $guardFilterRules, $guardServiceMs, $guardProfileMs, $guardRuleReadMs, $guardSidMs)) }`;
+const timedRuleRead = script => `$guardReadWatch = [Diagnostics.Stopwatch]::StartNew(); try { ${script} } finally { $script:guardRuleReadMs = [long]$script:guardRuleReadMs + $guardReadWatch.ElapsedMilliseconds }`;
 
 export const CLAUDE_GUARD_GROUP_PREFIX = "EnvGuardCC-Claude-Guard";
 export const CLAUDE_GUARD_PORTS = [443];
@@ -36,6 +65,8 @@ export const CLAUDE_DIRECT_BLOCK_ADDRESSES = [
 
 // New-NetFirewallRule -Package 接受 SID，不接受 Get-AppxPackage 的 PackageFamilyName。
 export const PACKAGE_SID_SCRIPT = String.raw`
+$guardSidWatch = [Diagnostics.Stopwatch]::StartNew()
+try {
 Add-Type -TypeDefinition @'
 using System;
 using System.Runtime.InteropServices;
@@ -53,6 +84,7 @@ public static class EnvGuardPackageSid {
   }
 }
 '@
+} finally { $script:guardSidMs = $guardSidWatch.ElapsedMilliseconds }
 `;
 
 // 默认的 Anthropic/Claude 域名集合（浏览器等不按进程拦的入口靠 hosts 层覆盖）。
@@ -83,8 +115,10 @@ export const guardGroupName = (token) => `${CLAUDE_GUARD_GROUP_PREFIX}-${token}`
 const quote = (value) => `'${String(value).replaceAll("'", "''")}'`;
 const ruleName = spec => `${spec.group}-${createHash('sha256').update(JSON.stringify(spec)).digest('hex').slice(0, 24)}`;
 export const FIREWALL_CHECK_SCRIPT = `
-$service = Get-Service -Name MpsSvc -ErrorAction Stop
-$profiles = @(Get-NetFirewallProfile -PolicyStore ActiveStore)
+$guardStateWatch = [Diagnostics.Stopwatch]::StartNew()
+try { $service = Get-Service -Name MpsSvc -ErrorAction Stop } finally { $script:guardServiceMs = $guardStateWatch.ElapsedMilliseconds }
+$guardStateWatch.Restart()
+try { $profiles = @(Get-NetFirewallProfile -PolicyStore ActiveStore) } finally { $script:guardProfileMs = $guardStateWatch.ElapsedMilliseconds }
 if ($service.Status -ne 'Running' -or $profiles.Count -ne 3 -or @($profiles | Where-Object { $_.Enabled -ne 'True' }).Count) { throw '[FIREWALL_DISABLED] Windows 防火墙未开启，需要确认开启后才能阻止 Claude 直连。' }
 if (@($profiles | Where-Object { $_.AllowLocalFirewallRules -eq 'False' }).Count) { throw '组策略禁止本地防火墙规则，请联系管理员；无法确认 Claude 直连阻断生效。' }
 `;
@@ -163,6 +197,19 @@ export function claudeDirectSpecs(selectors) {
     .map(spec => ({ ...spec, group: `${spec.group}-Direct`, name: `${spec.name}-Direct`, protocol: 'Any', port: 'Any', addresses: CLAUDE_DIRECT_BLOCK_ADDRESSES }));
 }
 
+/** 生成单条「存在则更新、缺失则新建」的规则语句；indent 用于嵌入条件块。 */
+function guardArmLine(spec, indent = '') {
+  const selector = spec.package
+    ? `-Program Any -Package ([EnvGuardPackageSid]::Resolve(${quote(spec.package)}))`
+    : spec.program
+      ? `-Program ${quote(spec.program)} -Package $null`
+      : '-Program Any -Package $null';
+  const remote = spec.addresses ? `-RemoteAddress ${spec.addresses.map(quote).join(',')}` : '-RemoteAddress Any';
+  const name = ruleName(spec);
+  const settings = `-Direction Outbound -Action Block -Profile Any -Enabled True -Service Any -InterfaceType Any -InterfaceAlias Any -LocalAddress Any -LocalPort Any -Protocol ${spec.protocol} -RemotePort ${spec.port} ${selector} ${remote}`;
+  return `${indent}if (${quote(name)} -in $existing.Name) { Set-NetFirewallRule -PolicyStore PersistentStore -Name ${quote(name)} ${settings} } else { New-NetFirewallRule -PolicyStore PersistentStore -Name ${quote(name)} -DisplayName ${quote(spec.name)} -Group ${quote(spec.group)} ${settings} | Out-Null }`;
+}
+
 /** 按稳定 Name 更新，不先删旧规则；重试和补齐部分失败不会制造新的直连窗口。 */
 export function claudeGuardArmScript(specs) {
   if (!Array.isArray(specs) || !specs.length) throw new Error("fail-closed 规则为空。");
@@ -170,32 +217,70 @@ export function claudeGuardArmScript(specs) {
   const lines = [
     "$ErrorActionPreference = 'Stop'",
     FIREWALL_CHECK_SCRIPT,
-    `$existing = @(Get-NetFirewallRule -Group ${groups.map(quote).join(',')} -PolicyStore PersistentStore -ErrorAction SilentlyContinue)`,
+    timedRuleRead(`$existing = @(Get-NetFirewallRule -Group ${groups.map(quote).join(',')} -PolicyStore PersistentStore -ErrorAction SilentlyContinue)`),
   ];
   if (specs.some(spec => spec.package)) lines.push(PACKAGE_SID_SCRIPT);
-  for (const spec of specs) {
-    const selector = spec.package
-      ? `-Program Any -Package ([EnvGuardPackageSid]::Resolve(${quote(spec.package)}))`
-      : spec.program
-        ? `-Program ${quote(spec.program)} -Package $null`
-        : '-Program Any -Package $null';
-    const remote = spec.addresses ? `-RemoteAddress ${spec.addresses.map(quote).join(',')}` : '-RemoteAddress Any';
-    const name = ruleName(spec);
-    const settings = `-Direction Outbound -Action Block -Profile Any -Enabled True -Service Any -InterfaceType Any -InterfaceAlias Any -LocalAddress Any -LocalPort Any -Protocol ${spec.protocol} -RemotePort ${spec.port} ${selector} ${remote}`;
-    lines.push(`if (${quote(name)} -in $existing.Name) { Set-NetFirewallRule -PolicyStore PersistentStore -Name ${quote(name)} ${settings} } else { New-NetFirewallRule -PolicyStore PersistentStore -Name ${quote(name)} -DisplayName ${quote(spec.name)} -Group ${quote(spec.group)} ${settings} | Out-Null }`);
-  }
+  for (const spec of specs) lines.push(guardArmLine(spec));
   lines.push(guardVerifiedCount(groups, specs));
   lines.push("ConvertTo-Json -Compress -InputObject @{ count = $count }");
   return lines.join("\n");
 }
 
-export function claudeGuardReleaseScript(group) {
+export function claudeGuardReleaseScript(group, { directGroup = null, directSpecs = [] } = {}) {
+  const remove = [
+    `Remove-NetFirewallRule -Group ${quote(group)} -ErrorAction SilentlyContinue`,
+    timedRuleRead(`$count = @(Get-NetFirewallRule -Group ${quote(group)} -ErrorAction SilentlyContinue).Count`),
+  ];
+  if (!directGroup || !directSpecs.length) {
+    return ["$ErrorActionPreference = 'Stop'", ...remove,
+      "ConvertTo-Json -Compress -InputObject @{ count = $count }",
+    ].join("\n");
+  }
+  // 常驻规则的核对/补齐与全阻断删除合并在同一个 PowerShell 进程里：
+  // 宿主里每次冷启动要几秒，原来「先 status 再 release」要付两次启动成本。
+  // 必须完整核对实际过滤器；同名规则的程序、地址等条件可以被独立修改。
+  // 顺序：确认防火墙启用、完整核验/修复常驻规则，再删除全阻断。
   return [
     "$ErrorActionPreference = 'Stop'",
-    `Remove-NetFirewallRule -Group ${quote(group)} -ErrorAction SilentlyContinue`,
-    `$count = @(Get-NetFirewallRule -Group ${quote(group)} -ErrorAction SilentlyContinue).Count`,
-    "ConvertTo-Json -Compress -InputObject @{ count = $count }",
+    FIREWALL_CHECK_SCRIPT,
+    ...(directSpecs.some(spec => spec.package) ? [PACKAGE_SID_SCRIPT] : []),
+    timedRuleRead(`$allRules = @(Get-NetFirewallRule -Group ${quote(directGroup)} -PolicyStore ActiveStore -ErrorAction SilentlyContinue)`),
+    guardVerifiedCount(directGroup, directSpecs, 'directCount', '$allRules'),
+    `if ($directCount -lt ${directSpecs.length}) {`,
+    timedRuleRead(`$existing = @(Get-NetFirewallRule -Group ${quote(directGroup)} -PolicyStore PersistentStore -ErrorAction SilentlyContinue)`),
+    ...directSpecs.map(spec => guardArmLine(spec, '    ')),
+    guardVerifiedCount(directGroup, directSpecs, 'directCount'),
+    '}',
+    `if ($directCount -lt ${directSpecs.length}) { throw '常驻桌面阻断未确认，拒绝撤防。' }`,
+    ...remove,
+    "ConvertTo-Json -Compress -InputObject @{ count = $count; directCount = $directCount }",
   ].join("\n");
+}
+
+/**
+ * 把多个分组的回读合并进一个 PowerShell 进程。
+ * status 原来为全阻断组和常驻组各起一个 PowerShell；宿主里并行反而互相争抢，
+ * 实测一次 status 超过 12 秒。
+ */
+export function claudeGuardCountsScript(entries) {
+  const list = (Array.isArray(entries) ? entries : [entries]).filter(entry => entry?.group);
+  if (!list.length) throw new Error("缺少需要回读的规则分组。");
+  const groups = [...new Set(list.map(entry => entry.group))];
+  const lines = [
+    "$ErrorActionPreference = 'Stop'",
+    FIREWALL_CHECK_SCRIPT,
+    ...(list.some(entry => entry.specs?.some(spec => spec.package)) ? [PACKAGE_SID_SCRIPT] : []),
+    timedRuleRead(`$allRules = @(Get-NetFirewallRule -Group ${groups.map(quote).join(',')} -PolicyStore ActiveStore -ErrorAction SilentlyContinue)`),
+  ];
+  list.forEach((entry, index) => {
+    if (entry.specs?.length) {
+      lines.push(guardVerifiedCount(entry.group, entry.specs, `count${index}`, '$allRules'));
+    } else {
+      lines.push(`$count${index} = @($allRules | Where-Object { $_.Group -eq ${quote(entry.group)} }).Count`);
+    }
+  });
+  lines.push(`ConvertTo-Json -Compress -InputObject @{ ${groups.map((group, index) => `${quote(group)} = $count${index}`).join('; ')} }`);
+  return lines.join('\n');
 }
 
 export function claudeGuardStatusScript(group, specs = null) {
@@ -208,12 +293,13 @@ export function claudeGuardStatusScript(group, specs = null) {
   ].join("\n");
 }
 
-function guardVerifiedCount(group, specs) {
+function guardVerifiedCount(group, specs, variable = 'count', rulesVariable = null) {
   const groups = (Array.isArray(group) ? group : [group]).map(quote).join(',');
-  if (!specs?.length) return `$count = @(Get-NetFirewallRule -Group ${groups} -PolicyStore ActiveStore -ErrorAction SilentlyContinue).Count`;
+  const source = rulesVariable ?? '$rules';
+  if (!specs?.length) return timedRuleRead(`$${variable} = @(Get-NetFirewallRule -Group ${groups} -PolicyStore ActiveStore -ErrorAction SilentlyContinue).Count`);
   return [FIREWALL_RULE_CHECK,
-    `$rules = @(Get-NetFirewallRule -Group ${groups} -PolicyStore ActiveStore -ErrorAction SilentlyContinue)`, '$count = 0',
-    ...specs.map(spec => `if (Test-GuardRule ($rules | Where-Object { $_.Name -eq ${quote(ruleName(spec))} } | Select-Object -First 1) ${quote(spec.program || 'Any')} ${spec.package ? `([EnvGuardPackageSid]::Resolve(${quote(spec.package)}))` : "'Any'"} ${quote(spec.protocol)} ${quote(spec.port)} @(${(spec.addresses || ['Any']).map(quote).join(',')})) { $count++ }`),
+    ...(rulesVariable ? [] : [timedRuleRead(`$rules = @(Get-NetFirewallRule -Group ${groups} -PolicyStore ActiveStore -ErrorAction SilentlyContinue)`)]), `$${variable} = 0`,
+    ...specs.map(spec => `if (Test-GuardRule (${source} | Where-Object { $_.Name -eq ${quote(ruleName(spec))} } | Select-Object -First 1) ${quote(spec.program || 'Any')} ${spec.package ? `([EnvGuardPackageSid]::Resolve(${quote(spec.package)}))` : "'Any'"} ${quote(spec.protocol)} ${quote(spec.port)} @(${(spec.addresses || ['Any']).map(quote).join(',')})) { $${variable}++ }`),
   ].join('\n');
 }
 
@@ -259,6 +345,16 @@ const countOf = (stdout) => {
   return value;
 };
 
+/** 多分组回读的解析：每个分组的计数必须是明确的非负整数。 */
+const countsOf = (stdout) => {
+  const parsed = JSON.parse(String(stdout ?? "").trim() || "{}");
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error('防火墙未返回有效的分组计数。');
+  for (const [group, value] of Object.entries(parsed)) {
+    if (!Number.isInteger(value) || value < 0) throw new Error(`防火墙分组 ${group} 的规则数量无效。`);
+  }
+  return parsed;
+};
+
 /** Windows hosts 路径；非 Windows 或读不到 SystemRoot 时返回 null（不碰系统文件）。 */
 export function defaultHostsPath(env = process.env, platform = process.platform) {
   if (platform !== "win32") return null;
@@ -273,9 +369,41 @@ export function defaultHostsPath(env = process.env, platform = process.platform)
 export function createClaudeGuard({ platform = process.platform, stateDir, exec = run, logger = () => {}, hostsPath = defaultHostsPath(), readText = readFile, writeText = writeFile } = {}) {
   const supported = platform === "win32";
   const file = stateDir ? path.join(stateDir, "claude-guard.json") : null;
+  // 只有默认文件系统读写时才启用「临时文件 + rename」与原文备份；
+  // 测试注入的 readText/writeText 没有真实文件边界，沿用原路径。
+  const filesystemBacked = writeText === writeFile && readText === readFile;
+  const hostsBackupPath = hostsPath ? `${hostsPath}.envguardcc-backup` : null;
+  const writeHosts = async (content) => {
+    if (!filesystemBacked) { await writeText(hostsPath, content, "utf8"); return; }
+    const temporary = `${hostsPath}.${randomBytes(4).toString("hex")}.tmp`;
+    try {
+      await writeFile(temporary, content, "utf8");
+      await rename(temporary, hostsPath);
+    } catch (error) {
+      await rm(temporary, { force: true }).catch(() => {});
+      throw error;
+    }
+  };
+  // 首次布防前保存用户原文：撤离时恢复自定义条目，而不是把它们连同标记段一起丢掉。
+  const backupHosts = async (original) => {
+    if (!filesystemBacked || !hostsBackupPath) return;
+    const exists = await access(hostsBackupPath).then(() => true, () => false);
+    if (!exists) await writeFile(hostsBackupPath, original, "utf8");
+  };
+  const readHostsBackup = async () => {
+    if (!filesystemBacked || !hostsBackupPath) return null;
+    return readFile(hostsBackupPath, "utf8").catch(error => error.code === "ENOENT" ? null : Promise.reject(error));
+  };
   let state = { token: null, desired: "released", selectors: null, at: null };
   let cached = { supported, armed: null, directProtected: null, desired: 'released', count: 0, hostsBlocked: null, error: null };
-  const snapshot = () => ({ ...cached });
+  const snapshot = () => ({ ...cached, persistent: state.persistent === true });
+  async function measured(phase, action) {
+    const started = Date.now();
+    let outcome = 'ok';
+    try { return await action(); }
+    catch (error) { outcome = 'failed'; throw error; }
+    finally { logger(`[claude-guard] ${phase} ${outcome} ms=${Math.max(0, Date.now() - started)}`); }
+  }
 
   async function load() {
     if (!file) return;
@@ -294,14 +422,19 @@ export function createClaudeGuard({ platform = process.platform, stateDir, exec 
     await rename(temporary, file);
   }
 
-  async function expect(action) {
+  async function expect(action, parse = countOf) {
+    const started = Date.now();
+    const logTiming = stderr => {
+      const timing = String(stderr ?? '').match(/\[guard-timing\] body-ms=\d+ filter-ms=\d+ filter-rules=\d+(?: (?:service-ms|profile-ms|rule-read-ms|sid-ms)=\d+)*/)?.[0];
+      if (timing) logger(`[claude-guard] powershell total-ms=${Math.max(0, Date.now() - started)} ${timing}`);
+    };
     try {
-      const { stdout } = await exec(powershell, ["-NoProfile", "-NonInteractive", "-Command", jsonScript(action)], windowsOptions);
-      return countOf(stdout);
+      const { stdout, stderr = '' } = await exec(powershell, ["-NoProfile", "-NonInteractive", "-Command", jsonScript(action)], windowsOptions);
+      logTiming(stderr);
+      return parse(stdout);
     } catch (error) {
-      const detail = String(error.stderr || error.message);
-      if (detail.includes('[FIREWALL_DISABLED]')) throw new Error('Windows 防火墙未开启，需要确认开启后才能阻止 Claude 直连。', { cause: error });
-      throw error;
+      logTiming(error.stderr);
+      throw new Error(describeGuardFailure(error, { timeoutMs: windowsOptions.timeout }), { cause: error });
     }
   }
 
@@ -310,7 +443,9 @@ export function createClaudeGuard({ platform = process.platform, stateDir, exec 
     const current = await readText(hostsPath, "utf8").catch(error => { if (error.code === "ENOENT") return ""; throw error; });
     const cleaned = stripHostsBlock(current);
     const next = (cleaned.trimEnd() ? cleaned.trimEnd() + "\r\n" : "") + hostsBlockText(domains, useToken);
-    await writeText(hostsPath, next, "utf8");
+    if (next === current) return true;
+    await backupHosts(cleaned);
+    await writeHosts(next);
     if (!hostsBlocked(await readText(hostsPath, "utf8"))) throw new Error("hosts 段未写入。");
     return true;
   }
@@ -319,7 +454,11 @@ export function createClaudeGuard({ platform = process.platform, stateDir, exec 
     if (!hostsPath) return false;
     const current = await readText(hostsPath, "utf8").catch(error => { if (error.code === "ENOENT") return ""; throw error; });
     if (!hostsBlocked(current)) return false;
-    await writeText(hostsPath, stripHostsBlock(current), "utf8");
+    // 优先恢复布防前保存的原文；没有备份（旧版本写入的）才退回只删标记段。
+    const backup = await readHostsBackup();
+    const next = stripHostsBlock(backup ?? current);
+    await writeHosts(next);
+    if (hostsBackupPath) await rm(hostsBackupPath, { force: true }).catch(() => {});
     if (hostsBlocked(await readText(hostsPath, "utf8"))) throw new Error("hosts 段未清除。");
     return true;
   }
@@ -333,10 +472,15 @@ export function createClaudeGuard({ platform = process.platform, stateDir, exec 
       const selectors = { ...state.selectors, token: state.token };
       const fullSpecs = selectors.packages?.length || selectors.programs?.length || selectors.addresses?.length ? claudeGuardSpecs(selectors) : [];
       const directSpecs = claudeDirectSpecs(selectors);
-      const [count, directCount] = await Promise.all([
-        expect(claudeGuardStatusScript(guardGroupName(state.token), state.desired === 'armed' ? fullSpecs : null)),
-        expect(claudeGuardStatusScript(`${guardGroupName(state.token)}-Direct`, directSpecs)),
-      ]);
+      const fullGroup = guardGroupName(state.token);
+      const directGroup = `${fullGroup}-Direct`;
+      // 两个分组一次回读：宿主里每次 PowerShell 冷启动要几秒，分两次进程会慢一倍。
+      const counts = await expect(claudeGuardCountsScript([
+        { group: fullGroup, specs: state.desired === 'armed' ? fullSpecs : [] },
+        { group: directGroup, specs: directSpecs },
+      ]), countsOf);
+      const count = counts[fullGroup] ?? 0;
+      const directCount = counts[directGroup] ?? 0;
       const fullCount = fullSpecs.length;
       const hostsReady = !hostsPath || !(selectors.domains?.length) || hosts === true;
       return (cached = { supported, armed: state.desired === 'armed' && count >= fullCount && hostsReady,
@@ -358,74 +502,117 @@ export function createClaudeGuard({ platform = process.platform, stateDir, exec 
     const hasRules = packages.length || programs.length || addresses.length;
     const specs = hasRules ? claudeGuardSpecs({ token: useToken, packages, programs, addresses }) : [];
     if (!specs.length && !(domains?.length)) throw new Error("fail-closed 缺少阻断目标：需要程序/包/地址或域名之一。");
-    await save({ token: useToken, desired: "armed", selectors: { packages, programs, addresses, domains }, at: new Date().toISOString() });
+    await save({ token: useToken, desired: "armed", persistent: false, selectors: { packages, programs, addresses, domains }, at: new Date().toISOString() });
     const directSpecs = claudeDirectSpecs({ token: useToken, packages, programs });
     const errors = [];
     let count = 0;
-    if (specs.length) {
-      try {
-        // Both groups share one PowerShell process and one effective-store scan.
-        // Direct rules are installed first; every expected rule is still verified.
-        const allSpecs = [...directSpecs, ...specs];
-        const script = claudeGuardArmScript(allSpecs);
-        // Windows has a command-line length limit. Multiple installed versions
-        // may exceed it when combined; retain the separate-group path then.
-        if (script.length > 24000 && directSpecs.length) {
-          if (await expect(claudeGuardArmScript(directSpecs)) < directSpecs.length) throw new Error('桌面直连阻断规则未全部生效。');
-          count = await expect(claudeGuardArmScript(specs));
-          if (count < specs.length) errors.push(`规则未全部生效：期望 ${specs.length} 条，实际 ${count} 条`);
-        } else {
-          const verified = await expect(script);
-          if (verified !== allSpecs.length) errors.push(`规则未全部生效：期望 ${allSpecs.length} 条，实际 ${verified} 条`);
-          count = Math.max(0, verified - directSpecs.length);
-        }
-      } catch (error) { errors.push(`规则：${error.message}`); }
-    }
+    // 规则与 hosts 互不依赖，并行执行：宿主里一次 PowerShell 就要几秒，hosts 读写不应该串在后面等。
+    const armRules = async () => {
+      // Both groups share one PowerShell process and one effective-store scan.
+      // Direct rules are installed first; every expected rule is still verified.
+      const allSpecs = [...directSpecs, ...specs];
+      const script = claudeGuardArmScript(allSpecs);
+      // Windows has a command-line length limit. Multiple installed versions
+      // may exceed it when combined; retain the separate-group path then.
+      if (script.length > 24000 && directSpecs.length) {
+        if (await expect(claudeGuardArmScript(directSpecs)) < directSpecs.length) throw new Error('桌面直连阻断规则未全部生效。');
+        const verified = await expect(claudeGuardArmScript(specs));
+        if (verified < specs.length) throw new Error(`规则未全部生效：期望 ${specs.length} 条，实际 ${verified} 条`);
+        return verified;
+      }
+      const verified = await expect(script);
+      if (verified !== allSpecs.length) throw new Error(`规则未全部生效：期望 ${allSpecs.length} 条，实际 ${verified} 条`);
+      return Math.max(0, verified - directSpecs.length);
+    };
+    const [ruleResult, hostResult] = await Promise.allSettled([
+      specs.length ? measured('arm rules', armRules) : Promise.resolve(0),
+      measured('arm hosts', () => armHosts(domains, useToken)),
+    ]);
+    if (ruleResult.status === "rejected") errors.push(`规则：${ruleResult.reason?.message ?? ruleResult.reason}`);
+    else count = ruleResult.value;
     let hosts = false;
-    try { hosts = await armHosts(domains, useToken); }
-    catch (error) { errors.push(`hosts：${error.message}`); }
+    if (hostResult.status === "rejected") errors.push(`hosts：${hostResult.reason?.message ?? hostResult.reason}`);
+    else hosts = hostResult.value;
     if (errors.length) throw new Error(`fail-closed 布防未全部生效：${errors.join("；")}`);
     logger(`[claude-guard] 已布防：${specs.length} 条规则、hosts ${hosts ? "已写入" : "未启用"}（令牌 ${useToken}）。`);
     return (cached = { supported, desired: 'armed', armed: true, directProtected: directSpecs.length > 0, count, hostsBlocked: hosts, error: null });
   }
 
-  async function release({ keepDirect = false } = {}) {
+  async function protect({ token = state.token, packages = [], programs = [], domains = CLAUDE_GUARD_DOMAINS } = {}) {
+    if (!supported) throw new Error('当前平台没有实现 Windows 常驻阻断。');
+    const useToken = state.token ?? (TOKEN.test(String(token ?? '')) ? token : `g${Date.now().toString(36)}`);
+    const blockedDomains = domains.length ? domains : CLAUDE_GUARD_DOMAINS;
+    await save({ token: useToken, selectors: { packages, programs, domains: blockedDomains }, desired: 'protected', persistent: true, at: new Date().toISOString() });
+    // 常驻的只有防火墙规则。hosts 必须随「隧道是否已接管」切换：
+    // hosts 优先级高于内核 DNS，隧道接管后仍挂 hosts 会把域名钉到 0.0.0.0，
+    // 浏览器/客户端直接报 ERR_ADDRESS_INVALID。启动时先清掉可能残留的阻断段。
+    await releaseHosts().catch(() => {});
+    const result = await release({ keepDirect: true, keepHosts: true });
+    return { ...result, hostsBlocked: false };
+  }
+
+  /** 隧道未接管时的浏览器直连兜底；接管后必须清掉，否则域名无法解析。 */
+  async function setHostsBlocked(blocked) {
+    if (!supported || !hostsPath) return false;
+    // 返回值语义固定为「当前是否处于 hosts 阻断」，不表示本次是否发生过清理。
+    if (blocked) {
+      const domains = state.selectors?.domains?.length ? state.selectors.domains : CLAUDE_GUARD_DOMAINS;
+      const ok = await armHosts(domains, state.token ?? 'default');
+      cached = { ...cached, desired: state.desired, hostsBlocked: ok };
+      return ok;
+    }
+    if (!hostsBlocked(await readText(hostsPath, 'utf8').catch(() => ''))) return false;
+    const cleared = await releaseHosts();
+    cached = { ...cached, desired: state.desired, hostsBlocked: false, hostsCleared: cleared };
+    return false;
+  }
+
+  async function release({ keepDirect = false, keepHosts = false } = {}) {
     if (!supported) return { armed: false, count: 0 };
     // 允许隧道时只移除临时全阻断，桌面直连规则一直存在，覆盖无法预知的内核崩溃。
     const directSpecs = state.token ? claudeDirectSpecs({ ...state.selectors, token: state.token }) : [];
-    if (keepDirect && directSpecs.length) {
-      // Read effective filters before releasing. Correct persistent rules need
-      // no rewrite; repair missing/altered rules before removing full blocking.
-      const directCount = await expect(claudeGuardStatusScript(`${guardGroupName(state.token)}-Direct`, directSpecs));
-      if (directCount < directSpecs.length && await expect(claudeGuardArmScript(directSpecs)) < directSpecs.length) throw new Error('桌面直连阻断未确认，拒绝放行。');
-    }
-    await save({ desired: keepDirect ? 'protected' : 'released', at: new Date().toISOString() });
+    const directGroup = state.token ? `${guardGroupName(state.token)}-Direct` : null;
+    if (!keepHosts) await save({ desired: keepDirect ? 'protected' : 'released', persistent: false, at: new Date().toISOString() });
     const errors = [];
     let count = 0;
+    let hosts = false;
     if (state.token) {
       try {
-        count = await expect(claudeGuardReleaseScript(guardGroupName(state.token)));
-        if (count > 0) errors.push(`规则未删除：仍有 ${count} 条`);
-        if (!keepDirect && await expect(claudeGuardReleaseScript(`${guardGroupName(state.token)}-Direct`)) > 0) errors.push('桌面直连规则未删除');
+        await measured('release rules', async () => {
+          if (keepDirect && directSpecs.length) {
+            // 同一进程内完整核验/补齐常驻规则，再删除临时全阻断。
+            const result = await expect(claudeGuardReleaseScript(guardGroupName(state.token), { directGroup, directSpecs }), countsOf);
+            count = result.count ?? 0;
+            if (count > 0) throw new Error(`规则未删除：仍有 ${count} 条`);
+            if ((result.directCount ?? 0) < directSpecs.length) throw new Error('桌面直连阻断未确认，拒绝放行。');
+          } else {
+            count = await expect(claudeGuardReleaseScript(guardGroupName(state.token)));
+            if (count > 0) throw new Error(`规则未删除：仍有 ${count} 条`);
+            if (!keepDirect && await expect(claudeGuardReleaseScript(`${guardGroupName(state.token)}-Direct`)) > 0) throw new Error('桌面直连规则未删除');
+          }
+        });
       } catch (error) { errors.push(`规则：${error.message}`); }
     }
-    let hosts = false;
-    try { hosts = await releaseHosts(); }
-    catch (error) { errors.push(`hosts：${error.message}`); }
+    // 核验/删除失败时保留浏览器的 hosts 保护；不可在核验完成前提前清理。
+    if (!errors.length && !keepHosts) {
+      try { hosts = await measured('release hosts', releaseHosts); }
+      catch (error) { errors.push(`hosts：${error.message}`); }
+    }
     if (errors.length) throw new Error(`fail-closed 撤防未完成：${errors.join("；")}`);
-    logger("[claude-guard] 已撤防。");
-    return (cached = { supported, desired: state.desired, armed: false, directProtected: keepDirect && directSpecs.length > 0, count, hostsBlocked: false, hostsCleared: hosts, error: null });
+    logger(keepHosts ? '[claude-guard] 常驻直连阻断已就绪。' : '[claude-guard] 已撤防。');
+    return (cached = { supported, desired: state.desired, armed: false, directProtected: keepDirect && directSpecs.length > 0, count, hostsBlocked: keepHosts, hostsCleared: hosts, error: null });
   }
 
   /** 宿主启动/后台核验：按落盘意图收敛；心跳只能读缓存，不得覆盖意图。 */
   async function reconcile(selectors = null, { desired = null } = {}) {
     if (!supported) return { armed: false, count: 0 };
     await load();
-    if (['armed', 'protected', 'released'].includes(desired)) await save({ desired });
+    if (['armed', 'protected', 'released'].includes(desired)) await save({ desired, persistent: false });
     if (state.desired === 'protected') {
       const current = await status();
       const hasDirect = claudeDirectSpecs({ ...state.selectors, token: state.token }).length > 0;
-      if ((!hasDirect || current.directProtected) && current.count === 0 && current.hostsBlocked === false) return current;
+      if (!current.error && (!hasDirect || current.directProtected) && current.count === 0 && current.hostsBlocked === (state.persistent === true)) return current;
+      if (state.persistent) return protect(state.selectors);
       return release({ keepDirect: true });
     }
     if (state.desired !== "armed") {
@@ -445,7 +632,7 @@ export function createClaudeGuard({ platform = process.platform, stateDir, exec 
     catch (error) { cached = { ...cached, desired: state.desired, armed: null, directProtected: null, error: error.message }; throw error; }
   };
   // 宿主串行执行变更；慢速 PowerShell 运行期间 /health 仍可立即读取缓存。
-  return { supported, arm: tracked(arm), release: tracked(release), status, snapshot, reconcile: tracked(reconcile), load,
+  return { supported, arm: tracked(arm), protect: tracked(protect), release: tracked(release), setHostsBlocked: tracked(setHostsBlocked), status, snapshot, reconcile: tracked(reconcile), load,
     enableFirewall: async confirmed => {
       if (!supported) throw new Error('仅 Windows 支持此操作。');
       if (await expect(enableFirewallScript(confirmed)) !== 3) throw new Error('Windows 防火墙开启后核验失败。');

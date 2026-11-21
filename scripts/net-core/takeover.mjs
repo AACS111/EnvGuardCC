@@ -34,6 +34,11 @@ const CLIENTS = [
 ];
 const kernelName = /^(?:mihomo|clash(?:-meta)?|sing-box|xray|v2ray)(?:\.exe)?$/i;
 const normalize = value => String(value).toLowerCase().replace(/[ ._-]/g, "");
+// ProcessName 不带 .exe；内核名与 kernelName 同源，避免两处判据漂移。
+const WINDOWS_PROCESS_PATTERN = `^(?i:${[
+  ...CLIENTS.flatMap(client => client.win.map(name => name.replace(/\.exe$/i, ""))),
+  "mihomo", "clash", "clash-meta", "sing-box", "xray", "v2ray",
+].join("|")})$`;
 
 export function classifyTakeoverProcesses(rows, { platform, uid = process.getuid?.(), ownBinary = "" } = {}) {
   const clients = new Map(), kernels = [];
@@ -68,7 +73,12 @@ async function processes(platform, exec) {
     // 只关闭当前交互会话的 GUI，不能借 SYSTEM 权限停其他用户的工具。
     // 用 Get-Process 而不是 WMI：不依赖 Winmgmt，还能顺带拿到「是否有主窗口」，
     // 托盘运行（无窗口）的客户端无法被 CloseMainWindow 关掉，必须直接提示用户。
-    const output = await exec("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", "$ErrorActionPreference='Stop'; $s=(Get-Process -Id $PID).SessionId; @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.SessionId -eq $s } | ForEach-Object { $path = try { $_.Path } catch { $null }; if ($path) { [pscustomobject]@{ Id = $_.Id; Path = $path; Window = [bool]$_.MainWindowHandle } } }) | ConvertTo-Json -Compress"]);
+    //
+    // 必须先按 ProcessName 过滤再取 .Path：全量 Get-Process 逐个访问 .Path 时，
+    // 每个进程都要做一次镜像路径检查（Defender 会参与），300+ 进程实测 10~11 秒，
+    // 正好顶穿 COMMAND_TIMEOUT_MS，机器一忙就误判「内核启动失败」。
+    // 名字与 classifyTakeoverProcesses 的判据保持一致（客户端集合 + 内核名）。
+    const output = await exec("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", `$ErrorActionPreference='Stop'; $s=(Get-Process -Id $PID).SessionId; @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.SessionId -eq $s -and $_.ProcessName -match '${WINDOWS_PROCESS_PATTERN}' } | ForEach-Object { $path = try { $_.Path } catch { $null }; if ($path) { [pscustomobject]@{ Id = $_.Id; Path = $path; Window = [bool]$_.MainWindowHandle } } }) | ConvertTo-Json -Compress`]);
     const data = JSON.parse(output || "[]");
     return (Array.isArray(data) ? data : [data]).filter(Boolean).map(p => ({ pid: Number(p.Id), executable: p.Path, hasWindow: p.Window !== false }));
   }

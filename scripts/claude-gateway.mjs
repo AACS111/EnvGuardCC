@@ -1,7 +1,8 @@
 // Claude API gateway and diagnostics use the same native Node HTTP(S) route.
 import http from "node:http";
+import { isIP } from "node:net";
 import { probeLiveGateway, PROBE_SIGNAL_IDS } from "./gateway-message-probe.mjs";
-import { proxyInfo } from "./gateway-proxy.mjs";
+import { proxyInfo, requestTransport } from "./gateway-proxy.mjs";
 import { createSimulationRunner } from "./simulation-runner.mjs";
 import { randomUUID } from "node:crypto";
 import { readFile, mkdir, writeFile, rename, rm } from "node:fs/promises";
@@ -143,10 +144,23 @@ export function createGateway({ upstreamBase = "https://api.anthropic.com", prof
   const upstream = new URL(upstreamBase);
   if (!["http:", "https:"].includes(upstream.protocol) || upstream.username || upstream.password || upstream.search || upstream.hash) throw new Error("CHECKCC_UPSTREAM 必须是无凭证、无查询参数的 HTTP(S) 地址。");
   const probeTargets = new Map();
+  const withExitCounts = async history => {
+    if (!history) return history;
+    const log = netCore?.connectionLog;
+    const [requests, claudeTransferCounts] = await Promise.all([
+      Promise.resolve().then(() => log?.requestCountsByExit?.()).catch(() => null),
+      Promise.resolve().then(() => log?.claudeCountsByExit?.()).catch(() => null),
+    ]);
+    return {
+      ...history,
+      ...(requests && { requestCounts: requests.byExit, unassignedRequests: requests.unassigned }),
+      ...(claudeTransferCounts && { claudeTransferCounts }),
+    };
+  };
   // 内核状态 + 出口历史：两者都不依赖网络探测，可以随只读接口一起返回。
   const kernelPayload = async () => {
     const report = await Promise.resolve(netCore?.report()).catch((error) => ({ state: "unavailable", reason: error.message }));
-    const exitHistory = await readExitHistory(stateDir).catch(() => null);
+    const exitHistory = await withExitCounts(await readExitHistory(stateDir).catch(() => null));
     return { netCore: report, exitHistory };
   };
   const simulation = createSimulationRunner({ messageProbe: () => probeLiveGateway(server, probeTargets) });
@@ -204,6 +218,8 @@ export function createGateway({ upstreamBase = "https://api.anthropic.com", prof
             const params = new URL(rawPath, "http://127.0.0.1").searchParams;
             if (params.get("view") === "settings") return sendJson(response, 200, { ok: true, ...(log?.settings?.() ?? { scope: "all" }) });
             const host = params.get("host") ?? "";
+            const exitIp = params.get("exitIp");
+            if (exitIp !== null && exitIp !== "unknown" && !isIP(exitIp)) return sendJson(response, 400, { error: "出口 IP 筛选无效。" });
             for (const key of ["claude", "viaExit"]) {
               if (params.has(key) && !["true", "false"].includes(params.get(key))) return sendJson(response, 400, { error: "连接筛选参数无效。" });
             }
@@ -218,9 +234,9 @@ export function createGateway({ upstreamBase = "https://api.anthropic.com", prof
             if (params.has("detailId") && !/^[\w-]{1,128}$/.test(params.get("detailId"))) return sendJson(response, 400, { error: "记录标识无效。" });
             if (params.has("format") && !["json", "csv"].includes(params.get("format"))) return sendJson(response, 400, { error: "导出格式无效。" });
             if (!log && params.has("format")) return sendJson(response, 503, { ok: false, error: "当前后台不支持传输记录导出。" });
-            if (!log) return sendJson(response, 200, { ok: true, available: false, storageError: false, retentionHours: 48, stats: { active: 0, ended: 0, total: 0 }, total: 0, offset: 0, limit: 50, items: [], recent: [] });
+            if (!log) return sendJson(response, 200, { ok: true, available: false, storageError: false, retentionHours: 48, stats: { active: 0, ended: 0, total: 0 }, total: 0, offset: 0, limit: 50, exitIp, items: [], recent: [] });
             try {
-              const query = { host, claude: params.get("claude") === "true", viaExit: params.has("viaExit") ? params.get("viaExit") === "true" : null, offset: Number(params.get("offset") || 0), limit: Number(params.get("limit") || 50), kind: params.get("kind") ?? "all", route: params.get("route") ?? "all", state: params.get("state") ?? "all", at: params.get("at"), detailId: params.get("detailId") };
+              const query = { host, claude: params.get("claude") === "true", viaExit: params.has("viaExit") ? params.get("viaExit") === "true" : null, offset: Number(params.get("offset") || 0), limit: Number(params.get("limit") || 50), kind: params.get("kind") ?? "all", route: params.get("route") ?? "all", state: params.get("state") ?? "all", at: params.get("at"), detailId: params.get("detailId"), exitIp };
               if (params.has("format")) {
                 const format = params.get("format");
                 const body = await log.export(query, format);
@@ -517,7 +533,7 @@ export function createGateway({ upstreamBase = "https://api.anthropic.com", prof
               if (typeof netCore.setTunnel !== "function") { ok = false; reason = "本次启动未支持单独的 TUN 开关。"; }
               else await netCore.setTunnel(kernelValue.enabled, { ensureHost: true });
             }
-            else if (action === "stop") await netCore.stop();
+            else if (action === "stop") await netCore.stop({ keepClaudeGuard: true });
             else if (action === "restart") { ok = await netCore.restart(); }
             else ok = await netCore.select(node);
           } catch (error) { ok = false; reason = error.message; }
@@ -606,9 +622,10 @@ export function createGateway({ upstreamBase = "https://api.anthropic.com", prof
           Object.assign(report, signalId ? await collect(upstream, { signalId }) : await networkDiagnostics());
           // 出口 IP 历史：只记录观测，不参与打分；变化次数由界面展示。
           const exitIp = report.exit?.primary?.ip;
-          report.exitHistory = exitIp
-            ? await recordExit(stateDir, exitIp).catch(() => null)
+          const exitHistory = exitIp
+            ? await recordExit(stateDir, exitIp, { countryCode: report.exit?.primary?.countryCode ?? null }).catch(() => null)
             : await readExitHistory(stateDir).catch(() => null);
+          report.exitHistory = await withExitCounts(exitHistory);
           if (!signalId || ["edgeCountry", "edgeCity", "edgeColo"].includes(signalId)) {
             report.edge = await collectEdgeTrace();
             report.testedSignals = [...(report.testedSignals ?? []), "edgeCountry", "edgeCity", "edgeColo"];
@@ -652,7 +669,8 @@ export function createGateway({ upstreamBase = "https://api.anthropic.com", prof
       };
       // 请求日志仅来自此 HTTP 转发链；不解密 TUN 内的其他 HTTPS，也不保存 URL/query/正文。
       const requestLog = !isSimulation ? netCore?.connectionLog : null;
-      const requestId = await requestLog?.beginRequest?.({ method: request.method, endpoint: target.pathname, host: target.hostname, port: Number(target.port || (target.protocol === "https:" ? 443 : 80)) }).catch(() => null);
+      const transport = requestTransport(target);
+      const requestId = await requestLog?.beginRequest?.({ method: request.method, endpoint: target.pathname, host: target.hostname, port: Number(target.port || (target.protocol === "https:" ? 443 : 80)), transport: transport.info }).catch(() => null);
       let requestFinished = false, uploaded = 0, downloaded = 0, requestError = null;
       let lastProgress = 0;
       const progress = (force = false) => {
@@ -684,7 +702,7 @@ export function createGateway({ upstreamBase = "https://api.anthropic.com", prof
         response.writeHead(upstreamResponse.statusCode || 502, responseHeaders);
         upstreamResponse.on("error", () => { requestError = "STREAM_ERROR"; response.destroy(); });
         upstreamResponse.pipe(response);
-      });
+      }, transport.proxy);
       proxy.on("error", (error) => {
         requestError = "UPSTREAM_ERROR";
         if (isClaudeRequest) lastFailure = { at: new Date().toISOString(), error: error.code ?? "UPSTREAM_ERROR" };

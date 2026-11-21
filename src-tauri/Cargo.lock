@@ -925,7 +925,7 @@ dependencies = [
 
 [[package]]
 name = "envguardcc"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "core-foundation",
  "dunce",

@@ -34,7 +34,11 @@ for (const level of ['log', 'info', 'debug', 'warn', 'error']) console[level] = 
 console.log(`[desktop] 后台启动 pid=${process.pid}${logFile ? `，日志 ${logFile}` : ''}`);
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const devURL = process.env.CHECKCC_DESKTOP_DEV_URL;
-let origin = 'http://127.0.0.1:3030';
+// 页面端口由启动器在拉起本进程前探测：3030 被残留后台占用时会自动换到 3031+，这里只接受传入值。
+const sitePort = Number(process.env.CHECKCC_DESKTOP_SITE_PORT ?? 3030);
+// 0 表示由系统分配随机端口（测试与开发启动器会用到），其余必须是有效端口。
+if (!Number.isInteger(sitePort) || sitePort < 0 || sitePort > 65535) throw new Error('桌面页面端口无效。');
+let origin = `http://127.0.0.1:${sitePort}`;
 if (devURL && new URL(devURL).origin !== origin) throw new Error('开发页面必须使用 ' + origin);
 if (!process.env.CHECKCC_DESKTOP_USER_DATA) throw new Error('缺少桌面用户数据目录。');
 process.env.CHECKCC_STATE_DIR ||= path.join(process.env.CHECKCC_DESKTOP_USER_DATA, 'state');
@@ -144,11 +148,20 @@ try {
   await new Promise((resolve, reject) => { gateway.once('error', reject); gateway.listen(devURL ? 3010 : 0, '127.0.0.1', resolve); });
   process.env.CHECKCC_GATEWAY_URL = `http://127.0.0.1:${gateway.address().port}`;
   const { startRepairHelper } = await import('../scripts/local-repair.mjs');
-  helper = await startRepairHelper(devURL ? 3001 : 0, { netCore: kernel });
+  // 启动即会开保护时先抑制 hosts：否则 recover/未保护阻断会写一次，1～2 秒后再清。
+  kernel.setHostsSuppressed?.(settings.autoStartProtection === true);
+  helper = await startRepairHelper(devURL ? 3001 : 0, { netCore: kernel, autoStartProtection: settings.autoStartProtection });
   if (!helper.server) { helper = null; throw new Error('本机助手端口已被占用，请先退出旧服务。'); }
   const ports = { helper: helper.server.address().port, gateway: gateway.address().port };
   if (!devURL) {
-    site = await startSite(path.join(root, 'out'), ports, Number(process.env.CHECKCC_DESKTOP_SITE_PORT ?? 3030));
+    site = await startSite(path.join(root, 'out'), ports, sitePort).catch(async error => {
+      if (error?.code !== 'EADDRINUSE') throw error;
+      // 启动器已探测过端口；走到这里说明探测与绑定之间有进程抢入。把占用人写清楚，别只丢一行 listen EADDRINUSE。
+      const { findPortOwner, processName } = await import('../scripts/net-core/ports.mjs');
+      const pid = await findPortOwner(sitePort).catch(() => null);
+      const name = pid ? await processName(pid).catch(() => null) : null;
+      throw new Error(`应用端口 ${sitePort} 被${pid ? ` ${name ?? '未知进程'}（PID ${pid}）` : '其他进程'}占用（EADDRINUSE），请退出占用者后重试。`);
+    });
     origin = `http://127.0.0.1:${site.address().port}`;
     headers.Origin = origin;
   }

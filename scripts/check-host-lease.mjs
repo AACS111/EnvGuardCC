@@ -7,6 +7,55 @@ import path from 'node:path';
 import { createKernelHost, HOST_TOKEN_HEADER } from './net-core/host.mjs';
 import { createClaudeGuard } from './net-core/claude-guard.mjs';
 
+test('宿主只在启动恢复持久规则，租约循环不巡检常驻防火墙', async t => {
+  const directory = await mkdtemp(path.join(tmpdir(), 'egcc-host-persistent-'));
+  let inspections = 0;
+  const host = createKernelHost({ token: 'test-persistent-token-123456789', binary: 'unused', stateDir: directory,
+    port: 0, leaseTimeoutMs: 20, ports: { portOwner: async () => null },
+    claudeGuard: { load: async () => {}, reconcile: async () => { inspections++; },
+      snapshot: () => ({ persistent: true, desired: 'protected' }),
+    },
+  });
+  await host.listen();
+  t.after(async () => { await host.close(); await rm(directory, { recursive: true, force: true }); });
+  await new Promise(resolve => setTimeout(resolve, 100));
+  assert.equal(inspections, 1);
+});
+
+test('宿主记录守卫请求的排队和执行耗时，失败也保留计时且健康检查不排队', async t => {
+  const directory = await mkdtemp(path.join(tmpdir(), 'egcc-host-timing-'));
+  const logs = [];
+  let finish, entered, failStatus = false;
+  const entering = new Promise(resolve => { entered = resolve; });
+  const cached = { supported: true, armed: false };
+  const host = createKernelHost({ token: 'test-timing-token-123456789', binary: 'unused', stateDir: directory, port: 0,
+    ports: { portOwner: async () => null },
+    logger: line => logs.push(line),
+    claudeGuard: { load: async () => {}, reconcile: async () => cached, snapshot: () => cached,
+      arm: async () => { entered(); await new Promise(resolve => { finish = resolve; }); return cached; },
+      status: async () => { if (failStatus) throw new Error('mock status failed'); return cached; },
+    },
+  });
+  const { url } = await host.listen();
+  t.after(async () => { finish?.(); await host.close(); await rm(directory, { recursive: true, force: true }); });
+  const headers = { 'Content-Type': 'application/json', [HOST_TOKEN_HEADER]: host.token };
+  const call = op => fetch(`${url}/kernel`, { method: 'POST', headers, body: JSON.stringify({ action: 'claude-guard', op }) });
+  const arming = call('arm');
+  await entering;
+  const inspecting = call('status');
+  await new Promise(resolve => setTimeout(resolve, 30));
+  assert.equal((await fetch(`${url}/health`, { headers })).status, 200);
+  finish();
+  assert.equal((await arming).status, 200);
+  assert.equal((await inspecting).status, 200);
+  const timing = logs.find(line => /claude-guard:status.*queue-ms=\d+.*run-ms=\d+/.test(line));
+  assert.ok(timing, '必须能区分排队和执行耗时');
+  assert.ok(Number(timing.match(/queue-ms=(\d+)/)[1]) > 0, '等待布防的请求需要报告排队时间');
+  failStatus = true;
+  assert.equal((await call('status')).status, 500);
+  assert.ok(logs.some(line => /claude-guard:status.*result=failed/.test(line)));
+});
+
 test('慢速布防不阻塞健康检查，旧心跳不能撤销新的阻断状态', async () => {
   const directory = await mkdtemp(path.join(tmpdir(), 'egcc-host-guard-'));
   await mkdir(path.join(directory, 'net-core'));

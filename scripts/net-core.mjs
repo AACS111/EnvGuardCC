@@ -4,7 +4,6 @@
 
 import { spawn as nodeSpawn } from "node:child_process";
 import { mkdir, readFile } from "node:fs/promises";
-import dns from "node:dns/promises";
 import { randomUUID } from "node:crypto";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 import { inIpv4Range } from "./net-core/config.mjs";
@@ -12,9 +11,17 @@ import { findPortOwner, processName } from "./net-core/ports.mjs";
 import { fileURLToPath } from "node:url";
 import { createLogLimiter, kernelWarningKey } from "./net-core/log-limiter.mjs";
 import { loopbackFetch } from './net-core/loopback-fetch.mjs';
+import { createTunnelLookup } from './net-core/tunnel-dns.mjs';
 
 const LOOPBACK = "127.0.0.1";
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * 隧道 DNS 探测的单次等待上限。实测同一台机器 p50 29ms、p90 3.5s（防火墙布防/系统繁忙时），
+ * 原 4s 阈值只剩 500ms 余量，一次抖动就被当成「隧道失效」并触发 fail-closed 断网。
+ * 这里放宽到 8s，与宿主 /health 探测一致；调用方另有「连续失败」判定兜底。
+ */
+export const TUNNEL_PROBE_TIMEOUT_MS = 8000;
 
 function encodePath(value) {
   return encodeURIComponent(String(value));
@@ -49,7 +56,7 @@ export function createNetCore({
   // 端口归属探查（测试可注入）。
   portOwner = (port) => findPortOwner(port),
   portOwnerName = (pid) => processName(pid),
-  lookup = (host, options) => dns.lookup(host, options),
+  lookup,
   spawn = nodeSpawn,
   fetchImpl = loopbackFetch,
   logger = () => {},
@@ -60,6 +67,7 @@ export function createNetCore({
   if (!Number.isInteger(apiPort) || apiPort < 1 || apiPort > 65535) throw new Error("外部控制器端口无效。");
 
   const wantsTunnel = () => (typeof verifyTunnel === "function" ? Boolean(verifyTunnel()) : Boolean(verifyTunnel));
+  const tunnelLookup = lookup ?? createTunnelLookup();
   const kernelLogs = createLogLimiter(logger, { intervalMs: 5 * 60 * 1000 });
   let child = null;
   let ready = false;
@@ -84,13 +92,18 @@ export function createNetCore({
     const deadline = Date.now() + waitMs;
     for (;;) {
       let timer;
+      const controller = new AbortController();
       try {
-        // 固定域名可能命中开启 TUN 前的系统缓存；默认 getaddrinfo 还可能优先返回 AAAA。
+        // 固定域名可能命中开启 TUN 前的系统缓存；必须显式查询 A 记录。
         // 新子域 + 显式 A 查询验证当前 DNS 路径，不清空全系统缓存。
         const probeHost = `egcc-${randomUUID()}.${host}`;
         const answer = await Promise.race([
-          lookup(probeHost, { family: 4 }),
-          new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("隧道解析探测超时。")), 4000); }),
+          tunnelLookup(probeHost, { family: 4, signal: controller.signal }),
+          new Promise((_, reject) => { timer = setTimeout(() => {
+            const error = new Error("隧道解析探测超时。");
+            controller.abort(error);
+            reject(error);
+          }, TUNNEL_PROBE_TIMEOUT_MS); }),
         ]);
         const address = String(answer?.address ?? answer ?? "");
         const result = { active: inIpv4Range(address), host, address };
@@ -146,13 +159,13 @@ export function createNetCore({
     pipeLines(next.stdout, "kernel");
   }
 
-  async function request(pathname, { method = "GET", body, signal } = {}) {
+  async function request(pathname, { method = "GET", body, signal, timeoutMs = 8000 } = {}) {
     signal?.throwIfAborted();
     const response = await fetchImpl(`${base}${pathname}`, {
       method,
       headers: { ...authHeaders(), ...(body === undefined ? {} : { "Content-Type": "application/json" }) },
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),
-      signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(8000)]) : AbortSignal.timeout(8000),
+      signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)]) : AbortSignal.timeout(timeoutMs),
     });
     if (!response.ok) throw new Error(`内核接口 ${method} ${pathname} 返回 ${response.status}。`);
     if (response.status === 204) return null;
@@ -226,6 +239,7 @@ export function createNetCore({
   }
 
   async function terminate() {
+    tunnelLookup.dispose?.();
     if (!manageProcess) { ready = false; child = null; return; }
     const current = child;
     ready = false;
@@ -331,7 +345,7 @@ export function createNetCore({
     };
   }
 
-  async function selectProxy(group, name) {
+  async function selectProxy(group, name, { reloadOnFailure = true } = {}) {
     if (typeof name !== "string" || !name) throw new Error("缺少节点名称。");
     // 幂等：已经是当前节点时直接成功。mihomo 对“选中自身”会返回 400 proxy not exist。
     const current = await request(`/proxies/${encodePath(group)}`).catch(() => null);
@@ -342,7 +356,7 @@ export function createNetCore({
     } catch (error) {
       // 实测：部分内核版本首次加载后选择器内部列表为空，PUT 会返回 400；
       // 重新加载同一份配置即可重建选择器，但重载是异步完成的，必须等待并重试。
-      if (!/返回 400/.test(error.message)) throw error;
+      if (!reloadOnFailure || !/返回 400/.test(error.message)) throw error;
       const payload = await readFile(configPath, "utf8");
       await request("/configs?force=true", { method: "PUT", body: { payload } });
       let lastError = error;

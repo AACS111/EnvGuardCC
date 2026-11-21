@@ -3,8 +3,8 @@ import { proxyRequest, proxyInfo } from "./gateway-proxy.mjs";
 import dns from "node:dns";
 import { isIP } from "node:net";
 
-export function transportRequest(url, options, onResponse) {
-  return proxyRequest(url, options, onResponse);
+export function transportRequest(url, options, onResponse, proxyOverride) {
+  return proxyRequest(url, options, onResponse, proxyOverride);
 }
 
 export function publicIp(value) {

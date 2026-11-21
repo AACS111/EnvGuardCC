@@ -40,6 +40,12 @@ test("隔离浏览器复用真实代理、阻止本地 DNS 回退且不泄露认
   assert.throws(() => browserNetworkArgs({url:new URL("http://user:secret@localhost:7890")}), /带认证/);
 });
 
+test('受保护 Web 会话必须绑定本机内核代理，不能使用通用网络代理', async () => {
+  const origin = 'http://localhost:3000';
+  const runtime = new EnvironmentRuntime({ networkProxy: { url: new URL('http://other-proxy.invalid:8080') }, protectedWebProxy: () => null });
+  await assert.rejects(runtime.launch('web', origin), /本机内核代理/);
+});
+
 test("实际 Chromium 将未知目标域名交给代理，不依赖本地 DNS", { timeout: 180000 }, async () => {
   const directory = await mkdtemp(path.join(tmpdir(),"checkcc-proxy-browser-"));
   const requests = [];
@@ -52,7 +58,7 @@ test("实际 Chromium 将未知目标域名交给代理，不依赖本地 DNS", 
   const origin = `http://127.0.0.1:${proxy.address().port}`;
   // 浏览器清单可能返回混合分隔符；含空格的 Windows 路径必须在启动边界规范化。
   const browserPath = (await findBrowser()).replaceAll(path.sep, "/");
-  const runtime = new EnvironmentRuntime({stateDir:directory,browserPath,headless:true,networkProxy:{url:new URL(origin)}});
+  const runtime = new EnvironmentRuntime({stateDir:directory,browserPath,headless:true,networkProxy:null,protectedWebProxy:()=>origin});
   try {
     const instance = await runtime.launch("web",origin);
     // Chrome 132+ 会额外创建一个 url 为空的 page target，且 Page.navigate 返回时 URL 可能尚未提交。
@@ -77,6 +83,10 @@ test("实际 Chromium 将未知目标域名交给代理，不依赖本地 DNS", 
     assert.equal(navigation.errorText,undefined);
     for (let attempt = 0; attempt < 40 && !requests.includes("http://checkcc-proxy-test.invalid/"); attempt++) await new Promise(resolve => setTimeout(resolve, 50));
     assert.ok(requests.includes("http://checkcc-proxy-test.invalid/"));
+    proxy.closeAllConnections();
+    await new Promise(resolve => proxy.close(resolve));
+    const failed = await instance.client.send('Page.navigate', { url: 'https://checkcc-proxy-test.invalid/' }, sessionId);
+    assert.equal(failed.errorText, 'net::ERR_PROXY_CONNECTION_FAILED');
   } finally {
     await runtime.close();
     proxy.closeAllConnections();

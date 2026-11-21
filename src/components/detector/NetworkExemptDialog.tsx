@@ -195,9 +195,13 @@ export function NetworkExemptDialog({ locale, busy, onClose, onSaved }: Props) {
       setState(value);
       apply(value);
       setError(value.problem ?? "");
-      setNotice(restart
-        ? text("已保存并重启内核。", "Saved and restarted the kernel.")
-        : text("已保存。重启内核后生效。", "Saved. Restart the kernel to apply."));
+      setNotice(value.verificationPending
+        ? text("已保存，隧道将在后台验证。", "Saved. The tunnel will be verified in the background.")
+        : value.restarted === true || (restart && value.restarted === undefined)
+          ? text("已保存并重启内核。", "Saved and restarted the kernel.")
+          : value.pendingRestart
+            ? text("已保存。重启内核后生效。", "Saved. Restart the kernel to apply.")
+            : text("已保存，无需重启内核。", "Saved. No kernel restart required."));
       onSaved(value);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));

@@ -1,6 +1,7 @@
 // EnvGuardCC 的出口地区识别模块，用于读取真实出口 IP 情报并推导与其一致的时区、系统时区、语言和区域目标。
 import { COUNTRY_LANGUAGES, COUNTRY_TIMEZONES, WINDOWS_ZONES, FALLBACK_COUNTRY_NAMES as COUNTRY_NAMES } from "./region-data";
 import type { LocaleCode } from "@/i18n/messages";
+import { readIpQueryNetworkEvidence, type NetworkTypeEvidence } from "./network-type";
 
 export type ExitGeo = {
   ip: string | null;
@@ -13,6 +14,7 @@ export type ExitGeo = {
   asn: string | null;
   org: string | null;
   source: string;
+  networkEvidence?: NetworkTypeEvidence[];
 };
 
 export type ExitTarget = {
@@ -146,14 +148,22 @@ const providers: Provider[] = [
     read: (data) => {
       const connection = obj(data, "connection");
       const timezone = obj(data, "timezone");
+      const security = obj(data, "security");
+      const ip = str(data, "ip");
+      const hosting = security.hosting;
+      const asn = connection.asn;
+      const asnText = typeof asn === "number" && Number.isInteger(asn) ? String(asn) : str(connection, "asn")?.replace(/^AS/i, "");
       return build("ipwho.is", {
-        ip: str(data, "ip"),
+        ip,
         countryCode: str(data, "country_code"),
         cityRaw: str(data, "city"),
         regionName: str(data, "region"),
         timezone: str(timezone, "id"),
-        asn: str(connection, "asn") ? `AS${str(connection, "asn")}` : null,
+        asn: asnText && /^\d+$/.test(asnText) ? `AS${asnText}` : null,
         org: str(connection, "org") ?? str(connection, "isp"),
+        networkEvidence: ip && typeof hosting === "boolean" ? [{
+          ip, source: "ipwho.is", kind: hosting ? "datacenter" : [security.proxy, security.vpn, security.tor].some((value) => value === true) ? "other" : "not-hosting",
+        }] : undefined,
       }, "en");
     },
   },
@@ -193,7 +203,7 @@ function validLocation(geo: ExitGeo) {
   return true;
 }
 
-// 依次尝试多个公开 IP 情报接口；任一接口给出有效国家即采用，全部失败时返回 null（界面按未检测处理）。
+// 并行查询当前出口，补充的类型证据只在返回同一地址时才参与判断。
 export async function fetchExitGeo(locale: LocaleCode): Promise<ExitGeo | null> {
   const attempts = providers.map(async (provider) => {
     const geo = provider.read(await fetchJson(provider.url, 4500));
@@ -204,11 +214,22 @@ export async function fetchExitGeo(locale: LocaleCode): Promise<ExitGeo | null> 
       city: cityDisplayName(geo.cityRaw, locale),
     };
   });
+  const ipQuery = fetchJson("https://api.ipquery.io/?format=json", 2000).then(readIpQueryNetworkEvidence, () => null);
+  let evidenceTimer: ReturnType<typeof setTimeout> | undefined;
+  const ipWhoEvidence = new Promise<NetworkTypeEvidence[]>((resolve) => {
+    evidenceTimer = setTimeout(() => resolve([]), 2000);
+    void attempts[0].then((result) => resolve(result.networkEvidence ?? []), () => resolve([]));
+  });
   try {
     const geo = await Promise.any(attempts);
-    return geo;
+    const [extra, who] = await Promise.all([ipQuery, ipWhoEvidence]);
+    const networkEvidence = who.length ? [...who] : [...geo.networkEvidence ?? []];
+    if (extra) networkEvidence.push(extra);
+    return { ...geo, networkEvidence: networkEvidence.filter((entry) => entry.ip.toLowerCase() === geo.ip?.toLowerCase()) };
   } catch {
     return null;
+  } finally {
+    clearTimeout(evidenceTimer);
   }
 }
 

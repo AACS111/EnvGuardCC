@@ -55,8 +55,15 @@ export async function readHostConfig(stateDir, requested) {
   const raw = await readFile(actual, "utf8");
   if (Buffer.byteLength(raw) > 4 * 1024 * 1024) throw new Error("内核配置过大。");
   const config = parseYaml(raw, { maxAliasCount: 100 });
-  const fields = new Set(["mode", "log-level", "ipv6", "hosts", "sniffer", "mixed-port", "external-controller", "secret", "authentication", "tun", "dns", "proxies", "proxy-groups", "rules"]);
+  const fields = new Set(["mode", "log-level", "ipv6", "hosts", "sniffer", "mixed-port", "external-controller", "secret", "authentication", "tun", "dns", "proxies", "proxy-groups", "rules", "unified-delay", "tcp-concurrent", "profile"]);
   if (!config || Array.isArray(config) || typeof config !== "object" || Object.keys(config).some(key => !fields.has(key))) throw new Error("特权宿主只接受 EGCC 生成的配置字段，禁止外部文件、脚本和 provider。");
+  for (const field of ["unified-delay", "tcp-concurrent"]) {
+    if (Object.hasOwn(config, field) && typeof config[field] !== "boolean") throw new Error(`特权宿主配置 ${field} 必须是布尔值。`);
+  }
+  if (Object.hasOwn(config, 'profile')) {
+    const profile = config.profile;
+    if (!profile || typeof profile !== 'object' || Array.isArray(profile) || Object.keys(profile).length !== 1 || profile['store-selected'] !== false) throw new Error('特权宿主 profile 仅允许关闭选择器持久化。');
+  }
   if (typeof config.secret !== "string" || config.secret.length < 32) throw new Error("特权内核必须配置控制器密钥。");
   return config;
 }
@@ -88,8 +95,18 @@ export function createKernelHost({ token, binary, stateDir, apiPort = 39090, hos
   let networkKey = "";
   const physicalNetwork = () => JSON.stringify(Object.entries(os.networkInterfaces()).filter(([name]) => name !== "utun90").map(([name, rows]) => [name, rows.filter(row => !row.internal).map(row => row.address).sort()]).sort());
   let operation = Promise.resolve();
-  const serialize = (action) => {
-    const next = operation.then(action);
+  const serialize = (action, label = null) => {
+    const queuedAt = performance.now();
+    const next = operation.then(async () => {
+      const startedAt = performance.now();
+      let result = 'ok';
+      try { return await action(); }
+      catch (error) { result = 'failed'; throw error; }
+      finally {
+        const runMs = Math.round(performance.now() - startedAt);
+        if (label) logger(`[host] ${label} queue-ms=${Math.round(startedAt - queuedAt)} run-ms=${runMs} result=${result}`);
+      }
+    });
     operation = next.catch(() => {});
     return next;
   };
@@ -233,11 +250,13 @@ export function createKernelHost({ token, binary, stateDir, apiPort = 39090, hos
       if (action === "claude-guard") {
         const result = await serialize(async () => {
           if (value.op === 'arm') return claudeGuard.arm({ token: value.token, packages: value.packages, programs: value.programs, addresses: value.addresses, domains: value.domains });
+          if (value.op === 'protect') return claudeGuard.protect({ token: value.token, packages: value.packages, programs: value.programs, domains: value.domains });
+          if (value.op === 'hosts') return { blocked: await claudeGuard.setHostsBlocked(value.blocked === true) };
           if (value.op === 'release') return claudeGuard.release({ keepDirect: value.keepDirect === true });
           if (value.op === 'status') return claudeGuard.status();
           if (value.op === 'enable-firewall') return claudeGuard.enableFirewall(value.confirmed);
           throw new Error('未知的 fail-closed 动作。');
-        });
+        }, `claude-guard:${['arm', 'protect', 'hosts', 'release', 'status', 'enable-firewall'].includes(value.op) ? value.op : 'unknown'}`);
         send(response, 200, { ok: true, claudeGuard: result });
         return;
       }
@@ -304,9 +323,14 @@ export function createKernelHost({ token, binary, stateDir, apiPort = 39090, hos
               leaseAt = Date.now();
             }
           }
-          if (Date.now() - lastClaudeInspection >= 10000) {
-            lastClaudeInspection = Date.now();
-            await claudeGuard.reconcile();
+          const currentClaudeGuard = claudeGuard.snapshot();
+          if (!currentClaudeGuard.persistent && (currentClaudeGuard.desired !== 'released' || currentClaudeGuard.error) && Date.now() - lastClaudeInspection >= 10000) {
+            const startedAt = performance.now();
+            try { await claudeGuard.reconcile(); }
+            finally {
+              lastClaudeInspection = Date.now();
+              logger(`[host] claude-guard:inspection run-ms=${Math.round(performance.now() - startedAt)}`);
+            }
           }
         }).catch(error => logger(`[host] 租约回收失败：${error.message}`)).finally(() => { monitoring = false; });
       }, Math.min(1000, leaseTimeoutMs));

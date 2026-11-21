@@ -16,6 +16,8 @@ pnpm test:tauri
 
 `dev:tauri` 启动 Next 开发页面，再启动 Tauri。页面端口为 3030，开发助手与网关使用 3001/3010。退出开发启动器时先请求宿主正常退出，待配置恢复后才关闭 Next。恢复失败时保留应用供重试。
 
+生产构建的页面端口默认也是 3030，但如果启动时探测到 3030 已被占用（最常见的是上一轮残留的 `desktop/backend.mjs` 后台进程），启动器会自动改用 3031–3049 中第一个空闲端口并把同一端口传给后台与窗口来源校验，因此不会因 `EADDRINUSE` 直接启动失败。需要固定端口时设置环境变量 `CHECKCC_DESKTOP_SITE_PORT`；开发版固定 3030，不受自动端口影响。
+
 可选的仓库隔离 Rust 工具链位于 `node_modules/.tauri-tools/{cargo,rustup}`，构建脚本会在没有显式 CARGO_HOME/RUSTUP_HOME 时自动使用它；CI 使用正常安装的 Rust 工具链。
 
 ## 运行结构与权限
@@ -25,7 +27,7 @@ pnpm test:tauri
 - macOS 的 WKWebView 配置本地 HTTP 传输支持；窗口导航与原生能力继续由 Rust 的精确回环来源检查限制。
 - `desktop/backend.mjs` 使用 Node 启动助手、网关和仅监听回环地址的页面服务。发行版后台端口动态分配，通过 `__CHECKCC_PORTS__` 注入页面。保留 HTTP 页面以支持受控 Chrome/Edge 打开相同页面。
 - Rust/Node 通过 stdin/stdout 交换逐行 JSON：request/response 使用 id 关联；ready/failed/power 为后台事件。应用日志仅写 stderr。
-- 页面只获得 `envGuardDesktop.getSettings/updateSettings/resetClaude`。权限动态绑定到 main 窗口的精确回环来源；不开放文件系统、进程启动或通用原生方法。页面来源之外的 HTTP(S) 链接交给系统浏览器。
+- 页面可调用 `envGuardDesktop.getSettings/updateSettings/resetClaude/exportNodeSetupScript`。导出脚本只允许在系统保存窗口选定位置后写入内置的 `install-node.sh`。权限动态绑定到 main 窗口的精确回环来源；不开放通用文件系统或进程启动方法。页面来源之外的 HTTP(S) 链接交给系统浏览器。
 - `frontendDist` 配置的 HTTP 地址会被 Tauri 归为 Local：main 窗口需授予对应本地桌面命令权限；测试或开发中的其他端口仍按精确 Remote URL 授权。Rust 命令继续复核窗口标签和实际来源，不开放其他插件命令。
 - Node 独立恢复原始配置，成功后才关闭网关和监听器。管道断开时尝试恢复，失败保留磁盘备份，下次启动继续恢复。
 

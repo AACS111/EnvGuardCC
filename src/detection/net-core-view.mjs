@@ -46,6 +46,8 @@ const STATE_LABELS = {
   error: ["启动失败", "Start failed"],
   idle: ["未启动", "Not started"],
   running: ["运行中", "Running"],
+  verifying: ["复检中", "Rechecking"],
+  unknown: ["待确认", "Unconfirmed"],
   unavailable: ["状态不可读", "Status unavailable"],
   off: ["未接入", "Not connected"],
   starting: ["启动中", "Starting"],
@@ -185,6 +187,22 @@ export function netCoreView(report, { locale = "zh", exitHistory = null } = {}) 
       tone: "warn",
       title: t("内核状态不可读", "Kernel status unavailable"),
       detail: report.reason || t("请确认内核进程仍在运行。", "Confirm the kernel process is still running."),
+    };
+  } else if (state === "verifying") {
+    // 短暂波动/复检不是故障：内核仍在运行，不要显示成「不可读」。
+    tone = "muted";
+    conclusion = {
+      tone: "muted",
+      title: t("正在复检出口 · 内核运行中", "Rechecking exit · kernel running"),
+      detail: report.reason || t("短暂网络波动不会中断已建立的连接；复检通过后自动恢复。", "Brief network fluctuations do not interrupt established connections; this view recovers automatically."),
+    };
+  } else if (state === "unknown") {
+    // 只有缺少证据时才走到这里；仍然不能接受「不可读」这种吓人的措辞。
+    tone = "warn";
+    conclusion = {
+      tone: "warn",
+      title: t("隧道状态待确认", "Tunnel status unconfirmed"),
+      detail: report.reason || t("尚未拿到本轮隧道证据，内核仍在运行；下一次复检会自动更新。", "No tunnel evidence for this cycle yet; the kernel is still running and the next check will update this view."),
     };
   } else if (state === "offline") {
     // 断网不是内核故障：等 network 回来就自动复检/重建，不能报成「启动失败」吓人。
@@ -399,7 +417,7 @@ export function netCoreView(report, { locale = "zh", exitHistory = null } = {}) 
       canStart: state !== "running" && state !== "unconfigured" && state !== "off",
       canStop: state === "running",
       canRestart: state === "running",
-      canSelect: ["running", "unavailable"].includes(state) && nodes.length > 0,
+      canSelect: ["running", "verifying", "unavailable"].includes(state) && nodes.length > 0,
     },
   };
 }
@@ -424,6 +442,25 @@ export function trafficFlowSamples(report, { now = Date.now() } = {}) {
     unknown: count(routing?.paths?.unknown ?? routing?.traffic?.unknown),
     pinned: count(routing?.pinned),
   };
+}
+
+export function exitHistoryTags(history) {
+  const merged = new Map();
+  const entries = history?.entries?.length ? history.entries : (history?.ips ?? []).map(ip => ({ ip, at: history.lastAt }));
+  for (const entry of entries) {
+    const current = merged.get(entry.ip);
+    if (!current) merged.set(entry.ip, { ...entry });
+    else {
+      if (entry.countryCode) current.countryCode = entry.countryCode;
+      if (Date.parse(entry.at) >= Date.parse(current.at)) current.at = entry.at;
+    }
+  }
+  const byExit = history?.claudeTransferCounts?.byExit ?? {};
+  for (const ip of Object.keys(byExit)) if (!merged.has(ip)) merged.set(ip, { ip, at: null });
+  return [...merged.values()].map(entry => {
+    const count = byExit[entry.ip];
+    return { ...entry, transferCount: Number.isSafeInteger(count) && count > 0 ? count : 0 };
+  });
 }
 
 export function activeFlowConnections(report, { now = Date.now() } = {}) {

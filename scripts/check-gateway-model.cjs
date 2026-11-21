@@ -87,6 +87,12 @@ test('超时按真实出口地区区分同地区备用与跨地区，未测量�
   assert.equal(nodeSelectionState({ nodes, selected: 'Japan 01', delays: { ...delays, 'Taiwan 02': null }, exits }).recovery.tone, 'danger');
   assert.equal(nodeSelectionState({ nodes, selected: 'Japan 01', delays: {}, exits }).recovery, null);
   assert.equal(netCoreView({ enabled: true, state: 'unavailable', nodes, selected: 'Japan 01' }).actions.canSelect, true);
+  // 短暂复检/证据过期不能被说成「内核不可读」——内核仍在运行。
+  const verifying = netCoreView({ enabled: true, state: 'verifying', nodes, selected: 'Japan 01' });
+  assert.equal(verifying.actions.canSelect, true);
+  assert.doesNotMatch(`${verifying.conclusion.title} ${verifying.conclusion.detail}`, /不可读|unavailable/i);
+  const unknown = netCoreView({ enabled: true, state: 'unknown', nodes, selected: 'Japan 01' });
+  assert.doesNotMatch(`${unknown.conclusion.title} ${unknown.conclusion.detail}`, /不可读|unavailable/i);
 });
 
 test('节点卡片显示延迟色阶，超时有同地区备用时显示黄色并保留选择入口', () => {
@@ -121,6 +127,7 @@ test('跨地区选择必须确认，同地区手动切换，供应商变化后�
   t.mock.method(React, 'useId', () => 'node-test');
   const triggerRef = { current: null };
   t.mock.method(React, 'useRef', () => triggerRef);
+  t.mock.method(React, 'useCallback', fn => fn);
   const trigger = { focus: t.mock.fn() };
   const selected = [];
   const report = { enabled: true, state: 'running', activeId: 'src_a', nodes: ['Taiwan 01', 'Taiwan 02', 'Japan 01'], selected: 'Taiwan 01', mode: 'rule' };
@@ -1490,7 +1497,7 @@ test('manual exit probing shows IP and region even when the region matches the n
   assert.match(cards, /Exit IP<\/span><span>203\.0\.113\.20/);
   assert.match(cards, /Exit region<\/span><span>United States/);
   assert.ok(html.indexOf('netcore-scope') < html.indexOf('netcore-nodes'), 'proxy scope must remain above a long node list');
-  assert.match(html, /role="tooltip"[^>]*>Measure response latency/);
+  assert.match(html, /role="tooltip"[^>]*>Measure the node’s round-trip latency/);
   assert.match(html, /role="tooltip"[^>]*>Query each node/);
   const unavailable = renderToStaticMarkup(React.createElement(NetCorePanel, {...props,exits:{}}));
   assert.equal((unavailable.match(/data-state="unavailable"/g) ?? []).length, 2);
@@ -1588,6 +1595,50 @@ test('路径图螃蟹随保护与网关状态往返，不受旧连接采样影�
   assert.match(render(false), /data-mascot-at="gateway"/);
   assert.match(render(true), /data-mascot-at="proxy"/);
   assert.match(render(true, 'stopped'), /data-mascot-at="gateway"/);
+  // 复检/短暂波动时内核仍在运行，不能退回网关位置（看起来像断开）。
+  assert.match(render(true, 'verifying'), /data-mascot-at="proxy"/);
   assert.match(render(false), /data-mascot-at="gateway"/);
   assert.equal((render(true).match(/class="workspace-flow__mascot"/g) ?? []).length, 1);
+});
+
+test('出口角标按 IP 显示 48 小时 Claude 传输记录，概览包含未知出口', () => {
+  const { NetCorePanel } = require(path.join(root, 'src/components/detector/NetCorePanel.tsx'));
+  const report = { enabled: true, state: 'running', nodes: ['US-NODE'], selected: 'US-NODE', mode: 'rule', tunEnabled: true, tunCaptured: true, routing: { state: 'verified', claude: 0, pinned: 0, direct: 0, total: 0, violations: [] } };
+  const now = new Date().toISOString();
+  const later = new Date(Date.parse(now) + 60000).toISOString();
+  const exitHistory = { windowHours: 48, samples: 3, changes: 2, stable: false, current: '198.51.100.20', ips: ['198.51.100.20', '203.0.113.10'], requestCounts: { '198.51.100.20': 5 }, claudeTransferCounts: { byExit: { '198.51.100.20': 7, '2001:db8::20': 3 }, unassigned: 2 }, entries: [
+    { ip: '203.0.113.10', at: now, countryCode: 'CN', requests: 0, connections: 3 },
+    { ip: '198.51.100.20', at: now, countryCode: 'US', requests: 4, connections: 6 },
+    { ip: '198.51.100.20', at: later, countryCode: 'US', requests: 3, connections: 3 },
+  ], firstAt: now, lastAt: later };
+  const html = renderToStaticMarkup(React.createElement(NetCorePanel, { locale: 'zh', report, onRefresh() {}, onRestart() {}, onSelectNode() {}, onMeasure() {}, onModeChange() {}, exitHistory }));
+  assert.match(html, /data-tone="ok"/);
+  assert.match(html, /data-tone="danger"/);
+  assert.match(html, /netcore-history__requests"[^>]*>7</);
+  assert.match(html, /netcore-history__pill" data-tone="danger"/);
+  assert.match(html, /netcore-history__pill" data-tone="ok"/);
+  // 同一 IP 多次切换只显示一个标签；明细有归属的 IP 也出现在分组中。
+  assert.equal((html.match(/netcore-history__address">198.51.100.20</g) ?? []).length, 1);
+  assert.match(html, /netcore-history__requests"[^>]*>7</);
+  // 0 次不显示次数徽标。
+  assert.doesNotMatch(html, /netcore-history__requests"[^>]*>0</);
+  assert.match(html, /Claude 传输记录 12 条/);
+  assert.match(html, /出口未知 · 近 48 小时 2 条 Claude 传输记录/);
+  assert.match(html, /2001:db8::20 · 近 48 小时 3 条 Claude 传输记录/);
+  const zero = { ...exitHistory, claudeTransferCounts: { byExit: {}, unassigned: 0 } };
+  const zeroHtml = renderToStaticMarkup(React.createElement(NetCorePanel, { locale: 'zh', report, onRefresh() {}, onRestart() {}, onSelectNode() {}, onMeasure() {}, onModeChange() {}, exitHistory: zero }));
+  assert.doesNotMatch(zeroHtml, /Claude 传输记录 0 条|出口未知/);
+  assert.doesNotMatch(zeroHtml, /netcore-history__requests/);
+  assert.match(zeroHtml, /出口 IP 变化 2 次，当前 198\.51\.100\.20/);
+});
+
+test('出口传输列表显示当前筛选，等待新结果期间隐藏旧总数', () => {
+  const { TransferLogDialog } = require(path.join(root, 'src/components/detector/TransferLog.tsx'));
+  const props = { locale: 'zh', data: { available: true, total: 7, items: [], exitIp: '2001:db8::20', stats: { total: 7 } }, selected: null, host: '', claude: true, offset: 0, exitIp: '2001:db8::20' };
+  const html = renderToStaticMarkup(React.createElement(TransferLogDialog, props));
+  assert.match(html, /出口 IP 2001:db8::20/);
+  assert.match(html, /共 7 条/);
+  const loading = renderToStaticMarkup(React.createElement(TransferLogDialog, { ...props, loading: true }));
+  assert.match(loading, /正在读取传输记录/);
+  assert.doesNotMatch(loading, /共 7 条/);
 });

@@ -9,7 +9,7 @@ const file = path.join(__dirname, '../src/detection/network-type.ts');
 const compiled = ts.transpileModule(fs.readFileSync(file, 'utf8'), { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 } });
 const output = { exports: {} };
 vm.runInNewContext(compiled.outputText, { exports: output.exports });
-const { exitNetworkType } = output.exports;
+const { exitNetworkType, readIpQueryNetworkEvidence } = output.exports;
 
 test('云厂商、宽带运营商与未知网络分开，未命中云厂商不能当作住宅', () => {
   assert.equal(exitNetworkType('Tencent Cloud Computing (Beijing) Co., Ltd', 'zh-CN').kind, 'datacenter');
@@ -37,4 +37,28 @@ test('BIGLOBE 组织名识别为住宅推断，云厂商证据优先', () => {
   assert.equal(exitNetworkType('BIGLOBE Cloud Hosting', 'en', 'AS2518').kind, 'datacenter');
   assert.equal(exitNetworkType('BIGLOBE Inc.', 'en', 'AS16509').kind, 'datacenter');
   assert.equal(exitNetworkType('Japan Network Information Center', 'zh', 'AS2518').kind, 'unknown');
+});
+
+test('只使用与当前出口相同的数据库证据，明确区分机房与家宽推断', () => {
+  const ip = '203.0.113.20';
+  const sample = (kind, address = ip, source = 'IPQuery') => ({ ip: address, kind, source });
+  const classify = (evidence, org = 'Transit network', asn = 'AS2914') =>
+    exitNetworkType(org, 'zh', asn, ip, evidence);
+  assert.equal(classify([sample('not-hosting', '203.0.113.21')]).kind, 'unknown');
+  assert.equal(classify([sample('not-hosting')]).label, '疑似家宽');
+  assert.equal(classify([sample('not-hosting')], 'Comcast').label, '家庭网络（推断）');
+  assert.match(classify([sample('not-hosting')]).detail, /IPQuery/);
+  assert.equal(classify([sample('datacenter')]).label, '机房网络');
+  assert.equal(classify([sample('not-hosting')], 'Transit network', 'AS16509').kind, 'datacenter');
+  assert.equal(classify([sample('datacenter'), sample('not-hosting', ip, 'ipwho.is')]).kind, 'unknown');
+  assert.equal(classify([sample('other')], 'Comcast').kind, 'unknown');
+});
+
+test('IPQuery 只在返回明确且完整的标记时参与家宽推断', () => {
+  const ip = '203.0.113.20';
+  const risk = { is_datacenter: false, is_mobile: false, is_proxy: false, is_vpn: false, is_tor: false };
+  assert.equal(readIpQueryNetworkEvidence({ ip, risk }).kind, 'not-hosting');
+  assert.equal(readIpQueryNetworkEvidence({ ip, risk: { ...risk, is_mobile: true } }).kind, 'other');
+  assert.equal(readIpQueryNetworkEvidence({ ip, risk: { is_datacenter: true } }).kind, 'datacenter');
+  assert.equal(readIpQueryNetworkEvidence({ ip, risk: { is_datacenter: false } }), null);
 });
