@@ -17,7 +17,24 @@
 
 
  ----------------------------！！！！！！！！！！！！！！！！！------------------------------------------------ 
+## 交流与支持
 
+<table>
+  <tr>
+    <th>微信交流</th>
+    <th>微信打赏</th>
+  </tr>
+  <tr>
+    <td align="center">
+      <a href="docs/images/wechat-contact.jpg"><img src="docs/images/wechat-contact.jpg" width="240" alt="作者微信好友二维码"></a><br>
+      扫码添加作者微信，进群交流使用体验和建议。
+    </td>
+    <td align="center">
+      <a href="docs/images/wechat-payment.jpg"><img src="docs/images/wechat-payment.jpg" width="240" alt="支持 EnvGuardCC 的微信收款码"></a><br>
+      用微信扫码打赏，支持项目的开发与维护。
+    </td>
+  </tr>
+</table>
 
 **开源、本地运行的 Claude 环境检测与保护工作台。**
 
@@ -268,24 +285,7 @@ pnpm desktop:installer
 | [环境操作](docs/environment-actions.md)                   | 环境检测与操作说明。                 |
 | [0.2.6 发布说明](docs/releases/v0.2.6.md)                 | 当前发布版本的变更记录。             |
 
-## 交流与支持
 
-<table>
-  <tr>
-    <th>微信交流</th>
-    <th>微信打赏</th>
-  </tr>
-  <tr>
-    <td align="center">
-      <a href="docs/images/wechat-contact.jpg"><img src="docs/images/wechat-contact.jpg" width="240" alt="作者微信好友二维码"></a><br>
-      扫码添加作者微信，交流使用体验和建议。
-    </td>
-    <td align="center">
-      <a href="docs/images/wechat-payment.jpg"><img src="docs/images/wechat-payment.jpg" width="240" alt="支持 EnvGuardCC 的微信收款码"></a><br>
-      用微信扫码打赏，支持项目的开发与维护。
-    </td>
-  </tr>
-</table>
 
 ## Contributors
 
