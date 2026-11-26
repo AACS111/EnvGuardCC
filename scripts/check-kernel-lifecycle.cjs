@@ -240,9 +240,9 @@ test('真实内核保持固定出口，并采样国内网站的代理连接与�
   }});
   try {
     await runtime.importNodes([{name:'a',type:'http',server:'127.0.0.1',port:a.address().port},{name:'b',type:'http',server:'127.0.0.1',port:b.address().port}],{selected:'b'});
-    // 普通流量走 AUTO-PROXY（node a）；探测主机 203.0.113.77 被专门钉到 CLAUDE-PIN（node b）。
+    // 普通流量走 AUTO-PROXY（优先当前选中节点 b）；探测主机 203.0.113.77 被专门钉到 CLAUDE-PIN（node b）。
     const ordinary = JSON.parse(await fetchTextViaProxy('http://203.0.113.78/',{proxy:`http://127.0.0.1:${mixedPort}`}));
-    assert.equal(ordinary.ip,'203.0.113.1');
+    assert.equal(ordinary.ip,'203.0.113.2');
     assert.equal(cores, 1, '主内核应当只启动一次');
     const selected = await runtime.probeSelectedExit();
     assert.equal(selected.ip,'203.0.113.2');

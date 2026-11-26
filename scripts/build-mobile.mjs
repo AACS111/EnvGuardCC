@@ -169,7 +169,7 @@ async function main() {
 
   const buildArgs = [platform, 'build', '--config', configPath];
   if (!release) buildArgs.push('--debug');
-  if (platform === 'android') buildArgs.push('--apk', 'true');
+  if (platform === 'android') buildArgs.push('--apk');
   await runCommand(tauriBin, buildArgs, { cwd: root });
 
   const pkg = JSON.parse(await readFile(path.join(root, 'package.json'), 'utf8'));
