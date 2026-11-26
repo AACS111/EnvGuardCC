@@ -43,14 +43,14 @@
 
 ## 下载安装
 
-当前版本 **0.2.6**。请查看 [0.2.6 发布说明](docs/releases/v0.2.6.md)或浏览 [全部版本](https://github.com/AACS111/EnvGuardCC/releases)。
+当前版本 **0.2.7**。请查看 [0.2.7 发布说明](docs/releases/v0.2.7.md)或浏览 [全部版本](https://github.com/AACS111/EnvGuardCC/releases)。
 
 | 平台                  | 安装包                                                                                                    | 其他形式                                                                                              |
 | --------------------- | --------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
-| Windows x64           | [EXE 安装器](https://github.com/AACS111/EnvGuardCC/releases/download/v0.2.6/EnvGuardCC-Setup-0.2.6.exe)   | [便携 ZIP](https://github.com/AACS111/EnvGuardCC/releases/download/v0.2.6/EnvGuardCC-Windows-x64.zip) |
-| macOS · Apple Silicon | [DMG 安装镜像](https://github.com/AACS111/EnvGuardCC/releases/download/v0.2.6/EnvGuardCC-0.2.6-arm64.dmg) | [应用 ZIP](https://github.com/AACS111/EnvGuardCC/releases/download/v0.2.6/EnvGuardCC-macOS-arm64.zip) |
+| Windows x64           | [EXE 安装器](https://github.com/AACS111/EnvGuardCC/releases/download/v0.2.7/EnvGuardCC-Setup-0.2.7.exe)   | [便携 ZIP](https://github.com/AACS111/EnvGuardCC/releases/download/v0.2.7/EnvGuardCC-Windows-x64.zip) |
+| macOS · Apple Silicon | [DMG 安装镜像](https://github.com/AACS111/EnvGuardCC/releases/download/v0.2.7/EnvGuardCC-0.2.7-arm64.dmg) | [应用 ZIP](https://github.com/AACS111/EnvGuardCC/releases/download/v0.2.7/EnvGuardCC-macOS-arm64.zip) |
 
-[SHA-256 校验值](https://github.com/AACS111/EnvGuardCC/releases/download/v0.2.6/SHA256SUMS.txt)
+[SHA-256 校验值](https://github.com/AACS111/EnvGuardCC/releases/download/v0.2.7/SHA256SUMS.txt)
 
 - **Windows**：运行安装器，或完整解压便携包后运行 `EnvGuardCC.exe`，保留同目录文件。需要系统 WebView2；安装器会在缺失时联网安装，便携版需自行准备。安装包尚未进行代码签名。
 - **macOS**：打开 DMG，将应用拖入 Applications，再从“应用程序”启动。当前采用 ad-hoc 签名，尚未进行 Developer ID 签名和公证；首次打开可能需要在“系统设置 → 隐私与安全性”中允许。
@@ -261,12 +261,13 @@ pnpm desktop:installer
 | 文档                                                      | 内容                                 |
 | --------------------------------------------------------- | ------------------------------------ |
 | [Tauri 桌面开发](docs/TAURI-DESKTOP.md)                   | 桌面架构、权限、构建、安装与验证。   |
+| [Tauri 移动端打包](docs/TAURI-MOBILE.md)                  | Android / iOS 内核库、VPN 与打包指南。 |
 | [网络内核](docs/NET-CORE.md)                              | mihomo、固定出口、分流、DNS 与恢复。 |
 | [连接保护实现记录](docs/NETWORK-SAFETY-IMPLEMENTATION.md) | 系统接管、严格模式及实际验证边界。   |
 | [网络兼容性](docs/NETWORK-COMPATIBILITY.md)               | 网络场景与兼容性说明。               |
 | [时区服务](docs/timezone-service.md)                      | macOS 时区辅助服务、授权及恢复。     |
 | [环境操作](docs/environment-actions.md)                   | 环境检测与操作说明。                 |
-| [0.2.6 发布说明](docs/releases/v0.2.6.md)                 | 当前发布版本的变更记录。             |
+| [0.2.7 发布说明](docs/releases/v0.2.7.md)                 | 当前发布版本的变更记录。             |
 
 ## 交流与支持
 
