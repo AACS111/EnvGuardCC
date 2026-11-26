@@ -37,7 +37,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.23'
+          go-version: '1.24'
           cache-dependency-path: mobile/core/go.mod
       - name: Run Go mobile core unit tests
         working-directory: mobile/core
@@ -65,15 +65,20 @@ jobs:
         with:
           distribution: temurin
           java-version: '17'
-      - uses: android-actions/setup-android@v3
       - name: Install Android NDK & build tools
         run: |
-          sdkmanager "platform-tools" "platforms;android-34" "build-tools;34.0.0" "ndk;26.3.11579264"
-          echo "NDK_HOME=$ANDROID_HOME/ndk/26.3.11579264" >> "$GITHUB_ENV"
-          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/26.3.11579264" >> "$GITHUB_ENV"
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          SDKMANAGER="$(ls -d "$SDK_ROOT"/cmdline-tools/*/bin/sdkmanager 2>/dev/null | head -n 1)"
+          if [ -z "$SDKMANAGER" ]; then echo "sdkmanager not found under $SDK_ROOT" >&2; exit 1; fi
+          yes | "$SDKMANAGER" --licenses >/dev/null 2>&1 || true
+          "$SDKMANAGER" "platform-tools" "platforms;android-34" "build-tools;34.0.0" "ndk;26.3.11579264"
+          echo "ANDROID_HOME=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "NDK_HOME=$SDK_ROOT/ndk/26.3.11579264" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=$SDK_ROOT/ndk/26.3.11579264" >> "$GITHUB_ENV"
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.23'
+          go-version: '1.24'
       - name: Install gomobile
         run: |
           go install golang.org/x/mobile/cmd/gomobile@latest
@@ -89,7 +94,7 @@ jobs:
         run: pnpm install --frozen-lockfile
       - name: Initialize & build Android APK
         run: |
-          (cd mobile/core && go mod tidy)
+          (cd mobile/core && go get -tool golang.org/x/mobile/cmd/gobind && go mod tidy)
           pnpm mobile:init:android
           pnpm mobile:build:android
       - name: Upload Android APK artifact
@@ -117,7 +122,7 @@ jobs:
           cache: pnpm
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.23'
+          go-version: '1.24'
       - name: Install gomobile
         run: |
           go install golang.org/x/mobile/cmd/gomobile@latest
@@ -133,7 +138,7 @@ jobs:
         run: pnpm install --frozen-lockfile
       - name: Build Go iOS XCFramework & initialize Tauri iOS project
         run: |
-          (cd mobile/core && go mod tidy)
+          (cd mobile/core && go get -tool golang.org/x/mobile/cmd/gobind && go mod tidy)
           pnpm mobile:core:ios
           pnpm mobile:init:ios
       - name: Upload iOS XCFramework artifact
