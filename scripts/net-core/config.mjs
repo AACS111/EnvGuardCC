@@ -286,9 +286,6 @@ export function buildKernelConfig({
   const modeFinal = finalRule && finalRule !== DEFAULT_FINAL_RULE ? finalRule : finalFromMode;
   // 只有兜底规则真的引用自动组时才生成它，避免 direct 模式下多出无用的健康检查。
   const usesAutoGroup = modeFinal === "MATCH," + autoGroupName;
-  // 共享入口时故障转移是空转：入口挂了全部节点一起挂，切端口没有任何冗余价值。
-  const ingress = ingressSummary(nodes, { hosts });
-  const effectiveAutoType = ingress.shared && autoGroupType === DEFAULT_AUTO_GROUP_TYPE ? "select" : autoGroupType;
   const localTarget = directInterface ? LOCAL_DIRECT_PROXY : "DIRECT";
   const customDomains = new Set(normalizeDomains(directDomains));
   const internalRules = internalDomains.map((domain) => `DOMAIN-SUFFIX,${domain},${customDomains.has(domain) ? localTarget : "DIRECT"}`);
@@ -383,15 +380,15 @@ export function buildKernelConfig({
       },
       ...(usesAutoGroup ? [{
         name: autoGroupName,
-        type: effectiveAutoType,
-        // 成员顺序即 fallback 优先级；全部节点都必须在内，否则等于主动放弃冗余。
-        proxies: [...names],
-        ...(effectiveAutoType === "select" ? {} : {
-          url: check.url,
-          interval: check.interval,
-          lazy: check.lazy,
-          ...(effectiveAutoType === "url-test" ? { tolerance: check.tolerance } : {}),
-        }),
+        type: autoGroupType,
+        // 成员顺序即 fallback 优先级：优先走用户当前选中的节点，故障时再转移到其余节点。
+        // 即使多个节点共用同一入口 IP（如 TCP-Reality 与 UDP-Hysteria2），单协议/单端口仍可能超时，
+        // 不能降级为无健康检查的 select，否则首节点超时后兜底流量会永久黑洞。
+        proxies: [initial, ...names.filter((name) => name !== initial)],
+        url: check.url,
+        interval: check.interval,
+        lazy: check.lazy,
+        ...(autoGroupType === "url-test" ? { tolerance: check.tolerance } : {}),
       }] : []),
     ],
     rules,
@@ -549,11 +546,9 @@ export function assertKernelConfig(config, { groupName = DEFAULT_GROUP, guardGro
   // 兜底出口组：必须是可自动故障转移的组，且覆盖全部节点。
   const autoGroup = groups.find((item) => item?.name === autoGroupName);
   const nodeNames = (config.proxies ?? []).map((node) => node?.name).filter((name) => name !== LOCAL_DNS_PROXY && name !== LOCAL_DIRECT_PROXY);
-  const sharedIngress = ingressSummary(config.proxies, { hosts: config.hosts ?? {} }).shared;
   if (autoGroup) {
-    // 共享入口时 select 是正确形态：切换端口不产生任何冗余，fallback 的健康检查只是噪音。
-    if (!AUTO_GROUP_TYPES.has(autoGroup.type) && !(sharedIngress && autoGroup.type === "select")) throw new Error(`自动出口组 ${autoGroupName} 必须是 fallback 或 url-test（当前 ${autoGroup.type}）；固定出口无法在节点故障时转移。`);
-    if (autoGroup.type !== "select" && (!autoGroup.url || !Number.isInteger(autoGroup.interval))) throw new Error(`自动出口组 ${autoGroupName} 缺少健康检查配置，节点故障后无法自动转移。`);
+    if (!AUTO_GROUP_TYPES.has(autoGroup.type)) throw new Error(`自动出口组 ${autoGroupName} 必须是 fallback 或 url-test（当前 ${autoGroup.type}）；固定出口无法在节点故障时转移。`);
+    if (!autoGroup.url || !Number.isInteger(autoGroup.interval)) throw new Error(`自动出口组 ${autoGroupName} 缺少健康检查配置，节点故障后无法自动转移。`);
     const members = new Set(autoGroup.proxies ?? []);
     if (!members.size) throw new Error(`自动出口组 ${autoGroupName} 没有节点。`);
     for (const name of members) if (!names.has(name)) throw new Error(`自动出口组引用了不存在的节点 ${name}。`);

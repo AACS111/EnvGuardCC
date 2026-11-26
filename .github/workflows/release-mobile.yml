@@ -1,0 +1,140 @@
+name: Mobile build (Android & iOS)
+
+on:
+  workflow_dispatch:
+    inputs:
+      platform:
+        description: Target platform (all, android, ios)
+        required: false
+        default: all
+        type: choice
+        options: [all, android, ios]
+  push:
+    tags: ['v*']
+  pull_request:
+    branches: [develop, main]
+    paths:
+      - 'mobile/**'
+      - 'src-tauri/**'
+      - 'scripts/build-mobile.mjs'
+      - 'scripts/check-mobile.mjs'
+      - '.github/workflows/release-mobile.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mobile-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  go-core-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+          cache-dependency-path: mobile/core/go.sum
+      - name: Run Go mobile core unit tests
+        working-directory: mobile/core
+        run: go test -v ./...
+
+  android:
+    needs: go-core-test
+    if: github.event_name != 'workflow_dispatch' || inputs.platform == 'all' || inputs.platform == 'android'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.34.5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v3
+      - name: Install Android NDK & build tools
+        run: |
+          sdkmanager "platform-tools" "platforms;android-34" "build-tools;34.0.0" "ndk;26.3.11579264"
+          echo "NDK_HOME=$ANDROID_HOME/ndk/26.3.11579264" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/26.3.11579264" >> "$GITHUB_ENV"
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+      - name: Install gomobile
+        run: |
+          go install golang.org/x/mobile/cmd/gomobile@latest
+          go install golang.org/x/mobile/cmd/gobind@latest
+          gomobile init
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - name: Install JS dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Initialize & build Android APK
+        run: |
+          pnpm mobile:init:android
+          pnpm mobile:build:android
+      - name: Upload Android APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: envguardcc-android-apk
+          retention-days: 14
+          path: src-tauri/gen/android/app/build/outputs/apk/**/*.apk
+
+  ios:
+    needs: go-core-test
+    if: github.event_name != 'workflow_dispatch' || inputs.platform == 'all' || inputs.platform == 'ios'
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.34.5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+      - name: Install gomobile
+        run: |
+          go install golang.org/x/mobile/cmd/gomobile@latest
+          go install golang.org/x/mobile/cmd/gobind@latest
+          gomobile init
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - name: Install JS dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Build Go iOS XCFramework & initialize Tauri iOS project
+        run: |
+          pnpm mobile:core:ios
+          pnpm mobile:init:ios
+      - name: Upload iOS XCFramework artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: envguardcc-ios-xcframework
+          retention-days: 14
+          path: node_modules/.checkcc-mobile-core/EnvGuardCore.xcframework

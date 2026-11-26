@@ -265,3 +265,29 @@ test('显式出口网卡：写入 tun.interface-name，未提供时保持自动�
   assert.equal(strict.tun['interface-name'], 'WLAN');
   assert.equal(strict.tun['strict-route'], true);
 });
+
+test('共享入口节点仍保留 fallback 故障转移，且兜底组优先使用当前选中节点', () => {
+  const sharedProxies = [
+    { name: 'TCP-Reality', type: 'vless', server: '203.0.113.10', port: 443, uuid: '11111111-1111-1111-1111-111111111111', tls: true },
+    { name: 'UDP-Hysteria2', type: 'hysteria2', server: '203.0.113.10', port: 443, password: 'secret' },
+  ];
+  const config = buildKernelConfig({
+    proxies: sharedProxies,
+    selected: 'UDP-Hysteria2',
+    apiPort: 39090,
+    mixedPort: 39080,
+    egressMode: 'rule',
+  });
+  const auto = config['proxy-groups'].find((group) => group.name === DEFAULT_AUTO_GROUP);
+  assert.equal(auto.type, 'fallback');
+  assert.deepEqual(auto.proxies, ['UDP-Hysteria2', 'TCP-Reality']);
+  assert.equal(typeof auto.url, 'string');
+  assert.equal(Number.isInteger(auto.interval), true);
+  assert.doesNotThrow(() => assertKernelConfig(config, { egressMode: 'rule' }));
+
+  const downgraded = structuredClone(config);
+  const downgradedAuto = downgraded['proxy-groups'].find((group) => group.name === DEFAULT_AUTO_GROUP);
+  downgradedAuto.type = 'select';
+  delete downgradedAuto.url;
+  assert.throws(() => assertKernelConfig(downgraded, { egressMode: 'rule' }), /fallback/);
+});
