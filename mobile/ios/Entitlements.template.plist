@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Main iOS App Entitlements template.
+  Replace $(APP_GROUP_ID) in Xcode build settings (e.g. group.io.github.yourname.envguardcc).
+  Never commit personal Apple Team IDs or signing identities.
+-->
+<plist version="1.0">
+<dict>
+    <key>com.apple.developer.networking.networkextension</key>
+    <array>
+        <string>packet-tunnel-provider</string>
+    </array>
+    <key>com.apple.security.application-groups</key>
+    <array>
+        <string>$(APP_GROUP_ID)</string>
+    </array>
+</dict>
+</plist>

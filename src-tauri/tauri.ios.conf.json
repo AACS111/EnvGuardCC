@@ -1,0 +1,27 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "build": {
+    "frontendDist": "../out"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "EnvGuardCC",
+        "url": "index.html"
+      }
+    ],
+    "withGlobalTauri": true,
+    "security": {
+      "capabilities": []
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": [],
+    "resources": {},
+    "iOS": {
+      "minimumSystemVersion": "15.0"
+    }
+  }
+}
