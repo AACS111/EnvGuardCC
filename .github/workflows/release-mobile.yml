@@ -38,10 +38,12 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: '1.23'
-          cache-dependency-path: mobile/core/go.sum
+          cache-dependency-path: mobile/core/go.mod
       - name: Run Go mobile core unit tests
         working-directory: mobile/core
-        run: go test -v ./...
+        run: |
+          go mod tidy
+          go test -v ./...
 
   android:
     needs: go-core-test
@@ -87,6 +89,7 @@ jobs:
         run: pnpm install --frozen-lockfile
       - name: Initialize & build Android APK
         run: |
+          (cd mobile/core && go mod tidy)
           pnpm mobile:init:android
           pnpm mobile:build:android
       - name: Upload Android APK artifact
@@ -130,6 +133,7 @@ jobs:
         run: pnpm install --frozen-lockfile
       - name: Build Go iOS XCFramework & initialize Tauri iOS project
         run: |
+          (cd mobile/core && go mod tidy)
           pnpm mobile:core:ios
           pnpm mobile:init:ios
       - name: Upload iOS XCFramework artifact
