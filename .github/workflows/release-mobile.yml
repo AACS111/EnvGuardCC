@@ -102,6 +102,19 @@ jobs:
           (cd mobile/core && go get -tool golang.org/x/mobile/cmd/gobind && go mod tidy)
           pnpm mobile:init:android
           pnpm mobile:build:android
+      - name: Sign unsigned release APK for direct installation
+        run: |
+          UNSIGNED="$(find src-tauri/gen/android/app/build/outputs/apk -type f -name '*unsigned*.apk' | head -n 1 || true)"
+          if [ -n "$UNSIGNED" ]; then
+            KEYSTORE="$RUNNER_TEMP/envguard-adhoc.jks"
+            keytool -genkeypair -keystore "$KEYSTORE" -storepass envguardcc -keypass envguardcc -alias envguardcc -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=EnvGuardCC,O=EnvGuardCC"
+            BUILD_TOOLS="$ANDROID_HOME/build-tools/34.0.0"
+            ALIGNED="${UNSIGNED%-unsigned.apk}-aligned.apk"
+            SIGNED="${UNSIGNED%-unsigned.apk}.apk"
+            "$BUILD_TOOLS/zipalign" -f -p 4 "$UNSIGNED" "$ALIGNED"
+            "$BUILD_TOOLS/apksigner" sign --ks "$KEYSTORE" --ks-pass pass:envguardcc --key-pass pass:envguardcc --out "$SIGNED" "$ALIGNED"
+            rm -f "$UNSIGNED" "$ALIGNED"
+          fi
       - name: Upload Android APK artifact
         uses: actions/upload-artifact@v4
         with:
