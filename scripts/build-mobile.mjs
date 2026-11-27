@@ -166,6 +166,8 @@ async function main() {
   await exportFrontend();
   await buildGoCore(platform);
   await syncNativeTemplates(platform);
+  // tauri-build 编译期仍会检查基础 tauri.conf.json 中的 resources 目录是否存在；空目录即可通过校验且不引入桌面资源。
+  await mkdir(path.join(root, 'node_modules/.checkcc-tauri-backend'), { recursive: true });
 
   const buildArgs = [platform, 'build', '--config', configPath];
   if (!release) buildArgs.push('--debug');
