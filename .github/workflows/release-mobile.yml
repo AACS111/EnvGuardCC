@@ -9,6 +9,11 @@ on:
         default: all
         type: choice
         options: [all, android, ios]
+      release_tag:
+        description: Optional existing release tag (e.g. v0.2.7) to upload mobile assets to
+        required: false
+        default: ''
+        type: string
   push:
     tags: ['v*']
   pull_request:
@@ -147,3 +152,48 @@ jobs:
           name: envguardcc-ios-xcframework
           retention-days: 14
           path: node_modules/.checkcc-mobile-core/EnvGuardCore.xcframework
+
+  publish-mobile:
+    needs: [android, ios]
+    if: always() && (startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')) && (needs.android.result == 'success' || needs.ios.result == 'success')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          path: mobile-artifacts
+      - name: Prepare and upload mobile assets to GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || inputs.release_tag }}
+        run: |
+          VERSION="${RELEASE_TAG#v}"
+          mkdir -p mobile-release-assets
+          APK="$(find mobile-artifacts/envguardcc-android-apk -type f -name '*universal*.apk' 2>/dev/null | head -n 1 || true)"
+          if [ -z "$APK" ]; then
+            APK="$(find mobile-artifacts/envguardcc-android-apk -type f -name '*.apk' 2>/dev/null | head -n 1 || true)"
+          fi
+          if [ -n "$APK" ] && [ -s "$APK" ]; then
+            cp "$APK" "mobile-release-assets/EnvGuardCC-${VERSION}-android.apk"
+          fi
+          if [ -d mobile-artifacts/envguardcc-ios-xcframework ]; then
+            (cd mobile-artifacts/envguardcc-ios-xcframework && zip -rq "../../mobile-release-assets/EnvGuardCC-${VERSION}-ios-xcframework.zip" .)
+          fi
+          if [ -z "$(ls -A mobile-release-assets)" ]; then
+            echo "No mobile release assets prepared." >&2
+            exit 1
+          fi
+          if ! gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            NOTES_ARGS=()
+            if [ -f "docs/releases/$RELEASE_TAG.md" ]; then
+              NOTES_ARGS=(--notes-file "docs/releases/$RELEASE_TAG.md")
+            else
+              NOTES_ARGS=(--generate-notes)
+            fi
+            gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --title "EnvGuardCC ${VERSION}" "${NOTES_ARGS[@]}" --draft
+          fi
+          gh release upload "$RELEASE_TAG" mobile-release-assets/* --repo "$GITHUB_REPOSITORY" --clobber
