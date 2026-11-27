@@ -101,6 +101,18 @@ async function buildGoCore(platform) {
     const androidLibs = path.join(root, 'src-tauri/gen/android/app/libs');
     await mkdir(androidLibs, { recursive: true });
     await cp(outAar, path.join(androidLibs, 'EnvGuardCore.aar'));
+    const appGradle = path.join(root, 'src-tauri/gen/android/app/build.gradle.kts');
+    try {
+      const gradleText = await readFile(appGradle, 'utf8');
+      if (!gradleText.includes('EnvGuardCore.aar')) {
+        if (!/dependencies\s*\{/.test(gradleText)) throw new Error('未在 app/build.gradle.kts 中找到 dependencies 块。');
+        const updated = gradleText.replace(/dependencies\s*\{/, 'dependencies {\n    implementation(files("libs/EnvGuardCore.aar"))');
+        await writeFile(appGradle, updated, 'utf8');
+        console.log('[mobile] 已将 EnvGuardCore.aar 依赖写入', appGradle);
+      }
+    } catch (error) {
+      if (error?.code !== 'ENOENT') throw error;
+    }
     return outAar;
   }
   const outXc = path.join(distDir, 'EnvGuardCore.xcframework');
